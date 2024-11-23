@@ -1,0 +1,11 @@
+[package]
+name = "rust-mccv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bdk = "0.29.0"
+bitcoin = "0.32.4"
+bitcoin_hashes = "0.15.0"
+clap = { version = "4.5.21", features = ["derive"] }
+toml = "0.8.19"
