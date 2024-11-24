@@ -1,26 +1,29 @@
+mod migrate;
+mod vault;
+
+use bdk_esplora::{
+    EsploraExt,
+};
+
+use bdk_wallet::KeychainKind;
+
+use bdk_wallet::{
+    template::Bip86,
+    template::DescriptorTemplate,
+    Wallet,
+};
+
+use bitcoin::NetworkKind;
 use bitcoin::bip32::{
-    ExtendedPubKey,
-    ExtendedPrivKey,
+    Xpub,
+    Xpriv,
     DerivationPath,
     ChildNumber,
 };
 
-use bitcoin::hashes::{
-    Hash,
-    HashEngine,
-    sha256::Hash as Sha256,
-    sha256::HashEngine as Sha256Engine,
-};
-
-use bitcoin::opcodes::all::{
-    OP_CSV,
-    OP_CHECKSIGVERIFY,
-    OP_CHECKSIG,
-    OP_NOP4 as OP_CHECKTEMPLATEVERIFY,
-};
-
 use bitcoin::secp256k1::{
     Secp256k1,
+    Signing,
     Verification,
     XOnlyPublicKey,
 };
@@ -30,300 +33,331 @@ use bitcoin::{
     script::Builder,
     consensus::Encodable,
     absolute::LockTime,
+    Network,
     opcodes::OP_TRUE,
     OutPoint,
     relative::LockTime as RelativeLockTime,
     ScriptBuf,
-    Sequence,
-    TapLeafHash,
     TapNodeHash,
     Transaction,
     Txid, 
     transaction::TxIn,
     transaction::TxOut,
-    VarInt,
     blockdata::transaction::Version,
     taproot::{
         LeafVersion,
-        TapLeaf,
-        TapTree,
         TaprootBuilder,
     },
     Witness,
 };
 
+use clap::{
+    Args,
+    Parser,
+    Subcommand,
+};
+
+use rand::{
+    RngCore,
+    thread_rng,
+};
+
+use rayon::iter::{
+    IntoParallelIterator,
+    ParallelIterator,
+};
+
+use rusqlite::{
+    Connection,
+    params,
+};
+
+use serde::{
+    Deserialize,
+    Serialize,
+};
+
+use std::path::PathBuf;
+
 use std::io::Write;
 
-type Depth = u32;
+use std::collections::HashMap;
 
-struct VaultParameters {
-    increment: u64,
-    /// Maximum value = max * increment
-    max: u32,
-    // All coins are always immediately spendable by master_xpub
-    master_xpub: ExtendedPubKey,
-    // Coins "recovered" from a bad withdrawal spendable by this xpub
-    recovery_xpub: ExtendedPubKey,
-    // Withdrawn coins are spendable by withdrawal_xpub at any time
-    withdrawal_xpub: ExtendedPubKey,
-    // Should there be yet another xpub for un-managed funds? probably but not in the vault params
-    delay_per_increment: u32,
-    max_withdrawal_per_step: u32,
-    max_added_per_step: u32,
-    max_depth: Depth,
+use crate::vault::{
+    VaultParameters,
+    Vault,
+    VaultAmount,
+};
+
+fn new_xpriv(network: NetworkKind) -> Xpriv {
+    let mut rng = thread_rng();
+
+    let mut seed = [0u8; 128];
+
+    rng.fill_bytes(&mut seed);
+    Xpriv::new_master(network, &seed)
+        .expect("privkey generation")
 }
 
-#[derive(Clone,Copy,Debug)]
-struct VaultAmount {
-    /// The scale of the amount, in satoshis
-    increment: u64,
-    /// The amount being represented, without scale
-    amount: u32,
+#[derive(Clone, Args)]
+struct DepositArg {
+    vault: u32,
+    amount: u64,
 }
 
-impl VaultAmount {
-    fn to_sats(&self) -> u64 {
-        u64::saturating_mul(self.amount as u64, self.increment)
-    }
+#[derive(Clone, Args)]
+struct WithdrawArg {
+    vault: u32,
+    amount: u64,
 }
 
-impl std::ops::Add<u32> for VaultAmount {
-    type Output = VaultAmount;
-
-    fn add(self, rhs: u32) -> Self::Output {
-        VaultAmount {
-            amount: u32::saturating_add(self.amount, rhs),
-            increment: self.increment,
-        }
-    }
+#[derive(Clone, Subcommand)]
+enum Command {
+    Generate,
+    List,
+    Receive,
+    Sync,
+    Deposit(DepositArg),
+    Withdraw(WithdrawArg),
+    Benchmark,
 }
 
-impl std::ops::Sub<u32> for VaultAmount {
-    type Output = Self;
+#[derive(Parser)]
+#[command(name = "mccv")]
+struct CommandLine {
+    #[arg(short = 'c', long = "config", default_value="./config.toml")]
+    config: PathBuf,
 
-    fn sub(self, rhs: u32) -> Self::Output {
-        VaultAmount {
-            amount: u32::saturating_sub(self.amount, rhs),
-            increment: self.increment,
-        }
-    }
+    #[arg(short = 'w', long = "wallet", default_value="./mccv-wallet.sqlite")]
+    wallet_path: PathBuf,
+
+    #[command(subcommand)]
+    command: Command,
+
+    #[arg(short = 'n', long = "network", default_value="signet")]
+    network: Network,
+
+    #[arg(short = 'e', long = "esplora", default_value="http://signet.bitcoindevkit.net")]
+    esplora: String,
 }
 
-impl Into<Amount> for VaultAmount {
-    fn into(self) -> Amount {
-        Amount::from_sat(self.to_sats())
-    }
+#[derive(Serialize,Deserialize)]
+struct Configuration {
+    vault_parameters: VaultParameters,
+    master_xpriv: Xpriv,
+    wallet_path: PathBuf,
+    descriptor: String,
+    change_descriptor: String,
 }
 
-fn get_default_template(transaction: &Transaction, input_index: u32) -> std::io::Result<Sha256> {
-    let mut sha256 = Sha256::engine();
-
-    transaction.version.consensus_encode(&mut sha256)?;
-    transaction.lock_time.consensus_encode(&mut sha256)?;
-
-    let any_script_sigs = transaction.input.iter()
-        .any(|input| !input.script_sig.is_empty());
-
-    if any_script_sigs {
-        for input in transaction.input.iter() {
-            input.script_sig.consensus_encode(&mut sha256)?;
-        }
-    }
-
-    let vin_count: u32 = transaction.input.len() as u32;
-    sha256.write(&vin_count.to_le_bytes())?;
-    for input in transaction.input.iter() {
-        let sequence: u32 = input.sequence.to_consensus_u32();
-        sha256.write(&sequence.to_le_bytes())?;
-    }
-
-    let vout_count: u32 = transaction.output.len() as u32;
-    sha256.write(&vout_count.to_le_bytes())?;
-
-    for output in transaction.output.iter() {
-        output.consensus_encode(&mut sha256)?;
-    }
-
-    sha256.write(&input_index.to_le_bytes())?;
-
-    Ok(Sha256::from_engine(sha256))
-}
-
-fn ephemeral_anchor() -> TxOut {
-    let mut script_pubkey = ScriptBuf::new();
-    script_pubkey.push_opcode(OP_TRUE);
-
-    TxOut {
-        value: Amount::from_sat(0),
-        script_pubkey,
-    }
-}
-
-fn dummy_input(lock_time: RelativeLockTime) -> TxIn {
-    TxIn {
-        previous_output: OutPoint {
-            txid: Txid::from_byte_array([0u8; 32]),
-            vout: 0,
-        },
-        script_sig: ScriptBuf::new(),
-        sequence: lock_time.to_sequence(),
-        witness: Witness::new(),
-    }
-}
-
-impl VaultParameters {
-    fn amount_from_increment(&self, increment: u32) -> VaultAmount {
-        VaultAmount {
-            amount: increment,
-            increment: self.increment,
-        }
-    }
-
-    fn recovery_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
-
-        let path = [
-            ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
-        ];
-
-        let xpub = self.recovery_xpub.derive_pub(secp, &path)
-            .expect("recovery key derivation");
-
-        xpub.to_x_only_pub()
-    }
-
-    fn master_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
-        let path = [
-            ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
-        ];
-
-        let xpub = self.master_xpub.derive_pub(secp, &path)
-            .expect("master key derivation");
-
-        xpub.to_x_only_pub()
-    }
-
-    fn withdrawal_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
-        let path = [
-            ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
-        ];
-
-        let xpub = self.withdrawal_xpub.derive_pub(secp, &path)
-            .expect("withdrawal key derivation");
-
-        xpub.to_x_only_pub()
-    }
-
-    fn withdrawal_script<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, timelock: u32) -> ScriptBuf {
-        let mut builder = Builder::new();
-
-        let withdrawal_key = self.withdrawal_key(secp, depth);
-
-        builder
-            .push_int(timelock as i64)
-            .push_opcode(OP_CSV)
-            .push_x_only_key(&withdrawal_key)
-            .push_opcode(OP_CHECKSIG)
-            .into_script()
-    }
-
-    fn withdrawal_timelock(&self, value: VaultAmount) -> u32 {
-        u32::saturating_mul(value.amount, self.delay_per_increment)
-    }
-
-    fn withdrawal_output<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, value: VaultAmount) -> TxOut {
-        let master_key = self.master_key(secp, depth);
-        let recovery_tx = self.recovery_template(secp, depth + 1, value);
-
-        let timelock = self.withdrawal_timelock(value);
-        let withdrawal_script = self.withdrawal_script(secp, depth, timelock);
-
-        let withdrawal = TapNodeHash::from_script(&withdrawal_script, LeafVersion::TapScript);
-        // FIXME: let's make this 1 and the vault 0?
-        let recovery_template = get_default_template(&recovery_tx, 1)
-            .expect("recovery tx template");
-
-        let mut builder = Builder::new();
-        builder.push_slice(recovery_template.as_ref());
-        builder.push_opcode(OP_CHECKTEMPLATEVERIFY);
-        builder.push_x_only_key(&self.withdrawal_key(secp, depth));
-        builder.push_opcode(OP_CHECKSIG);
-
-        let recovery = TapNodeHash::from_script(&builder.as_script(), LeafVersion::TapScript);
-
-        let root_node_hash = TapNodeHash::from_node_hashes(recovery, withdrawal);
-
-        let script_pubkey = ScriptBuf::new_p2tr(secp, master_key, Some(root_node_hash));
-
-        TxOut {
-            value: value.into(),
-            script_pubkey,
-        }
-    }
-
-    fn recovery_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, value: VaultAmount) -> Transaction {
-        let mut input: Vec<TxIn> = Vec::new();
-        input.push(dummy_input(RelativeLockTime::ZERO));
-        input.push(dummy_input(RelativeLockTime::ZERO));
-        let mut output: Vec<TxOut> = Vec::new();
-
-        let key = self.recovery_key(secp, depth);
-
-        let script_pubkey = ScriptBuf::new_p2tr(secp, key, None);
-
-        let recovery_output = TxOut {
-            value: value.into(),
-            script_pubkey,
-        };
-
-        output.push(recovery_output);
-        output.push(ephemeral_anchor());
-
-        Transaction {
-            version: Version::non_standard(3),
-            lock_time: LockTime::ZERO,
-            input,
-            output,
-        }
-    }
-
-    // SHIT we have a 1 input and 2 input variation at every step
-    // I think the 1 input version would have a lock time, and the 2 input version probably doesn't
-    // need it (that'd be a deposit)
-    fn terminal_tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, input_count: usize, lock_time: RelativeLockTime, value: VaultAmount, withdrawal_amount: VaultAmount) -> Transaction {
-        let mut input: Vec<TxIn> = Vec::new();
-
-        for _ in 0..input_count {
-            input.push(dummy_input(lock_time));
-            input.push(dummy_input(lock_time));
-        }
-
-        let mut output: Vec<TxOut> = Vec::new();
-
-        let key = self.recovery_key(secp, depth + 1);
-
-        let script_pubkey = ScriptBuf::new_p2tr(secp, key, None);
-
-        let recovery_output = TxOut {
-            value: value.into(),
-            script_pubkey,
-        };
-        output.push(recovery_output);
-
-        if withdrawal_amount.to_sats() > 0 {
-            let withdrawal_output = self.withdrawal_output(secp, depth + 1, withdrawal_amount);
-            output.push(withdrawal_output);
-        }
-        output.push(ephemeral_anchor());
-
-        Transaction {
-            version: Version::non_standard(3),
-            lock_time: LockTime::ZERO,
-            input,
-            output,
-        }
-    }
+fn read_config(path: &PathBuf) -> Configuration {
+    let config = std::fs::read_to_string(path)
+        .expect("Can't read config");
+    toml::from_str::<Configuration>(&config)
+        .expect("Can't parse config")
 }
 
 fn main() {
-    println!("Hello, world!");
+    let args = CommandLine::parse();
+
+    let secp = Secp256k1::new();
+
+    match args.command {
+        Command::Generate => {
+            let master_xpriv = new_xpriv(args.network.into());
+
+            let vault_parameters = VaultParameters::from_xpriv(&secp, &master_xpriv, 0);
+
+            let (descriptor, _, _) = Bip86(master_xpriv, KeychainKind::External)
+                .build(args.network)
+                .expect("Failed to build external descriptor");
+
+            let descriptor_string = descriptor.to_string();
+
+            let (change_descriptor, _, _) = Bip86(master_xpriv, KeychainKind::Internal)
+                .build(args.network)
+                .expect("Failed to build change descriptor");
+
+            let change_descriptor_string = change_descriptor.to_string();
+
+            let mut sqlite = Connection::open(&args.wallet_path)
+                .expect("open wallet");
+
+            Vault::init(&mut sqlite).expect("init vault");
+
+            let mut wallet = Wallet::create(descriptor, change_descriptor)
+                .network(args.network)
+                .create_wallet(&mut sqlite)
+                .expect("wallet create");
+
+            let req = wallet.start_full_scan()
+                .build();
+
+            let blocking_esplora = bdk_esplora::esplora_client::Builder::new(&args.esplora)
+                .build_blocking();
+
+            let result = blocking_esplora.full_scan(req, 32, 4)
+                .expect("full scan failed");
+
+            wallet.apply_update(result)
+                .expect("update failed");
+
+            wallet.persist(&mut sqlite)
+                .expect("update sqlite");
+
+            let config = Configuration {
+                vault_parameters,
+                master_xpriv,
+                wallet_path: args.wallet_path,
+                descriptor: descriptor_string.clone(),
+                change_descriptor: change_descriptor_string.clone(),
+            };
+
+            {
+                let mut transaction = sqlite.transaction().expect("start transaction");
+                transaction.execute(r#"
+                    insert into
+                        mccv_secret
+                    (
+                        master_xpriv,
+                        descriptor,
+                        change_descriptor
+                    )
+                    values
+                    ( ?, ?, ? )
+                "#, params![&master_xpriv.to_string(), descriptor_string, change_descriptor_string])
+                    .expect("insert material");
+
+                transaction.commit()
+                    .expect("commit transaction");
+            }
+
+            let config = toml::to_string(&config).expect("serialize config");
+            std::fs::write(args.config, config.as_bytes()).expect("write config");
+        },
+        Command::List => {
+            let config = read_config(&args.config);
+            let mut sqlite = Connection::open(&args.wallet_path)
+                .expect("open wallet");
+
+            Vault::init(&mut sqlite).expect("init vault");
+
+            let mut wallet = Wallet::load()
+                .load_wallet(&mut sqlite)
+                .expect("load wallet")
+                .expect("load wallet");
+
+            let req = wallet.start_sync_with_revealed_spks()
+                .build();
+
+            let blocking_esplora = bdk_esplora::esplora_client::Builder::new(&args.esplora)
+                .build_blocking();
+
+            //let result = blocking_esplora.full_scan(req, 32, 4)
+            let result = blocking_esplora.sync(req, 4)
+                .expect("full scan failed");
+
+            wallet.apply_update(result)
+                .expect("update failed");
+
+            wallet.persist(&mut sqlite)
+                .expect("update sqlite");
+
+            let balance = wallet.balance();
+
+            println!("   immature: {}", balance.immature);
+            println!("+ confirmed: {}", balance.confirmed);
+            println!("----------------------------------");
+            println!("total: {}", balance.total());
+
+            todo!()
+        }
+        Command::Sync => {
+            let config = read_config(&args.config);
+            let mut sqlite = Connection::open(&args.wallet_path)
+                .expect("open wallet");
+
+            Vault::init(&mut sqlite).expect("init vault");
+
+            let mut wallet = Wallet::load()
+                .load_wallet(&mut sqlite)
+                .expect("load wallet")
+                .expect("load wallet");
+
+            let req = wallet.start_sync_with_revealed_spks()
+                .build();
+
+            let blocking_esplora = bdk_esplora::esplora_client::Builder::new(&args.esplora)
+                .build_blocking();
+
+            //let result = blocking_esplora.full_scan(req, 32, 4)
+            let result = blocking_esplora.sync(req, 4)
+                .expect("full scan failed");
+
+            wallet.apply_update(result)
+                .expect("update failed");
+
+            wallet.persist(&mut sqlite)
+                .expect("update sqlite");
+
+            println!("Sync'd");
+        }
+        Command::Receive => {
+            let config = read_config(&args.config);
+            let mut sqlite = Connection::open(&args.wallet_path)
+                .expect("open wallet");
+
+            Vault::init(&mut sqlite).expect("init vault");
+
+            let mut wallet = Wallet::load()
+                .load_wallet(&mut sqlite)
+                .expect("load wallet")
+                .expect("load wallet");
+
+            let address = wallet.next_unused_address(KeychainKind::External);
+
+            wallet.persist(&mut sqlite).expect("sqlite sync");
+
+            println!("Address: {}", address.to_string());
+        }
+        Command::Deposit(amount) => {
+            let config = read_config(&args.config);
+            let mut sqlite = Connection::open(&args.wallet_path)
+                .expect("open wallet");
+
+            Vault::init(&mut sqlite).expect("init vault");
+
+            // Actually I think you need the private descriptors via .descriptor() for
+            // .extract_keys()
+            //
+            // That's a bit clunky imho.
+            Wallet::load()
+                // Seems like this is unnecessary, it's more of a "check" to see that descriptors
+                // are correct according to the docs, which we don't care about
+                // Let's see if it actually is...
+                .descriptor(KeychainKind::External, Some(config.descriptor))
+                .descriptor(KeychainKind::Internal, Some(config.change_descriptor))
+                // This is what's necessary to load private keys
+                // wtf? does that mean we have to derive private keys from an xpriv ourselves?
+                // seems terribly unergonomic
+                //.keymap(KeychainKind::External, &config.descriptor)
+                //.keymap(KeychainKind::Internal, &config.change_descriptor)
+                .extract_keys()
+                .load_wallet(&mut sqlite)
+                .expect("success");
+
+            todo!()
+        }
+        Command::Withdraw(_amount) => {
+            let config = read_config(&args.config);
+
+            todo!()
+        }
+        Command::Benchmark => {
+            let config = read_config(&args.config);
+
+            let first_level = config.vault_parameters.templates_at_depth(&secp, 0);
+            println!("done");
+        }
+    }
 }
