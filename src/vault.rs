@@ -83,6 +83,10 @@ use std::collections::HashMap;
 
 pub type Depth = u32;
 
+fn builder_with_capacity(size: usize) -> Builder {
+    Builder::from(Vec::with_capacity(size))
+}
+
 #[derive(Serialize,Deserialize)]
 pub struct VaultParameters {
     scale: u32,
@@ -326,15 +330,12 @@ impl VaultParameters {
     }
 
     fn withdrawal_script<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, timelock: u32) -> ScriptBuf {
-        let mut builder = Builder::new();
-
-        let withdrawal_key = self.withdrawal_key(secp, depth);
-
         // TODO: decide if we want to omit the CSV when timelock is 0
-        builder
+        // Conservative estimating the push_int size
+        builder_with_capacity(5 + 1 + 33 + 1)
             .push_int(timelock as i64)
             .push_opcode(OP_CSV)
-            .push_x_only_key(&withdrawal_key)
+            .push_x_only_key(&self.withdrawal_key(secp, depth))
             .push_opcode(OP_CHECKSIG)
             .into_script()
     }
@@ -360,7 +361,7 @@ impl VaultParameters {
         let recovery_template = get_default_template(&recovery_tx, input_index)
             .expect("recovery tx template");
 
-        let recovery_script = Builder::new()
+        let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
             .push_slice(recovery_template.to_byte_array())
             .push_opcode(OP_CHECKTEMPLATEVERIFY)
             .push_opcode(OP_DROP)
@@ -472,7 +473,7 @@ impl VaultParameters {
                             .expect("vault tx template");
 
                         // uh checksequence? I guess we already enforce sequence by CTV
-                        let transition_script = Builder::new()
+                        let transition_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
                             .push_slice(next_state_template.to_byte_array())
                             .push_opcode(OP_CHECKTEMPLATEVERIFY)
                             .push_opcode(OP_DROP)
@@ -492,7 +493,7 @@ impl VaultParameters {
 
         let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
 
-        let recovery_script = Builder::new()
+        let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
             .push_slice(recovery_template.to_byte_array())
             .push_opcode(OP_CHECKTEMPLATEVERIFY)
             .push_opcode(OP_DROP)
@@ -509,7 +510,7 @@ impl VaultParameters {
 
             let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
 
-            let recovery_script = Builder::new()
+            let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
                 .push_slice(recovery_template.to_byte_array())
                 .push_opcode(OP_CHECKTEMPLATEVERIFY)
                 .push_opcode(OP_DROP)
