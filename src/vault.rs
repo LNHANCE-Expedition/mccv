@@ -416,33 +416,29 @@ impl VaultParameters {
     }
 
     // FIXME: should the terminal state just be all funds spendable by recovery or master?
-
-    // SHIT we have a 1 input and 2 input variation at every step
-    // I think the 1 input version would have a lock time, and the 2 input version probably doesn't
-    // need it (that'd be a deposit)
     fn terminal_tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters) -> Transaction {
-        let value = parameter.next_value();
+        let next_value = parameter.next_value();
         let withdrawal_amount = parameter.withdrawal_value();
 
         let mut output: Vec<TxOut> = Vec::new();
 
         let key = self.recovery_key(secp, depth + 1);
 
-        assert!(value.nonzero() || withdrawal_amount.nonzero());
+        assert!(next_value.nonzero() || withdrawal_amount.nonzero());
 
-        if value.nonzero() {
+        if next_value.nonzero() {
             // FIXME: should have master key with recovery alternate spending path
             let script_pubkey = ScriptBuf::new_p2tr(secp, key, None);
 
             let recovery_output = TxOut {
-                value: value.to_amount(self.scale),
+                value: next_value.to_amount(self.scale),
                 script_pubkey,
             };
             output.push(recovery_output);
         }
 
         if withdrawal_amount.nonzero() {
-            let withdrawal_output = self.withdrawal_output(secp, depth, value, withdrawal_amount);
+            let withdrawal_output = self.withdrawal_output(secp, depth, next_value, withdrawal_amount);
             output.push(withdrawal_output);
         }
         output.push(ephemeral_anchor());
