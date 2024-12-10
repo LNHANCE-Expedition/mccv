@@ -77,11 +77,13 @@ use serde::{
     Serialize,
 };
 
-use std::path::PathBuf;
-
 use std::io::Write;
 
 use std::collections::HashMap;
+
+use std::path::PathBuf;
+
+use std::time::{Duration, Instant};
 
 use crate::vault::{
     VaultParameters,
@@ -356,8 +358,12 @@ fn main() {
         Command::Benchmark => {
             let config = read_config(&args.config);
 
+            let start = Instant::now();
             let first_level = config.vault_parameters.templates_at_depth(&secp, 0);
-            println!("done");
+            let end = Instant::now();
+            let duration = end - start;
+
+            println!("done! {}s elapsed", duration.as_secs_f64());
         }
     }
 }
