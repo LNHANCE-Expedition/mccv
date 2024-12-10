@@ -182,23 +182,40 @@ fn get_default_template(transaction: &Transaction, input_index: u32) -> std::io:
         .any(|input| !input.script_sig.is_empty());
 
     if any_script_sigs {
+        let mut script_sig_sha256 = Sha256::engine();
+
         for input in transaction.input.iter() {
-            input.script_sig.consensus_encode(&mut sha256)?;
+            input.script_sig.consensus_encode(&mut script_sig_sha256)?;
         }
+
+        let script_sig_sha256 = Sha256::from_engine(script_sig_sha256);
+        script_sig_sha256.consensus_encode(&mut sha256)?;
     }
 
     let vin_count: u32 = transaction.input.len() as u32;
     sha256.write(&vin_count.to_le_bytes())?;
-    for input in transaction.input.iter() {
-        let sequence: u32 = input.sequence.to_consensus_u32();
-        sha256.write(&sequence.to_le_bytes())?;
+
+    {
+        let mut sequences_sha256 = Sha256::engine();
+        for input in transaction.input.iter() {
+            let sequence: u32 = input.sequence.to_consensus_u32();
+            sequences_sha256.write(&sequence.to_le_bytes())?;
+        }
+        let sequences_sha256 = Sha256::from_engine(sequences_sha256);
+        sequences_sha256.consensus_encode(&mut sha256)?;
     }
 
     let vout_count: u32 = transaction.output.len() as u32;
     sha256.write(&vout_count.to_le_bytes())?;
 
-    for output in transaction.output.iter() {
-        output.consensus_encode(&mut sha256)?;
+    {
+        let mut outputs_sha256 = Sha256::engine();
+        for output in transaction.output.iter() {
+            output.consensus_encode(&mut outputs_sha256)?;
+        }
+
+        let outputs_sha256 = Sha256::from_engine(outputs_sha256);
+        outputs_sha256.consensus_encode(&mut sha256)?;
     }
 
     sha256.write(&input_index.to_le_bytes())?;
