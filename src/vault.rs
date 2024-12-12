@@ -13,7 +13,6 @@ use bitcoin::opcodes::all::{
 use bitcoin::bip32::{
     Xpub,
     Xpriv,
-    DerivationPath,
     ChildNumber,
 };
 
@@ -29,8 +28,6 @@ use bitcoin::{
     script::Builder,
     consensus::Encodable,
     absolute::LockTime,
-    Network,
-    NetworkKind,
     opcodes::OP_TRUE,
     OutPoint,
     relative::LockTime as RelativeLockTime,

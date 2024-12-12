@@ -18,40 +18,15 @@ use bdk_wallet::{
 
 use bitcoin::NetworkKind;
 use bitcoin::bip32::{
-    Xpub,
     Xpriv,
-    DerivationPath,
-    ChildNumber,
 };
 
 use bitcoin::secp256k1::{
     Secp256k1,
-    Signing,
-    Verification,
-    XOnlyPublicKey,
 };
 
 use bitcoin::{
-    Amount,
-    script::Builder,
-    consensus::Encodable,
-    absolute::LockTime,
     Network,
-    opcodes::OP_TRUE,
-    OutPoint,
-    relative::LockTime as RelativeLockTime,
-    ScriptBuf,
-    TapNodeHash,
-    Transaction,
-    Txid, 
-    transaction::TxIn,
-    transaction::TxOut,
-    blockdata::transaction::Version,
-    taproot::{
-        LeafVersion,
-        TaprootBuilder,
-    },
-    Witness,
 };
 
 use clap::{
@@ -65,11 +40,6 @@ use rand::{
     thread_rng,
 };
 
-use rayon::iter::{
-    IntoParallelIterator,
-    ParallelIterator,
-};
-
 use rusqlite::{
     Connection,
     params,
@@ -80,18 +50,13 @@ use serde::{
     Serialize,
 };
 
-use std::io::Write;
-
-use std::collections::HashMap;
-
 use std::path::PathBuf;
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::vault::{
     VaultParameters,
     Vault,
-    VaultAmount,
 };
 
 fn new_xpriv(network: NetworkKind) -> Xpriv {
