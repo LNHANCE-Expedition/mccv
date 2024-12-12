@@ -814,7 +814,16 @@ impl Vault {
 mod test {
     use super::*;
 
+    use crate::test_util;
+
     use std::str::FromStr;
+
+    #[test]
+    fn test_ctv() {
+        for (tx, index, result) in test_util::get_ctv_test_vectors() {
+            assert_eq!(get_default_template(&tx, index).unwrap(), result);
+        }
+    }
 
     fn test_xpubs() -> (Xpub, Xpub, Xpub) {
         (

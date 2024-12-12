@@ -1,6 +1,9 @@
 mod migrate;
 mod vault;
 
+#[cfg(test)]
+mod test_util;
+
 use bdk_esplora::{
     EsploraExt,
 };
