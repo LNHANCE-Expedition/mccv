@@ -1,4 +1,10 @@
 use bitcoin::consensus::Decodable;
+use electrsd::{
+    ElectrsD,
+    bitcoind::BitcoinD,
+};
+
+use electrsd::bitcoind;
 
 use bitcoin::hashes::{
     Hash,
@@ -19,6 +25,16 @@ use serde::{
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::marker::PhantomData;
+
+pub(crate) fn get_test_daemons() -> (ElectrsD, BitcoinD) {
+    let bitcoind_path = bitcoind::exe_path().expect("Failed to get bitcoind path. See README.md \"Testing Error\" section.");
+    let bitcoind = BitcoinD::new(bitcoind_path).expect("Failed to start bitcoind");
+
+    let electrs_path = electrsd::exe_path().expect("Failed to get electrsd path. See README.md \"Testing Error\" section.");
+    let electrs = ElectrsD::new(electrs_path, &bitcoind).expect("Failed to start electrs");
+
+    (electrs, bitcoind)
+}
 
 struct TransactionHexVisitor(PhantomData<()>);
 
