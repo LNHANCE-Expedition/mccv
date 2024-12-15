@@ -1,3 +1,6 @@
+use bdk_wallet::error::CreateTxError;
+use bdk_wallet::{Wallet, KeychainKind};
+use bitcoin::FeeRate;
 use bitcoin::hashes::{
     Hash,
     sha256::Hash as Sha256,
@@ -43,6 +46,7 @@ use bitcoin::{
         TaprootBuilder,
     },
     Witness,
+    Psbt,
 };
 
 use crate::migrate::{
@@ -71,9 +75,6 @@ use serde::{
     Serialize,
 };
 
-
-use std::path::PathBuf;
-
 use std::io::Write;
 
 use std::collections::HashMap;
@@ -84,7 +85,7 @@ fn builder_with_capacity(size: usize) -> Builder {
     Builder::from(Vec::with_capacity(size))
 }
 
-#[derive(Serialize,Deserialize)]
+#[derive(Clone,Serialize,Deserialize)]
 pub struct VaultParameters {
     scale: u32,
     /// Maximum value = max * scale
@@ -275,12 +276,12 @@ impl VaultTransition {
 pub struct VaultStateParameters {
     //depth: Depth, // Always implicit in the way we process
     transition: VaultTransition,
-    initial_amount: VaultAmount,
+    parent_state_value: VaultAmount,
 }
 
 impl VaultStateParameters {
-    fn next_value(&self) -> VaultAmount {
-        self.transition.next_value(self.initial_amount)
+    fn result_state_value(&self) -> VaultAmount {
+        self.transition.next_value(self.parent_state_value)
     }
 
     fn withdrawal_value(&self) -> VaultAmount {
@@ -290,6 +291,8 @@ impl VaultStateParameters {
         }
     }
 }
+
+type VaultGeneration = HashMap<VaultStateParameters, Transaction>;
 
 impl VaultParameters {
     fn recovery_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
@@ -414,7 +417,7 @@ impl VaultParameters {
 
     // FIXME: should the terminal state just be all funds spendable by recovery or master?
     fn terminal_tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters) -> Transaction {
-        let next_value = parameter.next_value();
+        let next_value = parameter.result_state_value();
         let withdrawal_amount = parameter.withdrawal_value();
 
         let mut output: Vec<TxOut> = Vec::new();
@@ -535,7 +538,7 @@ impl VaultParameters {
     // FIXME: probably easiest to just specify the previous transition?
     //fn tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, input_count: usize, lock_time: RelativeLockTime, value: VaultAmount, withdrawal_amount: VaultAmount, next_states: &HashMap<VaultStateParameters, Transaction>) -> Transaction {
     fn tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: &HashMap<VaultStateParameters, Transaction>) -> Transaction {
-        let next_value = parameter.next_value();
+        let next_value = parameter.result_state_value();
         let withdrawal_amount = parameter.withdrawal_value();
 
         assert!(next_value.nonzero() || withdrawal_amount.nonzero());
@@ -594,7 +597,7 @@ impl VaultParameters {
                     Some(
                         VaultStateParameters {
                             transition: VaultTransition::Withdrawal(withdrawal),
-                            initial_amount: previous_value,
+                            parent_state_value: previous_value,
                         }
                     )
                 } else {
@@ -610,7 +613,7 @@ impl VaultParameters {
                     Some(
                         VaultStateParameters{
                             transition: VaultTransition::Deposit(deposit),
-                            initial_amount: previous_value,
+                            parent_state_value: previous_value,
                         }
                     )
                 } else {
@@ -632,7 +635,7 @@ impl VaultParameters {
                         Some(
                             VaultStateParameters {
                                 transition: VaultTransition::Withdrawal(withdrawal),
-                                initial_amount: previous_value,
+                                parent_state_value: previous_value,
                             }
                         )
                     } else {
@@ -652,7 +655,7 @@ impl VaultParameters {
                             Some(
                                 VaultStateParameters{
                                     transition: VaultTransition::Deposit(deposit),
-                                    initial_amount: previous_value,
+                                    parent_state_value: previous_value,
                                 }
                             )
                         } else {
@@ -708,14 +711,25 @@ impl VaultParameters {
         }
     }
 
-    pub fn templates_at_depth<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> HashMap<VaultStateParameters, Transaction> {
+    pub fn templates_at_depth<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> (Option<HashMap<VaultStateParameters, Transaction>>, HashMap<VaultStateParameters, Transaction>) {
         let mut next_state = self.terminal_tx_templates(&secp, self.max_depth);
-        for depth in (depth..self.max_depth).into_iter().rev() {
+
+        let mut i = self.max_depth - 1;
+        while i >= depth {
             // tx_templates handles when depth == 0 specially for us
-            next_state = self.tx_templates(&secp, depth, &next_state);
+            next_state = self.tx_templates(&secp, i, &next_state);
+
+            i -= 1;
         }
 
-        next_state
+        // FIXME: get parent state, but how?
+        if i >= 0 {
+            let previous_state = self.tx_templates(&secp, i, &next_state);
+
+            (Some(previous_state), next_state)
+        } else {
+            (None, next_state)
+        }
     }
 
     pub fn from_xpriv<C: Signing>(secp: &Secp256k1<C>, xpriv: &Xpriv, vault_number: u32) -> Self {
@@ -761,33 +775,46 @@ impl VaultParameters {
 
 // Struct members are the outpoints
 enum VaultOutpoints {
-    Deposit(usize),
+    Deposit(VaultAmount),
     /// Any withdrawal that does not completely drain the vault
     /// .0 is the vault outpoint
     /// .1 is the withdrawal outpoint
-    Withdrawal(usize, usize),
-    /// 
-    Close(usize),
+    Withdrawal(VaultAmount, VaultAmount),
+    /// A sweep of the vault to recovery location
+    Close(VaultAmount),
 }
 
-struct VaultTransaction {
+pub struct VaultTransaction {
     txid: Txid,
+    depth: Depth,
     outpoints: VaultOutpoints,
     /// Vault amount resulting from this transaction
     value: VaultAmount,
 }
 
-trait VaultHistory {
-    fn get_deposit_info(&self, deposit_amount: VaultAmount, parameters: &VaultParameters) -> (ScriptBuf, usize) {
-        
-
-
-        todo!()
-    }
+#[derive(Clone,Copy,Debug)]
+pub enum VaultTransactionToStateParametersError {
+    CloseTransaction,
 }
 
-impl VaultHistory for Vec<VaultTransaction> {
+impl TryFrom<&VaultTransaction> for VaultStateParameters {
+    type Error = VaultTransactionToStateParametersError;
 
+    fn try_from(transaction: &VaultTransaction) -> Result<Self, Self::Error> {
+        let (initial_amount, transition) = match transaction.outpoints {
+            // FIXME: maybe assert that transaction.value >= amount?
+            VaultOutpoints::Deposit(amount) => (transaction.value - amount, VaultTransition::Deposit(amount)),
+            VaultOutpoints::Withdrawal(amount, withdrawal_amount) => (amount + withdrawal_amount, VaultTransition::Withdrawal(withdrawal_amount)),
+            VaultOutpoints::Close(_amount) => {
+                return Err(VaultTransactionToStateParametersError::CloseTransaction);
+            }
+        };
+
+        Ok(Self {
+            transition,
+            parent_state_value: initial_amount,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -796,14 +823,137 @@ pub enum VaultInitializationError {
     ConfigurationError(rusqlite::Error),
 }
 
-pub(crate) struct Vault {}
+#[derive(Debug)]
+pub enum VaultDepositError {
+    TransactionBuildError(CreateTxError),
+    VaultClosed,
+}
+
+pub struct Vault {
+    parameters: VaultParameters,
+    history: Vec<VaultTransaction>,
+}
 
 impl Vault {
-    pub fn init(connection: &mut Connection) -> Result<(), VaultInitializationError> {
+    pub fn init(&self, connection: &mut Connection) -> Result<(), VaultInitializationError> {
         migrate(connection)
             .map_err(|e| VaultInitializationError::MigrationError(e))?;
         configure(&connection)
             .map_err(|e| VaultInitializationError::ConfigurationError(e))
+    }
+
+    pub fn new(parameters: VaultParameters, history: Vec<VaultTransaction>) -> Self {
+        Self {
+            parameters,
+            history,
+        }
+    }
+
+    pub fn load(connection: &mut Connection) -> Result<Self, rusqlite::Error> {
+        todo!()
+    }
+
+    // FIXME: and parent utxo scripts
+    pub fn deposit_transaction_template<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Option<Transaction> {
+        let depth = self.history.len() as Depth;
+
+        let transactions = self.parameters.templates_at_depth(secp, depth);
+
+        let parameters = match self.history.last() {
+            //Some(transaction) => VaultStateParameters::try_from(transaction).ok(),
+            Some(transaction) => Some(
+                VaultStateParameters {
+                    transition: VaultTransition::Deposit(deposit_amount),
+                    parent_state_value: transaction.value,
+                }
+            ),
+            None => Some(
+                VaultStateParameters {
+                        transition: VaultTransition::Deposit(deposit_amount),
+                        parent_state_value: VaultAmount(0),
+                }
+            ),
+        };
+
+        // Could underflow if depth check is not followed
+        let parent_index = self.history.len() - 1;
+
+        let parameters = match self.history.get(parent_index) {
+            //Some(transaction) => VaultStateParameters::try_from(transaction).ok(),
+            Some(transaction) => Some(
+                VaultStateParameters {
+                    transition: VaultTransition::Deposit(deposit_amount),
+                    parent_state_value: transaction.value,
+                }
+            ),
+            None => Some(
+                VaultStateParameters {
+                        transition: VaultTransition::Deposit(deposit_amount),
+                        parent_state_value: VaultAmount(0),
+                }
+            ),
+        };
+
+        // FIXME: I think I fucked up here anyway, the last tx state parameters 
+        // we need to also see if we have a timelock from the parent transaction...
+
+        // FIXME!!!!!
+        parameters.and_then(|parameters| transactions.1.get(&parameters).cloned())
+    }
+
+    pub fn get_vault_utxo_witness<C: Verification>(&self, secp: &Secp256k1<C>, parameters: VaultStateParameters) -> Option<Transaction> {
+        let depth = self.history.len() as Depth;
+
+        if depth < 1 {
+            return None;
+        }
+
+        /*
+        let transactions = self.parameters.templates_at_depth(secp, depth - 1);
+
+        let parameters = match self.history.last() {
+            Some(transaction) => VaultStateParameters::try_from(transaction).ok(),
+            None => Some(
+                VaultStateParameters {
+                        transition: VaultTransition::Deposit(deposit_amount),
+                        initial_amount: VaultAmount(0),
+                }
+            ),
+        };
+
+        parameters.and_then(|parameters| transactions.get(&parameters).cloned())
+        */
+        todo!()
+    }
+
+    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, wallet: &mut Wallet, deposit_amount: VaultAmount, fee_rate: FeeRate) -> Result<(Psbt, Psbt), VaultDepositError> {
+        let mut template = self.deposit_transaction_template(secp, deposit_amount)
+            .ok_or(VaultDepositError::VaultClosed)?;
+
+        // TODO: add parent utxo witness
+
+        let address = wallet.reveal_next_address(KeychainKind::Internal);
+        let mut builder = wallet.build_tx();
+        builder
+            .fee_absolute(Amount::from_sat(0))
+            .add_recipient(address.script_pubkey(), deposit_amount.to_amount(self.parameters.scale));
+
+        let shape_tx = builder.finish()
+            .map_err(|e| VaultDepositError::TransactionBuildError(e))?;
+
+        todo!()
+    }
+}
+
+fn vault_generation_filter(current_amount: VaultAmount, previous_amount: Option<VaultAmount>) -> impl Fn(&VaultStateParameters, &mut Transaction) -> bool {
+    // FIXME: Make sure we're thinking about generations correctly
+    move |params: &VaultStateParameters, _tx: &mut Transaction| -> bool {
+        if let Some(previous_amount) = previous_amount {
+            params.result_state_value() == current_amount
+                && params.parent_state_value == previous_amount
+        } else {
+            params.result_state_value() == current_amount
+        }
     }
 }
 
@@ -814,6 +964,16 @@ mod test {
     use crate::test_util;
 
     use std::str::FromStr;
+    use bdk_electrum::{
+        electrum_client::ElectrumApi,
+    };
+
+    use bdk_wallet::KeychainKind;
+    use bdk_wallet::Wallet;
+
+    use electrsd::bitcoind::bitcoincore_rpc::{
+        RpcApi,
+    };
 
     #[test]
     fn test_ctv() {
@@ -834,8 +994,8 @@ mod test {
         let (master_xpub, recovery_xpub, withdrawal_xpub) = test_xpubs();
 
         VaultParameters {
-            scale: 100_000,
-            max: VaultAmount(100),
+            scale: 100_000_000,
+            max: VaultAmount(10),
             master_xpub,
             recovery_xpub,
             withdrawal_xpub,
@@ -851,12 +1011,41 @@ mod test {
         let secp = Secp256k1::new();
         let test_parameters = test_parameters();
 
-        let templates = test_parameters.templates_at_depth(&secp, 0);
+        let (_parent_templates, templates) = test_parameters.templates_at_depth(&secp, 0);
 
         for (params, template) in templates.into_iter() {
             assert_eq!(template.input.len(), 1);
-            assert_eq!(params.initial_amount, VaultAmount(0));
+            assert_eq!(params.parent_state_value, VaultAmount(0));
         }
+    }
+
+    #[test]
+    fn test_deposit() {
+        let secp = Secp256k1::new();
+
+        let (electrum, electrsd, bitcoind) = test_util::get_test_daemons();
+        let test_parameters = test_parameters();
+
+        let (mut wallet, mut sqlite) = test_util::load_wallet();
+
+        test_util::generate_to_wallet(&bitcoind, &electrum, &mut wallet, 100);
+
+        std::thread::sleep(std::time::Duration::from_secs(30));
+
+        test_util::full_scan(&electrum, &mut wallet, &mut sqlite);
+
+        let balance = wallet.balance();
+
+        assert_eq!(balance.confirmed.to_sat(), 50 * 100_000_000);
+
+        let vault = Vault::new(test_parameters, Vec::new());
+
+        vault.init(&mut sqlite)
+            .expect("vault init");
+
+        //vaultinitial_script_pubkey(&secp, VaultAmount(5), next_states: &HashMap<VaultStateParameters, Transaction>) -> ScriptBuf {
+
+        todo!()
     }
 
 }

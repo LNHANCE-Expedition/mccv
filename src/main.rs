@@ -4,8 +4,9 @@ mod vault;
 #[cfg(test)]
 mod test_util;
 
-use bdk_esplora::{
-    EsploraExt,
+use bdk_electrum::{
+    BdkElectrumClient,
+    electrum_client,
 };
 
 use bdk_wallet::KeychainKind;
@@ -107,8 +108,8 @@ struct CommandLine {
     #[arg(short = 'n', long = "network", default_value="signet")]
     network: Network,
 
-    #[arg(short = 'e', long = "esplora", default_value="http://signet.bitcoindevkit.net")]
-    esplora: String,
+    #[arg(short = 'e', long = "electrum")]
+    electrum: String,
 }
 
 #[derive(Serialize,Deserialize)]
@@ -153,8 +154,6 @@ fn main() {
             let mut sqlite = Connection::open(&args.wallet_path)
                 .expect("open wallet");
 
-            Vault::init(&mut sqlite).expect("init vault");
-
             let mut wallet = Wallet::create(descriptor, change_descriptor)
                 .network(args.network)
                 .create_wallet(&mut sqlite)
@@ -163,10 +162,12 @@ fn main() {
             let req = wallet.start_full_scan()
                 .build();
 
-            let blocking_esplora = bdk_esplora::esplora_client::Builder::new(&args.esplora)
-                .build_blocking();
+            let electrum = electrum_client::Client::new(args.electrum.as_str())
+                .expect("create electrum client");
 
-            let result = blocking_esplora.full_scan(req, 32, 4)
+            let electrum = BdkElectrumClient::new(electrum);
+
+            let result = electrum.full_scan(req, 32, 4, true)
                 .expect("full scan failed");
 
             wallet.apply_update(result)
@@ -174,6 +175,9 @@ fn main() {
 
             wallet.persist(&mut sqlite)
                 .expect("update sqlite");
+
+            let vault = Vault::new(vault_parameters.clone(), Vec::new());
+            vault.init(&mut sqlite).expect("Initialize sqlite");
 
             let config = Configuration {
                 vault_parameters,
@@ -210,8 +214,6 @@ fn main() {
             let mut sqlite = Connection::open(&args.wallet_path)
                 .expect("open wallet");
 
-            Vault::init(&mut sqlite).expect("init vault");
-
             let mut wallet = Wallet::load()
                 .load_wallet(&mut sqlite)
                 .expect("load wallet")
@@ -220,11 +222,12 @@ fn main() {
             let req = wallet.start_sync_with_revealed_spks()
                 .build();
 
-            let blocking_esplora = bdk_esplora::esplora_client::Builder::new(&args.esplora)
-                .build_blocking();
+            let electrum = electrum_client::Client::new(args.electrum.as_str())
+                .expect("create electrum client");
 
-            //let result = blocking_esplora.full_scan(req, 32, 4)
-            let result = blocking_esplora.sync(req, 4)
+            let electrum = BdkElectrumClient::new(electrum);
+
+            let result = electrum.sync(req, 4, true)
                 .expect("full scan failed");
 
             wallet.apply_update(result)
@@ -240,14 +243,13 @@ fn main() {
             println!("----------------------------------");
             println!("total: {}", balance.total());
 
+            let vault = Vault::load(&mut sqlite).expect("load vault");
             todo!()
         }
         Command::Sync => {
             let config = read_config(&args.config);
             let mut sqlite = Connection::open(&args.wallet_path)
                 .expect("open wallet");
-
-            Vault::init(&mut sqlite).expect("init vault");
 
             let mut wallet = Wallet::load()
                 .load_wallet(&mut sqlite)
@@ -257,11 +259,12 @@ fn main() {
             let req = wallet.start_sync_with_revealed_spks()
                 .build();
 
-            let blocking_esplora = bdk_esplora::esplora_client::Builder::new(&args.esplora)
-                .build_blocking();
+            let electrum = electrum_client::Client::new(args.electrum.as_str())
+                .expect("create electrum client");
 
-            //let result = blocking_esplora.full_scan(req, 32, 4)
-            let result = blocking_esplora.sync(req, 4)
+            let electrum = BdkElectrumClient::new(electrum);
+
+            let result = electrum.sync(req, 4, true)
                 .expect("full scan failed");
 
             wallet.apply_update(result)
@@ -270,14 +273,14 @@ fn main() {
             wallet.persist(&mut sqlite)
                 .expect("update sqlite");
 
+            let vault = Vault::load(&mut sqlite).expect("load vault");
+
             println!("Sync'd");
         }
         Command::Receive => {
             let config = read_config(&args.config);
             let mut sqlite = Connection::open(&args.wallet_path)
                 .expect("open wallet");
-
-            Vault::init(&mut sqlite).expect("init vault");
 
             let mut wallet = Wallet::load()
                 .load_wallet(&mut sqlite)
@@ -288,14 +291,14 @@ fn main() {
 
             wallet.persist(&mut sqlite).expect("sqlite sync");
 
+            let vault = Vault::load(&mut sqlite).expect("load vault");
+
             println!("Address: {}", address.to_string());
         }
         Command::Deposit(amount) => {
             let config = read_config(&args.config);
             let mut sqlite = Connection::open(&args.wallet_path)
                 .expect("open wallet");
-
-            Vault::init(&mut sqlite).expect("init vault");
 
             // Actually I think you need the private descriptors via .descriptor() for
             // .extract_keys()
@@ -315,6 +318,8 @@ fn main() {
                 .extract_keys()
                 .load_wallet(&mut sqlite)
                 .expect("success");
+
+            let vault = Vault::load(&mut sqlite).expect("load vault");
 
             todo!()
         }
