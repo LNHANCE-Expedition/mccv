@@ -1,6 +1,6 @@
 use bdk_wallet::error::CreateTxError;
 use bdk_wallet::{Wallet, KeychainKind};
-use bitcoin::FeeRate;
+use bitcoin::{FeeRate, BlockHash};
 use bitcoin::hashes::{
     Hash,
     sha256::Hash as Sha256,
@@ -48,6 +48,7 @@ use bitcoin::{
     Witness,
     Psbt,
 };
+use rusqlite::Row;
 
 use crate::migrate::{
     configure,
@@ -68,6 +69,10 @@ use rayon::iter::{
 use rusqlite::{
     Connection,
     params,
+    types::{
+        ToSql,
+        FromSql,
+    },
 };
 
 use serde::{
@@ -78,6 +83,7 @@ use serde::{
 use std::io::Write;
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 
 pub type Depth = u32;
 
@@ -787,34 +793,7 @@ enum VaultOutpoints {
 pub struct VaultTransaction {
     txid: Txid,
     depth: Depth,
-    outpoints: VaultOutpoints,
-    /// Vault amount resulting from this transaction
-    value: VaultAmount,
-}
-
-#[derive(Clone,Copy,Debug)]
-pub enum VaultTransactionToStateParametersError {
-    CloseTransaction,
-}
-
-impl TryFrom<&VaultTransaction> for VaultStateParameters {
-    type Error = VaultTransactionToStateParametersError;
-
-    fn try_from(transaction: &VaultTransaction) -> Result<Self, Self::Error> {
-        let (initial_amount, transition) = match transaction.outpoints {
-            // FIXME: maybe assert that transaction.value >= amount?
-            VaultOutpoints::Deposit(amount) => (transaction.value - amount, VaultTransition::Deposit(amount)),
-            VaultOutpoints::Withdrawal(amount, withdrawal_amount) => (amount + withdrawal_amount, VaultTransition::Withdrawal(withdrawal_amount)),
-            VaultOutpoints::Close(_amount) => {
-                return Err(VaultTransactionToStateParametersError::CloseTransaction);
-            }
-        };
-
-        Ok(Self {
-            transition,
-            parent_state_value: initial_amount,
-        })
-    }
+    state_parameters: VaultStateParameters,
 }
 
 #[derive(Debug)]
@@ -829,27 +808,116 @@ pub enum VaultDepositError {
     VaultClosed,
 }
 
+pub type VaultId = i64;
+
+pub struct SqliteVaultStorage {
+    sqlite: rusqlite::Connection,
+}
+
+#[derive(Debug)]
+pub enum SqliteInitializationError {
+    MigrationError(MigrationError),
+    ConnectionConfigurationError(rusqlite::Error),
+}
+
+impl SqliteVaultStorage {
+    pub fn from_connection(mut sqlite: rusqlite::Connection) -> Result<Self, SqliteInitializationError> {
+        migrate(&mut sqlite)
+            .map_err(|e| SqliteInitializationError::MigrationError(e))?;
+        configure(&sqlite)
+            .map_err(|e| SqliteInitializationError::ConnectionConfigurationError(e))?;
+
+        Ok(SqliteVaultStorage {
+            sqlite,
+        })
+    }
+}
+
+impl Deref for SqliteVaultStorage {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sqlite
+    }
+}
+
+impl DerefMut for SqliteVaultStorage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sqlite
+    }
+}
+
 pub struct Vault {
+    id: VaultId,
     parameters: VaultParameters,
     history: Vec<VaultTransaction>,
+    confirmations: Vec<(u32, BlockHash)>,
+}
+
+#[derive(Debug)]
+pub enum CreateVaultError {
+    SqliteError(rusqlite::Error),
 }
 
 impl Vault {
-    pub fn init(&self, connection: &mut Connection) -> Result<(), VaultInitializationError> {
-        migrate(connection)
-            .map_err(|e| VaultInitializationError::MigrationError(e))?;
-        configure(&connection)
-            .map_err(|e| VaultInitializationError::ConfigurationError(e))
-    }
+    pub fn create_new(storage: &mut SqliteVaultStorage, name: &str, parameters: VaultParameters) -> Result<Self, CreateVaultError> {
+        let mut statement = storage.prepare(r#"
+            insert into
+                mccv_vault
+            (
+                name
+            )
+            values (?)
+            returning id
+        "#)
+        .map_err(|e| CreateVaultError::SqliteError(e))?;
 
-    pub fn new(parameters: VaultParameters, history: Vec<VaultTransaction>) -> Self {
-        Self {
+        let vault_ids: Vec<i64> = statement
+            .query_map(
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(|e| CreateVaultError::SqliteError(e))?
+            .collect::<rusqlite::Result<Vec<i64>>>()
+            .map_err(|e| CreateVaultError::SqliteError(e))?;
+
+        Ok(Self {
+            id: vault_ids[0],
             parameters,
-            history,
-        }
+            history: Vec::new(),
+            confirmations: Vec::new(),
+        })
     }
 
-    pub fn load(connection: &mut Connection) -> Result<Self, rusqlite::Error> {
+    pub fn load(id: VaultId, storage: &mut SqliteVaultStorage) -> Result<Self, rusqlite::Error> {
+        let _vault_id = storage.query_row("select (id) from mccv_vault", params![id], |row: &Row| -> rusqlite::Result<i64> { row.get(0) })?;
+
+        Ok(Self {
+            id,
+            parameters: todo!(),
+            history: todo!(),
+            confirmations: todo!(),
+        })
+    }
+
+    pub fn list(connection: &mut Connection) -> Result<Vec<VaultId>, rusqlite::Error> {
+        let mut query = connection.prepare(r#"
+            select
+            (
+                id
+            )
+            from
+                mccv_vault
+        "#)?;
+
+        let result = query.query_map(params![], |row| -> rusqlite::Result<VaultId> {
+            row.get(0)
+        })?
+        .collect::<rusqlite::Result<Vec<VaultId>>>();
+        result
+    }
+
+    pub fn store(&self, connection: &mut Connection) -> Result<Self, rusqlite::Error> {
         todo!()
     }
 
@@ -861,44 +929,31 @@ impl Vault {
 
         let parameters = match self.history.last() {
             //Some(transaction) => VaultStateParameters::try_from(transaction).ok(),
-            Some(transaction) => Some(
-                VaultStateParameters {
-                    transition: VaultTransition::Deposit(deposit_amount),
-                    parent_state_value: transaction.value,
-                }
-            ),
-            None => Some(
-                VaultStateParameters {
-                        transition: VaultTransition::Deposit(deposit_amount),
-                        parent_state_value: VaultAmount(0),
-                }
-            ),
+            Some(transaction) => transaction.state_parameters.clone(),
+            None => VaultStateParameters {
+                transition: VaultTransition::Deposit(deposit_amount),
+                parent_state_value: VaultAmount(0),
+            },
         };
 
         // Could underflow if depth check is not followed
         let parent_index = self.history.len() - 1;
 
         let parameters = match self.history.get(parent_index) {
-            //Some(transaction) => VaultStateParameters::try_from(transaction).ok(),
-            Some(transaction) => Some(
-                VaultStateParameters {
-                    transition: VaultTransition::Deposit(deposit_amount),
-                    parent_state_value: transaction.value,
-                }
-            ),
-            None => Some(
-                VaultStateParameters {
-                        transition: VaultTransition::Deposit(deposit_amount),
-                        parent_state_value: VaultAmount(0),
-                }
-            ),
+            Some(transaction) => transaction.state_parameters.clone(),
+            None => VaultStateParameters {
+                transition: VaultTransition::Deposit(deposit_amount),
+                parent_state_value: VaultAmount(0),
+            },
         };
 
         // FIXME: I think I fucked up here anyway, the last tx state parameters 
         // we need to also see if we have a timelock from the parent transaction...
 
         // FIXME!!!!!
-        parameters.and_then(|parameters| transactions.1.get(&parameters).cloned())
+        //parameters.and_then(|parameters| transactions.1.get(&parameters).cloned())
+
+        todo!()
     }
 
     pub fn get_vault_utxo_witness<C: Verification>(&self, secp: &Secp256k1<C>, parameters: VaultStateParameters) -> Option<Transaction> {
@@ -1038,10 +1093,10 @@ mod test {
 
         assert_eq!(balance.confirmed.to_sat(), 50 * 100_000_000);
 
-        let vault = Vault::new(test_parameters, Vec::new());
-
-        vault.init(&mut sqlite)
-            .expect("vault init");
+        let mut storage = SqliteVaultStorage::from_connection(sqlite)
+            .expect("initialize vault storage");
+        let vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
+            .expect("create vault");
 
         //vaultinitial_script_pubkey(&secp, VaultAmount(5), next_states: &HashMap<VaultStateParameters, Transaction>) -> ScriptBuf {
 

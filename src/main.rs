@@ -58,7 +58,11 @@ use std::time::Instant;
 use crate::vault::{
     VaultParameters,
     Vault,
+    VaultId,
+    SqliteVaultStorage,
 };
+
+const DEFAULT_VAULT: VaultId = 0;
 
 fn new_xpriv(network: NetworkKind) -> Xpriv {
     let mut rng = thread_rng();
@@ -176,8 +180,10 @@ fn main() {
             wallet.persist(&mut sqlite)
                 .expect("update sqlite");
 
-            let vault = Vault::new(vault_parameters.clone(), Vec::new());
-            vault.init(&mut sqlite).expect("Initialize sqlite");
+            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+                .expect("initialize vault storage");
+
+            let vault = Vault::create_new(&mut storage, "Default Vault", vault_parameters.clone()).expect("vault create");
 
             let config = Configuration {
                 vault_parameters,
@@ -188,7 +194,7 @@ fn main() {
             };
 
             {
-                let mut transaction = sqlite.transaction().expect("start transaction");
+                let mut transaction = storage.transaction().expect("start transaction");
                 transaction.execute(r#"
                     insert into
                         mccv_secret
@@ -243,7 +249,9 @@ fn main() {
             println!("----------------------------------");
             println!("total: {}", balance.total());
 
-            let vault = Vault::load(&mut sqlite).expect("load vault");
+            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+                .expect("initialize vault storage");
+            let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
             todo!()
         }
         Command::Sync => {
@@ -273,7 +281,9 @@ fn main() {
             wallet.persist(&mut sqlite)
                 .expect("update sqlite");
 
-            let vault = Vault::load(&mut sqlite).expect("load vault");
+            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+                .expect("initialize vault storage");
+            let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
 
             println!("Sync'd");
         }
@@ -291,7 +301,9 @@ fn main() {
 
             wallet.persist(&mut sqlite).expect("sqlite sync");
 
-            let vault = Vault::load(&mut sqlite).expect("load vault");
+            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+                .expect("initialize vault storage");
+            let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
 
             println!("Address: {}", address.to_string());
         }
@@ -299,7 +311,6 @@ fn main() {
             let config = read_config(&args.config);
             let mut sqlite = Connection::open(&args.wallet_path)
                 .expect("open wallet");
-
             // Actually I think you need the private descriptors via .descriptor() for
             // .extract_keys()
             //
@@ -319,7 +330,10 @@ fn main() {
                 .load_wallet(&mut sqlite)
                 .expect("success");
 
-            let vault = Vault::load(&mut sqlite).expect("load vault");
+            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+                .expect("initialize vault storage");
+
+            let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
 
             todo!()
         }
