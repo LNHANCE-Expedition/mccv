@@ -94,7 +94,6 @@ enum Command {
     Sync,
     Deposit(DepositArg),
     Withdraw(WithdrawArg),
-    Benchmark,
 }
 
 #[derive(Parser)]
@@ -341,16 +340,6 @@ fn main() {
             let config = read_config(&args.config);
 
             todo!()
-        }
-        Command::Benchmark => {
-            let config = read_config(&args.config);
-
-            let start = Instant::now();
-            let first_level = config.vault_parameters.templates_at_depth(&secp, 0);
-            let end = Instant::now();
-            let duration = end - start;
-
-            println!("done! {}s elapsed", duration.as_secs_f64());
         }
     }
 }
