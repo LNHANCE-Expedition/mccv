@@ -52,10 +52,6 @@ use serde::{
     de::Visitor,
 };
 
-use crate::{
-    Vault,
-};
-
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::marker::PhantomData;

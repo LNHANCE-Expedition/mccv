@@ -120,11 +120,15 @@ pub struct VaultAmount(u32);
 impl VaultAmount {
     const ZERO: VaultAmount = VaultAmount(0);
 
-    fn to_sats(&self, scale: u32) -> u64 {
+    pub fn new(unscaled_amount: u32) -> Self {
+        Self(unscaled_amount)
+    }
+
+    pub fn to_sats(&self, scale: u32) -> u64 {
         u64::saturating_mul(self.0 as u64, scale as u64)
     }
 
-    fn to_amount(&self, scale: u32) -> Amount {
+    pub fn to_amount(&self, scale: u32) -> Amount {
         Amount::from_sat(self.to_sats(scale))
     }
 
@@ -348,6 +352,27 @@ impl<'a, 's, C: Verification> VaultGenerationIterator<'a, 's, C> {
 }
 
 impl VaultParameters {
+    pub fn new(
+            scale: u32,
+            max: VaultAmount,
+            master_xpub: Xpub, recovery_xpub: Xpub, withdrawal_xpub: Xpub,
+            delay_per_increment: u32,
+            max_withdrawal_per_step: VaultAmount, max_deposit_per_step: VaultAmount,
+            max_depth: Depth,
+        ) -> Self {
+        Self {
+            scale,
+            max,
+            master_xpub,
+            recovery_xpub,
+            withdrawal_xpub,
+            delay_per_increment,
+            max_withdrawal_per_step,
+            max_deposit_per_step,
+            max_depth,
+        }
+    }
+
     fn recovery_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
 
         let path = [
@@ -1144,53 +1169,4 @@ mod test {
 
         todo!()
     }
-
-    #[ignore]
-    #[test]
-    fn test_benchmark() {
-        let secp = Secp256k1::new();
-
-        let (master_xpub, recovery_xpub, withdrawal_xpub) = test_xpubs();
-
-        let test_parameters = VaultParameters {
-            scale: 100_000_000,
-            max: VaultAmount(100),
-            master_xpub,
-            recovery_xpub,
-            withdrawal_xpub,
-            delay_per_increment: 36,
-            max_withdrawal_per_step: VaultAmount(4),
-            max_deposit_per_step: VaultAmount(4),
-            max_depth: 4,
-        };
-
-        let bench_start = Instant::now();
-
-        let mut iter = test_parameters.iter_templates(&secp);
-
-        let mut final_generation: VaultGeneration = VaultGeneration::new();
-
-        loop {
-            let start = Instant::now();
-            let result = iter.next_with_depth();
-            let duration = Instant::now() - start;
-            if let Some((depth, state_at_depth)) = result {
-                println!("state_at_depth.len() = {} {}s elapsed", state_at_depth.len(), duration.as_secs_f64());
-
-                if depth == 0 {
-                    final_generation = state_at_depth.clone();
-                }
-            } else {
-                break;
-            }
-        }
-        let duration = Instant::now() - bench_start;
-        println!("{}s elapsed", duration.as_secs_f64());
-
-        for (params, template) in final_generation.into_iter() {
-            assert_eq!(template.input.len(), 1);
-            assert_eq!(params.previous_value, VaultAmount(0));
-        }
-    }
-
 }

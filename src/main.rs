@@ -1,9 +1,3 @@
-mod migrate;
-mod vault;
-
-#[cfg(test)]
-mod test_util;
-
 use bdk_electrum::{
     BdkElectrumClient,
     electrum_client,
@@ -55,7 +49,7 @@ use std::path::PathBuf;
 
 use std::time::Instant;
 
-use crate::vault::{
+use mccv::vault::{
     VaultParameters,
     Vault,
     VaultId,
