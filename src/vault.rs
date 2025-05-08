@@ -258,13 +258,7 @@ fn dummy_input(lock_time: RelativeLockTime) -> TxIn {
     }
 }
 
-#[derive(Clone,Eq,PartialEq,Hash)]
-pub enum VaultBalanceChange {
-    Deposit(VaultAmount),
-    Withdrawal(VaultAmount)
-}
-
-#[derive(Clone,Debug,Eq,Hash,PartialEq)]
+#[derive(Clone,Copy,Debug,Eq,Hash,PartialEq)]
 pub enum VaultTransition {
     Deposit(VaultAmount),
     Withdrawal(VaultAmount),
@@ -292,6 +286,17 @@ pub struct VaultStateParameters {
 }
 
 impl VaultStateParameters {
+    fn get_result(&self) -> Option<(VaultAmount, VaultAmount)> {
+        match self.transition {
+            VaultTransition::Deposit(value) => Some((self.previous_value + value, VaultAmount(0))),
+            VaultTransition::Withdrawal(withdrawal_value) => if self.previous_value < withdrawal_value {
+                None
+            } else {
+                Some((self.previous_value - withdrawal_value, withdrawal_value))
+            }
+        }
+    }
+
     fn result_state_value(&self) -> Option<VaultAmount> {
         match self.transition {
             VaultTransition::Deposit(value) => Some(self.previous_value + value),
@@ -308,6 +313,21 @@ impl VaultStateParameters {
             VaultTransition::Deposit(_) => VaultAmount(0),
             VaultTransition::Withdrawal(ref value) => *value,
         }
+    }
+
+    fn next(&self, transition: VaultTransition) -> Option<Self> {
+        self.result_state_value()
+            .map(|value| Self {
+                transition,
+                previous_value: value,
+                parent_transition: Some(self.transition),
+            })
+            .filter(|next_parameters| match next_parameters.transition {
+                VaultTransition::Deposit(_) => true,
+                VaultTransition::Withdrawal(withdrawal_value)
+                    if withdrawal_value <= next_parameters.previous_value => true,
+                _ => false,
+            })
     }
 }
 
@@ -529,9 +549,16 @@ impl VaultParameters {
         }
     }
 
-    fn vault_scripts<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, value: VaultAmount, withdrawal_amount: VaultAmount, next_states: &HashMap<VaultStateParameters, Transaction>) -> Vec<(u32, ScriptBuf)> {
-        let mut vault_scripts: Vec<(u32, ScriptBuf)> = self.state_transitions_single(value, depth == 0)
+    fn vault_scripts<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: &HashMap<VaultStateParameters, Transaction>) -> Vec<(u32, ScriptBuf)> {
+        let mut counter = 0;
+        if let Some((value, withdrawal_amount)) = parameter.get_result() {
+            let mut vault_scripts: Vec<(u32, ScriptBuf)> =
+            self.state_transitions_single(value, depth + 1)
                 .filter_map(|params| {
+                    if params.parent_transition != Some(parameter.transition) {
+                        return None;
+                    }
+
                     if let Some(next_state) = next_states.get(&params) {
                         let weight = match params.transition {
                             VaultTransition::Withdrawal(ref amount) => {
@@ -556,32 +583,19 @@ impl VaultParameters {
 
                         Some((weight.to_unscaled_amount(), transition_script.into_script()))
                     } else {
-                        eprintln!("No next state for {:?}", params);
+                        //eprintln!("Depth {depth} (Value: {value:?}): No next state for {:?} at depth", params);
+                        counter += 1;
                         None
                     }
                 })
                 .collect();
 
-        // FIXME: we really need to get consistent about depth + 1 vs depth
-        let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
+                if counter > 0 {
+                    //eprintln!("counter = {counter}");
+                }
 
-        let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
-
-        let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
-            .push_slice(recovery_template.to_byte_array())
-            .push_opcode(OP_CHECKTEMPLATEVERIFY)
-            .push_opcode(OP_DROP)
-            .push_x_only_key(&self.recovery_key(secp, depth))
-            .push_opcode(OP_CHECKSIG);
-
-        // FIXME: recovery weight
-        vault_scripts.push((1, recovery_script.into_script()));
-
-        // Spending path for vault-output-only recovery
-        // Only create if there is actually value left in the vault after the withdrawal
-        if value > withdrawal_amount {
-            let recovery_tx = self.recovery_template(secp, depth + 1, value - withdrawal_amount, VaultAmount(0));
-
+            // FIXME: we really need to get consistent about depth + 1 vs depth
+            let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
             let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
 
             let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
@@ -593,28 +607,34 @@ impl VaultParameters {
 
             // FIXME: recovery weight
             vault_scripts.push((1, recovery_script.into_script()));
+
+            // Spending path for vault-output-only recovery
+            // Only create if there is actually value left in the vault after the withdrawal
+            if value > withdrawal_amount {
+                let recovery_tx = self.recovery_template(secp, depth + 1, value - withdrawal_amount, VaultAmount(0));
+
+                let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
+
+                let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
+                    .push_slice(recovery_template.to_byte_array())
+                    .push_opcode(OP_CHECKTEMPLATEVERIFY)
+                    .push_opcode(OP_DROP)
+                    .push_x_only_key(&self.recovery_key(secp, depth))
+                    .push_opcode(OP_CHECKSIG);
+
+                // FIXME: recovery weight
+                vault_scripts.push((1, recovery_script.into_script()));
+            }
+
+            // TODO: pull this code into its own function
+            // TODO: add complete drain script
+
+            vault_scripts
+        } else {
+            Vec::new()
         }
-
-        // TODO: pull this code into its own function
-        // TODO: add complete drain script
-
-        vault_scripts
     }
 
-    fn initial_script_pubkey<C: Verification>(&self, secp: &Secp256k1<C>, value: VaultAmount, next_states: &HashMap<VaultStateParameters, Transaction>) -> ScriptBuf {
-        let master_key = self.master_key(secp, 0);
-        let vault_scripts = self.vault_scripts(secp, 0, value, VaultAmount(0), next_states);
-
-        let spend_info = TaprootBuilder::with_huffman_tree(vault_scripts)
-            .expect("taproot tree builder")
-            .finalize(secp, master_key)
-            .expect("taproot tree finalize");
-
-        ScriptBuf::new_p2tr(secp, spend_info.internal_key(), spend_info.merkle_root())
-    }
-
-    // FIXME: probably easiest to just specify the previous transition?
-    //fn tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, input_count: usize, lock_time: RelativeLockTime, value: VaultAmount, withdrawal_amount: VaultAmount, next_states: &HashMap<VaultStateParameters, Transaction>) -> Transaction {
     fn tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: &HashMap<VaultStateParameters, Transaction>) -> Transaction {
         let next_value = parameter.result_state_value();
         let withdrawal_amount = parameter.withdrawal_value();
@@ -626,7 +646,7 @@ impl VaultParameters {
         let master_key = self.master_key(secp, depth);
 
         if let Some(next_value) = next_value {
-            let vault_scripts = self.vault_scripts(secp, depth, next_value, withdrawal_amount, next_states);
+            let vault_scripts = self.vault_scripts(secp, depth, parameter, next_states);
 
             let spend_info = TaprootBuilder::with_huffman_tree(vault_scripts)
                 .expect("taproot tree builder")
@@ -667,30 +687,36 @@ impl VaultParameters {
         RelativeLockTime::from_height(lock_time)
     }
 
-    fn iter_withdrawal_amounts(&self) -> impl Iterator<Item=VaultAmount> {
+    fn iter_withdrawal_amounts(&self, _depth: Depth) -> impl Iterator<Item=VaultAmount> {
         (1..=self.max_withdrawal_per_step.0)
             .into_iter()
             .map(|withdrawal_amount| VaultAmount(withdrawal_amount))
     }
 
-    fn iter_deposit_amounts(&self) -> impl Iterator<Item=VaultAmount> {
-        (1..=self.max_deposit_per_step.0)
+    fn iter_deposit_amounts(&self, depth: Depth) -> impl Iterator<Item=VaultAmount> {
+        let range = if depth == 0 {
+            1..=self.max.0
+        } else {
+            1..=self.max_deposit_per_step.0
+        };
+
+        range
             .into_iter()
             .map(|deposit_amount| VaultAmount(deposit_amount))
     }
 
-    fn iter_transitions(&self) -> impl Iterator<Item=VaultTransition> {
-        let withdrawals = self.iter_withdrawal_amounts()
+    fn iter_transitions(&self, depth: Depth) -> impl Iterator<Item=VaultTransition> {
+        let withdrawals = self.iter_withdrawal_amounts(depth)
             .map(|withdrawal| VaultTransition::Withdrawal(withdrawal));
 
-        let deposits = self.iter_deposit_amounts()
+        let deposits = self.iter_deposit_amounts(depth)
             .map(|deposit| VaultTransition::Deposit(deposit));
 
         withdrawals.chain(deposits)
     }
 
-    fn state_transitions_single(&self, previous_value: VaultAmount, no_grandparents: bool) -> impl Iterator<Item=VaultStateParameters> + '_ {
-        self.iter_transitions()
+    fn state_transitions_single(&self, previous_value: VaultAmount, depth: Depth) -> impl Iterator<Item=VaultStateParameters> + '_ {
+        self.iter_transitions(depth)
             .filter_map(move |transition| {
                 match transition {
                     VaultTransition::Deposit(deposit_amount) if (previous_value + deposit_amount) <= self.max => Some(
@@ -711,9 +737,9 @@ impl VaultParameters {
                 }
             })
             .flat_map(move |parameters| {
-                self.iter_transitions()
+                self.iter_transitions(depth)
                     .filter_map(move |parent_transition|
-                        if no_grandparents {
+                        if depth == 0 {
                             Some(parameters.clone())
                         } else {
                             // Note this is "backwards" from other tests because we want to make
@@ -739,10 +765,15 @@ impl VaultParameters {
             })
     }
 
-    fn state_transitions(&self, no_grandparents: bool) -> impl ParallelIterator<Item=VaultStateParameters> + '_ {
-        // FIXME: only include zero on depth 0
-        (0..=self.max.0)
-            .flat_map(move |value| self.state_transitions_single(VaultAmount(value), no_grandparents))
+    fn state_transitions(&self, depth: Depth) -> impl ParallelIterator<Item=VaultStateParameters> + '_ {
+        let range = if depth == 0 {
+            0..=0
+        } else {
+            1..=self.max.0
+        };
+
+        range
+            .flat_map(move |value| self.state_transitions_single(VaultAmount(value), depth))
             .par_bridge()
     }
 
@@ -763,7 +794,7 @@ impl VaultParameters {
     }
 
     fn terminal_tx_templates<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> HashMap<VaultStateParameters, Transaction> {
-        self.state_transitions(depth == 0)
+        self.state_transitions(depth)
             .map(|parameter|
                 (parameter.clone(), self.terminal_tx_template(secp, depth, &parameter))
             )
@@ -772,7 +803,7 @@ impl VaultParameters {
 
     fn tx_templates<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, next_states: &HashMap<VaultStateParameters, Transaction>) -> HashMap<VaultStateParameters, Transaction> {
         if depth == 0 {
-            self.state_transitions_single(VaultAmount(0), depth == 0)
+            self.state_transitions_single(VaultAmount(0), depth)
                 .map(|parameter| (
                         parameter.clone(),
                         self.tx_template(secp, depth, &parameter, next_states)
@@ -780,7 +811,7 @@ impl VaultParameters {
                 )
                 .collect()
         } else {
-            self.state_transitions(depth == 0)
+            self.state_transitions(depth)
                 .map(|parameter| (
                         parameter.clone(),
                         self.tx_template(secp, depth, &parameter, next_states)

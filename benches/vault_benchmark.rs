@@ -58,7 +58,7 @@ pub fn benchmark_state_generation(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("templates");
 
-    group.sample_size(10);
+    group.sample_size(40);
 
     group.bench_function("iterate templates", |b| b.iter(|| {
         let mut iter = test_parameters.iter_templates(&secp);
