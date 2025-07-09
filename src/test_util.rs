@@ -1,8 +1,5 @@
-use bdk_electrum::{
-    BdkElectrumClient,
-    electrum_client,
-    electrum_client::ElectrumApi,
-};
+use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
+use bdk_bitcoind_rpc::Emitter;
 
 use bdk_wallet::{
     template::Bip86,
@@ -25,6 +22,8 @@ use bitcoin::hashes::{
     sha256::Hash as Sha256,
 };
 
+use bitcoin::secp256k1::rand::{RngCore, thread_rng};
+
 use bitcoin::secp256k1::{
     Secp256k1,
     Signing,
@@ -36,14 +35,9 @@ use bitcoin::{
     Transaction,
 };
 
-use electrsd::bitcoind::bitcoincore_rpc::{
-    RpcApi,
-};
-
-use electrsd::{
-    bitcoind,
-    bitcoind::BitcoinD,
-    ElectrsD,
+use corepc_node::{
+    Node,
+    exe_path,
 };
 
 use serde::{
@@ -59,31 +53,46 @@ use std::str::FromStr;
 
 use std::default::Default;
 
-pub(crate) fn get_test_daemons() -> (BdkElectrumClient<electrum_client::Client>, ElectrsD, BitcoinD) {
-    let bitcoind_path = bitcoind::exe_path().expect("Failed to get bitcoind path. See README.md \"Testing Error\" section.");
-    let bitcoind_conf = {
-        let mut conf: bitcoind::Conf = Default::default();
-        conf.p2p = bitcoind::P2P::Yes;
-        conf.network = "regtest";
-        //conf.view_stdout = true;
-        conf
-    };
-    let bitcoind = BitcoinD::with_conf(bitcoind_path, &bitcoind_conf).expect("Failed to start bitcoind");
+pub fn get_test_node() -> (Node, Client) {
+    let path = corepc_node::exe_path().expect("Failed to get bitcoind path. See README.md \"Testing Error\" section.");
+    let node = Node::new(path).unwrap();
+    let url = node.rpc_url();
+    let auth = Auth::CookieFile(node.params.cookie_file.clone());
+    (node, Client::new(&url, auth).unwrap())
+}
 
-    let electrs_path = electrsd::exe_path().expect("Failed to get electrsd path. See README.md \"Testing Error\" section.");
-    let electrs_conf = {
-        let mut conf: electrsd::Conf = Default::default();
-        conf.network = bitcoind_conf.network;
-        conf.http_enabled = true;
-        conf.view_stderr = true;
-        conf
-    };
-    let electrs = ElectrsD::with_conf(electrs_path, &bitcoind, &electrs_conf).expect("Failed to start electrs");
+pub fn get_test_wallet() -> (Xpriv, Wallet) {
+    let mut seed_bytes = [0u8; 128];
+    thread_rng().fill_bytes(&mut seed_bytes);
+    let master = Xpriv::new_master(Network::Regtest, &seed_bytes).unwrap();
 
-    let electrum_client = electrum_client::Client::new(electrs.electrum_url.as_str())
-        .expect("electrum client create");
+    let wallet = Wallet::create_single(
+        Bip86(master.clone(), KeychainKind::External)
+    )
+    .network(Network::Regtest)
+    .create_wallet_no_persist()
+    .unwrap();
 
-    (BdkElectrumClient::new(electrum_client), electrs, bitcoind)
+    (master, wallet)
+}
+
+pub fn update_wallet(wallet: &mut Wallet, client: &Client) {
+    let latest_checkpoint = wallet.latest_checkpoint();
+    let height = latest_checkpoint.height();
+
+    let mut emitter = Emitter::new(client, latest_checkpoint, height);
+
+    while let Some(block) = emitter.next_block().unwrap() {
+        wallet.apply_block(&block.block, block.block_height()).unwrap();
+    }
+}
+
+pub fn generate_to_wallet(wallet: &mut Wallet, client: &Client, num_blocks: u64) {
+    let address = wallet.reveal_next_address(KeychainKind::External);
+
+    client.generate_to_address(num_blocks, &address.address).unwrap();
+
+    update_wallet(wallet, client);
 }
 
 struct TransactionHexVisitor(PhantomData<()>);
