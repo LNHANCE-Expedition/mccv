@@ -433,6 +433,7 @@ impl VaultParameters {
         builder_with_capacity(5 + 1 + 33 + 1)
             .push_int(timelock as i64)
             .push_opcode(OP_CSV)
+            .push_opcode(OP_DROP)
             .push_x_only_key(&self.withdrawal_key(secp, depth))
             .push_opcode(OP_CHECKSIG)
             .into_script()
