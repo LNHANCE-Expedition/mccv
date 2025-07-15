@@ -80,7 +80,8 @@ pub fn update_wallet(wallet: &mut Wallet, client: &Client) {
     let latest_checkpoint = wallet.latest_checkpoint();
     let height = latest_checkpoint.height();
 
-    let mut emitter = Emitter::new(client, latest_checkpoint, height);
+    // we don't touch the mempool interface at all so this is ok
+    let mut emitter = Emitter::new(client, latest_checkpoint, height, bdk_bitcoind_rpc::NO_EXPECTED_MEMPOOL_TXIDS);
 
     while let Some(block) = emitter.next_block().unwrap() {
         wallet.apply_block(&block.block, block.block_height()).unwrap();
@@ -198,101 +199,4 @@ pub(crate) fn get_ctv_test_vectors() -> impl Iterator<Item=(Transaction, u32, Sh
                 .zip(entry.result.into_iter())
                 .map(move |(spend_index, result)| (entry.transaction.clone(), spend_index, result))
         })
-}
-
-pub(crate) fn load_wallet() -> (PersistedWallet<rusqlite::Connection>, rusqlite::Connection) {
-    let mut sqlite = rusqlite::Connection::open_in_memory()
-        .expect("open wallet");
-
-    let master_xpriv = Xpriv::from_str("tprv8ZgxMBicQKsPd1EzCPZcQSPhsotX5HvRDCivA7ASNQFmjWuTsW3WWEwUNKFAZrnD9qpz55rtyLdphqkwRZUqNWYXwSEzd6P4pYvXGByRim3")
-        .expect("decode test xpriv");
-
-    let descriptor = Bip86(master_xpriv, KeychainKind::External);
-    let change_descriptor = Bip86(master_xpriv, KeychainKind::Internal);
-
-    let _wallet = Wallet::create(descriptor, change_descriptor)
-        .network(Network::Regtest)
-        .create_wallet(&mut sqlite)
-        .expect("wallet create");
-
-    let wallet = Wallet::load()
-        .descriptor(KeychainKind::External, Some(Bip86(master_xpriv, KeychainKind::External)))
-        .descriptor(KeychainKind::Internal, Some(Bip86(master_xpriv, KeychainKind::Internal)))
-        //.extract_keys()
-        .load_wallet(&mut sqlite)
-        .expect("wallet load")
-        .expect("wallet construct");
-
-    (wallet, sqlite)
-}
-
-/*
-pub(crate) fn generate_to_wallet(bitcoind: &BitcoinD, electrum: &BdkElectrumClient<electrum_client::Client>, wallet: &mut PersistedWallet<rusqlite::Connection>, count: usize) {
-    for _ in 0..count {
-        let address = wallet.reveal_next_address(KeychainKind::External);
-        bitcoind.client.generate_to_address(1, &address)
-            .expect("generate failed");
-
-        let MAX_TIME = std::time::Duration::from_millis(30000);
-        let start = std::time::Instant::now();
-        let end = start + MAX_TIME;
-
-        let mut update = false;
-
-        while std::time::Instant::now() < end {
-            let history = electrum.inner
-                .script_get_history(address.script_pubkey().as_script())
-                .expect("get history");
-
-            if history.len() > 0 {
-                update = true;
-                break;
-            }
-        }
-
-        assert!(update);
-    }
-}
-*/
-
-pub(crate) fn generate_to_wallet(bitcoind: &BitcoinD, electrum: &BdkElectrumClient<electrum_client::Client>, wallet: &mut PersistedWallet<rusqlite::Connection>, count: usize) {
-    let address = wallet.reveal_next_address(KeychainKind::External);
-    bitcoind.client.generate_to_address(count as u64, &address)
-        .expect("generate failed");
-
-    let MAX_TIME = std::time::Duration::from_millis(30000);
-    let start = std::time::Instant::now();
-    let end = start + MAX_TIME;
-
-    let mut update = false;
-
-    while std::time::Instant::now() < end {
-        let history = electrum.inner
-            .script_get_history(address.script_pubkey().as_script())
-            .expect("get history");
-
-        if history.len() >= count {
-            update = true;
-            break;
-        }
-    }
-
-    assert!(update);
-}
-
-pub(crate) fn full_scan(
-    electrum: &BdkElectrumClient<electrum_client::Client>,
-    wallet: &mut PersistedWallet<rusqlite::Connection>,
-    sqlite: &mut rusqlite::Connection
-) {
-    let req = wallet.start_full_scan();
-
-    let result = electrum.full_scan(req, 32, 4, true)
-        .expect("full scan failed");
-
-    wallet.apply_update(result)
-        .expect("update failed");
-
-    wallet.persist(sqlite)
-        .expect("update sqlite");
 }

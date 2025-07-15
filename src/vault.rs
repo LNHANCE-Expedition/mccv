@@ -40,6 +40,7 @@ use bitcoin::{
     Txid,
     transaction::TxIn,
     transaction::TxOut,
+    blockdata::locktime::relative,
     blockdata::transaction::Version,
     taproot::{
         LeafVersion,
@@ -50,12 +51,6 @@ use bitcoin::{
 };
 use rayon::prelude::ParallelBridge;
 use rusqlite::Row;
-
-use crate::migrate::{
-    configure,
-    migrate,
-    MigrationError,
-};
 
 use rand::{
     RngCore,
@@ -81,10 +76,17 @@ use serde::{
     Serialize,
 };
 
+use std::iter;
 use std::io::Write;
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+
+use crate::migrate::{
+    configure,
+    migrate,
+    MigrationError,
+};
 
 pub type Depth = u32;
 
@@ -92,17 +94,36 @@ fn builder_with_capacity(size: usize) -> Builder {
     Builder::from(Vec::with_capacity(size))
 }
 
+#[derive(Clone,Copy,Serialize,Deserialize)]
+#[serde(transparent)]
+pub struct VaultScale(u32);
+
+impl VaultScale {
+    pub fn new(scale: u32) -> Self { Self(scale) }
+
+    pub fn convert_amount(&self, amount: Amount) -> (VaultAmount, Amount) {
+        let quotient  = amount.to_sat() / (self.0 as u64);
+        let remainder = amount.to_sat() % (self.0 as u64);
+
+        // FIXME: provide stronger guarantees or make fallible
+        debug_assert!((quotient & u64::from(u32::MAX)) == quotient);
+        (VaultAmount(quotient as u32), Amount::from_sat(remainder))
+    }
+
+    pub fn scale_amount(&self, amount: VaultAmount) -> Amount {
+        amount.to_amount(self.0)
+    }
+}
+
 #[derive(Clone,Serialize,Deserialize)]
 pub struct VaultParameters {
-    scale: u32,
+    scale: VaultScale,
     /// Maximum value = max * scale
     max: VaultAmount,
     // All coins are always immediately spendable by master_xpub
-    master_xpub: Xpub,
-    // Coins "recovered" from a bad withdrawal spendable by this xpub
-    recovery_xpub: Xpub,
+    cold_xpub: Xpub,
     // Withdrawn coins are spendable by withdrawal_xpub at any time
-    withdrawal_xpub: Xpub,
+    hot_xpub: Xpub,
     // Should there be yet another xpub for un-managed funds? probably but not in the vault params
     delay_per_increment: u32,
     max_withdrawal_per_step: VaultAmount,
@@ -236,9 +257,10 @@ fn get_default_template(transaction: &Transaction, input_index: u32) -> std::io:
     Ok(Sha256::from_engine(sha256))
 }
 
+const PAY_TO_ANCHOR_SCRIPT_BYTES: &[u8] = &[0x51, 0x02, 0x4e, 0x73];
+
 fn ephemeral_anchor() -> TxOut {
-    let mut script_pubkey = ScriptBuf::new();
-    script_pubkey.push_opcode(OP_TRUE);
+    let script_pubkey = ScriptBuf::from_bytes(PAY_TO_ANCHOR_SCRIPT_BYTES.to_vec());
 
     TxOut {
         value: Amount::from_sat(0),
@@ -289,23 +311,16 @@ impl VaultStateParameters {
     fn get_result(&self) -> Option<(VaultAmount, VaultAmount)> {
         match self.transition {
             VaultTransition::Deposit(value) => Some((self.previous_value + value, VaultAmount(0))),
-            VaultTransition::Withdrawal(withdrawal_value) => if self.previous_value < withdrawal_value {
-                None
-            } else {
+            VaultTransition::Withdrawal(withdrawal_value) => if self.previous_value >= withdrawal_value {
                 Some((self.previous_value - withdrawal_value, withdrawal_value))
+            } else {
+                None
             }
         }
     }
 
     fn result_state_value(&self) -> Option<VaultAmount> {
-        match self.transition {
-            VaultTransition::Deposit(value) => Some(self.previous_value + value),
-            VaultTransition::Withdrawal(withdrawal_value) => if self.previous_value < withdrawal_value {
-                None
-            } else {
-                Some(self.previous_value - withdrawal_value)
-            }
-        }
+        self.get_result().map(|result| result.0)
     }
 
     fn withdrawal_value(&self) -> VaultAmount {
@@ -329,6 +344,16 @@ impl VaultStateParameters {
                 _ => false,
             })
     }
+
+    fn assert_valid(&self) {
+        match self.transition {
+            _ => {},
+            VaultTransition::Withdrawal(amount) => {
+                assert!(self.previous_value.nonzero());
+                assert!(amount <= self.previous_value);
+            }
+        }
+    }
 }
 
 pub type VaultGeneration = HashMap<VaultStateParameters, Transaction>;
@@ -348,6 +373,7 @@ impl<'a, 's, C: Verification> VaultGenerationIterator<'a, 's, C> {
             return None;
         }
 
+        // FIXME
         let next_generation = if let Some(previous_generation) = &self.generation {
             self.parameters.tx_templates(&self.secp, self.depth, previous_generation)
         } else {
@@ -373,9 +399,9 @@ impl<'a, 's, C: Verification> VaultGenerationIterator<'a, 's, C> {
 
 impl VaultParameters {
     pub fn new(
-            scale: u32,
+            scale: VaultScale,
             max: VaultAmount,
-            master_xpub: Xpub, recovery_xpub: Xpub, withdrawal_xpub: Xpub,
+            cold_xpub: Xpub, hot_xpub: Xpub,
             delay_per_increment: u32,
             max_withdrawal_per_step: VaultAmount, max_deposit_per_step: VaultAmount,
             max_depth: Depth,
@@ -383,9 +409,8 @@ impl VaultParameters {
         Self {
             scale,
             max,
-            master_xpub,
-            recovery_xpub,
-            withdrawal_xpub,
+            cold_xpub,
+            hot_xpub,
             delay_per_increment,
             max_withdrawal_per_step,
             max_deposit_per_step,
@@ -399,7 +424,7 @@ impl VaultParameters {
             ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
         ];
 
-        let xpub = self.recovery_xpub.derive_pub(secp, &path)
+        let xpub = self.hot_xpub.derive_pub(secp, &path)
             .expect("recovery key derivation");
 
         xpub.to_x_only_pub()
@@ -410,7 +435,7 @@ impl VaultParameters {
             ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
         ];
 
-        let xpub = self.master_xpub.derive_pub(secp, &path)
+        let xpub = self.cold_xpub.derive_pub(secp, &path)
             .expect("master key derivation");
 
         xpub.to_x_only_pub()
@@ -421,12 +446,13 @@ impl VaultParameters {
             ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
         ];
 
-        let xpub = self.withdrawal_xpub.derive_pub(secp, &path)
+        let xpub = self.hot_xpub.derive_pub(secp, &path)
             .expect("withdrawal key derivation");
 
         xpub.to_x_only_pub()
     }
 
+    /// Script for spending an unvault output
     fn withdrawal_script<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, timelock: u32) -> ScriptBuf {
         // TODO: decide if we want to omit the CSV when timelock is 0
         // Conservative estimating the push_int size
@@ -443,29 +469,46 @@ impl VaultParameters {
         u32::saturating_mul(value.to_unscaled_amount(), self.delay_per_increment)
     }
 
-    fn withdrawal_output<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, value: VaultAmount, withdrawal_amount: VaultAmount) -> TxOut {
-        let master_key = self.master_key(secp, depth);
+    /// Script for spending recovering an unvault output to the cold key
+    fn recovery_script<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, recovery_tx: &Transaction, input_index: u32) -> ScriptBuf {
+        let recovery_template = get_default_template(recovery_tx, input_index)
+            .expect("recovery tx template");
+
+        builder_with_capacity(33 + 1 + 1 + 33 + 1)
+            .push_slice(recovery_template.to_byte_array())
+            .push_opcode(OP_CHECKTEMPLATEVERIFY)
+            .push_opcode(OP_DROP)
+            .push_x_only_key(&self.recovery_key(secp, depth))
+            .push_opcode(OP_CHECKSIG)
+            .into_script()
+    }
+
+    fn withdrawal_output<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters) -> Option<TxOut> {
+        let value = parameter.result_state_value().unwrap_or(VaultAmount(0));
+        let withdrawal_amount = parameter.withdrawal_value();
+
+        if !withdrawal_amount.nonzero() {
+            return None;
+        }
+
+        // FIXME: establish displine about depth
         let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
+
+        let master_key = self.master_key(secp, depth);
 
         let timelock = self.withdrawal_timelock(value);
         let withdrawal_script = self.withdrawal_script(secp, depth, timelock);
 
         let withdrawal = TapNodeHash::from_script(&withdrawal_script, LeafVersion::TapScript);
+        // FIXME: maybe just recovery_tx.input.len() - 1 ? OTOH then I have to worry about
+        // underflow..
         let input_index = if recovery_tx.input.len() == 1 {
             0
         } else {
             1
         };
 
-        let recovery_template = get_default_template(&recovery_tx, input_index)
-            .expect("recovery tx template");
-
-        let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
-            .push_slice(recovery_template.to_byte_array())
-            .push_opcode(OP_CHECKTEMPLATEVERIFY)
-            .push_opcode(OP_DROP)
-            .push_x_only_key(&self.withdrawal_key(secp, depth))
-            .push_opcode(OP_CHECKSIG);
+        let recovery_script = self.recovery_script(secp, depth, &recovery_tx, input_index);
 
         let recovery = TapNodeHash::from_script(&recovery_script.as_script(), LeafVersion::TapScript);
 
@@ -473,21 +516,25 @@ impl VaultParameters {
 
         let script_pubkey = ScriptBuf::new_p2tr(secp, master_key, Some(root_node_hash));
 
-        TxOut {
-            value: value.to_amount(self.scale),
-            script_pubkey,
-        }
+        Some(
+            TxOut {
+                value: self.scale.scale_amount(value),
+                script_pubkey,
+            }
+        )
     }
 
+    // Spend either a withdrawn balance, the vault balance, or both, to the cold key
     fn recovery_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, vault_amount: VaultAmount, withdrawal_amount: VaultAmount) -> Transaction {
         assert!(vault_amount.nonzero() || withdrawal_amount.nonzero());
+
         let mut input: Vec<TxIn> = Vec::new();
         if vault_amount.nonzero() {
-            input.push(dummy_input(RelativeLockTime::ZERO));
+            input.push(dummy_input(relative::LockTime::ZERO));
         }
 
         if withdrawal_amount.nonzero() {
-            input.push(dummy_input(RelativeLockTime::ZERO));
+            input.push(dummy_input(relative::LockTime::ZERO));
         }
 
         let mut output: Vec<TxOut> = Vec::new();
@@ -499,7 +546,7 @@ impl VaultParameters {
         let value = vault_amount + withdrawal_amount;
 
         let recovery_output = TxOut {
-            value: value.to_amount(self.scale),
+            value: self.scale.scale_amount(value),
             script_pubkey,
         };
 
@@ -514,40 +561,8 @@ impl VaultParameters {
         }
     }
 
-    // FIXME: should the terminal state just be all funds spendable by recovery or master?
     fn terminal_tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters) -> Transaction {
-        let next_value = parameter.result_state_value();
-        let withdrawal_amount = parameter.withdrawal_value();
-
-        let mut output: Vec<TxOut> = Vec::new();
-
-        let key = self.recovery_key(secp, depth + 1);
-
-        assert!(next_value.is_some() || withdrawal_amount.nonzero());
-
-        if let Some(next_value) = next_value {
-            // FIXME: should have master key with recovery alternate spending path
-            let script_pubkey = ScriptBuf::new_p2tr(secp, key, None);
-
-            let recovery_output = TxOut {
-                value: next_value.to_amount(self.scale),
-                script_pubkey,
-            };
-            output.push(recovery_output);
-        }
-
-        if withdrawal_amount.nonzero() {
-            let withdrawal_output = self.withdrawal_output(secp, depth, next_value.unwrap_or(VaultAmount(0)), withdrawal_amount);
-            output.push(withdrawal_output);
-        }
-        output.push(ephemeral_anchor());
-
-        Transaction {
-            version: Version::non_standard(3),
-            lock_time: LockTime::ZERO,
-            input: self.dummy_inputs(depth, parameter),
-            output,
-        }
+        self.tx_template(secp, depth, parameter, None)
     }
 
     fn vault_scripts<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: &HashMap<VaultStateParameters, Transaction>) -> Vec<(u32, ScriptBuf)> {
@@ -595,36 +610,27 @@ impl VaultParameters {
                     //eprintln!("counter = {counter}");
                 }
 
-            // FIXME: we really need to get consistent about depth + 1 vs depth
-            let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
-            let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
 
-            let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
-                .push_slice(recovery_template.to_byte_array())
-                .push_opcode(OP_CHECKTEMPLATEVERIFY)
-                .push_opcode(OP_DROP)
-                .push_x_only_key(&self.recovery_key(secp, depth))
-                .push_opcode(OP_CHECKSIG);
+            // FIXME: we really need to get consistent about depth + 1 vs depth
+            // I think the rule should be, that the transaction spending a txout with depth n is
+            // n+1, the txout on transaction at depth n is also n (this seems like a no-brainer but
+            // I think I was being inconsistent with things like the recovery tx which is kind of
+            // it's own thing, does it belong to this depth?)
+            let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
+            //let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
+            let recovery_script = self.recovery_script(&secp, depth, &recovery_tx, 0);
 
             // FIXME: recovery weight
-            vault_scripts.push((1, recovery_script.into_script()));
+            vault_scripts.push((1, recovery_script));
 
             // Spending path for vault-output-only recovery
             // Only create if there is actually value left in the vault after the withdrawal
             if value > withdrawal_amount {
                 let recovery_tx = self.recovery_template(secp, depth + 1, value - withdrawal_amount, VaultAmount(0));
 
-                let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
-
-                let recovery_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
-                    .push_slice(recovery_template.to_byte_array())
-                    .push_opcode(OP_CHECKTEMPLATEVERIFY)
-                    .push_opcode(OP_DROP)
-                    .push_x_only_key(&self.recovery_key(secp, depth))
-                    .push_opcode(OP_CHECKSIG);
-
+                let recovery_script = self.recovery_script(secp, depth, &recovery_tx, 1);
                 // FIXME: recovery weight
-                vault_scripts.push((1, recovery_script.into_script()));
+                vault_scripts.push((1, recovery_script));
             }
 
             // TODO: pull this code into its own function
@@ -636,41 +642,56 @@ impl VaultParameters {
         }
     }
 
-    fn tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: &HashMap<VaultStateParameters, Transaction>) -> Transaction {
-        let next_value = parameter.result_state_value();
-        let withdrawal_amount = parameter.withdrawal_value();
+    fn vault_output<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: Option<&HashMap<VaultStateParameters, Transaction>>) -> Option<TxOut> {
+        if let Some(next_value) = parameter.result_state_value() {
+            let master_key = self.master_key(secp, depth);
 
-        assert!(next_value.is_some() || withdrawal_amount.nonzero());
+            if let Some(next_states) = next_states {
+                let vault_scripts = self.vault_scripts(secp, depth, parameter, next_states);
 
-        let mut output: Vec<TxOut> = Vec::new();
+                let spend_info = TaprootBuilder::with_huffman_tree(vault_scripts)
+                    .expect("taproot tree builder")
+                    .finalize(secp, master_key)
+                    .expect("taproot tree finalize");
 
-        let master_key = self.master_key(secp, depth);
+                Some(
+                    TxOut {
+                        value: self.scale.scale_amount(next_value),
+                        script_pubkey: ScriptBuf::new_p2tr_tweaked(spend_info.output_key()),
+                    }
+                )
+            // Final state, only spendable by master
+            } else {
+                // TODO: CSFS delegated recursion
+                let script_pubkey = ScriptBuf::new_p2tr(secp, master_key, None);
 
-        if let Some(next_value) = next_value {
-            let vault_scripts = self.vault_scripts(secp, depth, parameter, next_states);
-
-            let spend_info = TaprootBuilder::with_huffman_tree(vault_scripts)
-                .expect("taproot tree builder")
-                .finalize(secp, master_key)
-                .expect("taproot tree finalize");
-
-            let vault_output = TxOut {
-                value: next_value.to_amount(self.scale),
-                // FIXME: obviously redundant with the TaprootBuilder...
-                script_pubkey: ScriptBuf::new_p2tr(secp, spend_info.internal_key(), spend_info.merkle_root()),
-            };
-            output.push(vault_output);
+                Some(
+                    TxOut {
+                        value: self.scale.scale_amount(next_value),
+                        script_pubkey,
+                    }
+                )
+            }
+        } else {
+            None
         }
+    }
 
-        if withdrawal_amount.nonzero() {
-            let withdrawal_output = self.withdrawal_output(secp, depth, next_value.unwrap_or(VaultAmount(0)), withdrawal_amount);
-            output.push(withdrawal_output);
-        }
-        output.push(ephemeral_anchor());
+    fn tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: Option<&HashMap<VaultStateParameters, Transaction>>) -> Transaction {
+        parameter.assert_valid();
+
+        let output: Vec<TxOut> = iter::empty()
+            .chain(
+                self.vault_output(secp, depth, parameter, next_states)
+            )
+            .chain(self.withdrawal_output(secp, depth, parameter))
+            .chain(Some(ephemeral_anchor()))
+            .collect();
 
         Transaction {
             version: Version::non_standard(3),
             lock_time: LockTime::ZERO,
+            // Handles input count
             input: self.dummy_inputs(depth, parameter),
             output,
         }
@@ -807,7 +828,7 @@ impl VaultParameters {
             self.state_transitions_single(VaultAmount(0), depth)
                 .map(|parameter| (
                         parameter.clone(),
-                        self.tx_template(secp, depth, &parameter, next_states)
+                        self.tx_template(secp, depth, &parameter, Some(next_states))
                     )
                 )
                 .collect()
@@ -815,13 +836,14 @@ impl VaultParameters {
             self.state_transitions(depth)
                 .map(|parameter| (
                         parameter.clone(),
-                        self.tx_template(secp, depth, &parameter, next_states)
+                        self.tx_template(secp, depth, &parameter, Some(next_states))
                     )
                 )
                 .collect()
         }
     }
 
+    // FIXME: Probably should create some sort of cache structure to pass around
     pub fn templates_at_depth<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> HashMap<VaultStateParameters, Transaction> {
         let mut iter = self.iter_templates(secp);
 
@@ -850,24 +872,20 @@ impl VaultParameters {
     pub fn from_xpriv<C: Signing>(secp: &Secp256k1<C>, xpriv: &Xpriv, vault_number: u32) -> Self {
         let h = |x: u32| ChildNumber::from_hardened_idx(x).expect("in range");
 
-        let master_xpriv = xpriv.derive_priv(secp, &[h(69), h(vault_number), h(0)])
-            .expect("derive master xpriv");
+        let cold_xpriv = xpriv.derive_priv(secp, &[h(69), h(vault_number), h(0)])
+            .expect("derive cold xpriv");
 
-        let recovery_xpriv = xpriv.derive_priv(secp, &[h(69), h(vault_number), h(1)])
-            .expect("derive recovery xpriv");
+        let hot_xpriv = xpriv.derive_priv(secp, &[h(69), h(vault_number), h(1)])
+            .expect("derive hot xpriv");
 
-        let withdrawal_xpriv = xpriv.derive_priv(secp, &[h(69), h(vault_number), h(2)])
-            .expect("derive withdrawal xpriv");
-
-        let master_xpub = Xpub::from_priv(secp, &master_xpriv);
-        let recovery_xpub = Xpub::from_priv(secp, &recovery_xpriv);
-        let withdrawal_xpub = Xpub::from_priv(secp, &withdrawal_xpriv);
+        let cold_xpub = Xpub::from_priv(secp, &cold_xpriv);
+        let hot_xpub = Xpub::from_priv(secp, &hot_xpriv);
 
         let delay_per_increment = 6 * 6; // ~6 hours
 
         // Vault max size = 1 Bitcoin
         let max = VaultAmount(100);
-        let scale = 1_000_000; // million sats
+        let scale = VaultScale::new(1_000_000); // million sats
 
         let max_withdrawal_per_step = VaultAmount(8);
         let max_deposit_per_step = VaultAmount(8);
@@ -877,9 +895,8 @@ impl VaultParameters {
         VaultParameters {
             scale,
             max,
-            master_xpub,
-            recovery_xpub,
-            withdrawal_xpub,
+            hot_xpub,
+            cold_xpub,
             delay_per_increment,
             max_withdrawal_per_step,
             max_deposit_per_step,
@@ -1009,20 +1026,23 @@ impl Vault {
         })
     }
 
-    pub fn list(connection: &mut Connection) -> Result<Vec<VaultId>, rusqlite::Error> {
+    pub fn list(connection: &mut Connection) -> Result<Vec<(VaultId, String)>, rusqlite::Error> {
         let mut query = connection.prepare(r#"
             select
             (
-                id
+                id,
+                name
             )
             from
                 mccv_vault
         "#)?;
 
-        let result = query.query_map(params![], |row| -> rusqlite::Result<VaultId> {
-            row.get(0)
+        let result = query.query_map(params![], |row| {
+            let id: VaultId = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok((id, name))
         })?
-        .collect::<rusqlite::Result<Vec<VaultId>>>();
+        .collect::<rusqlite::Result<Vec<(VaultId, String)>>>();
         result
     }
 
@@ -1034,10 +1054,7 @@ impl Vault {
     pub fn deposit_transaction_template<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Option<Transaction> {
         let depth = self.history.len() as Depth;
 
-        // FIXME: AAAHHH SHIT we still have to look up the parent tx too, to get the script paths
-        // FIXME FIXME: wait, is that easy now?
         let parameters = match self.history.last() {
-            //Some(transaction) => VaultStateParameters::try_from(transaction).ok(),
             Some(transaction) => transaction.state_parameters.clone(),
             None => VaultStateParameters {
                 transition: VaultTransition::Deposit(deposit_amount),
@@ -1046,23 +1063,12 @@ impl Vault {
             },
         };
 
-        let parent_parameters = if self.history.len() > 1 {
-            let parent_index = self.history.len() - 1;
-
-            Some(self.history[parent_index].state_parameters.clone())
-        } else {
-            None
-        };
-
         let transactions = self.parameters.templates_at_depth(secp, depth);
 
-        // FIXME: I think I fucked up here anyway, the last tx state parameters
-        // we need to also see if we have a timelock from the parent transaction...
+        let deposit = transactions.get(&parameters)
+            .expect("never call deposit_transaction_template_impl() with an invalid parameter set");
 
-        // FIXME!!!!!
-        //parameters.and_then(|parameters| transactions.1.get(&parameters).cloned())
-
-        todo!()
+        Some(deposit.clone())
     }
 
     pub fn get_vault_utxo_witness<C: Verification>(&self, secp: &Secp256k1<C>, parameters: VaultStateParameters) -> Option<Transaction> {
@@ -1100,12 +1106,20 @@ impl Vault {
         let mut builder = wallet.build_tx();
         builder
             .fee_absolute(Amount::from_sat(0))
-            .add_recipient(address.script_pubkey(), deposit_amount.to_amount(self.parameters.scale));
+            .add_recipient(address.script_pubkey(), self.parameters.scale.scale_amount(deposit_amount));
 
         let shape_tx = builder.finish()
             .map_err(|e| VaultDepositError::TransactionBuildError(e))?;
 
+        // TODO: to apply the fee rate we need to actually build the transaction, know what the
+        // total weight will be (either sign it, or make assumptions about the signed size) and
+        // then recreate it with a scaled up amount
+
         todo!()
+    }
+
+    pub fn to_vault_amount(&self, amount: Amount) -> (VaultAmount, Amount) {
+        self.parameters.scale.convert_amount(amount)
     }
 }
 
@@ -1116,16 +1130,9 @@ mod test {
     use crate::test_util;
 
     use std::str::FromStr;
-    use bdk_electrum::{
-        electrum_client::ElectrumApi,
-    };
 
     use bdk_wallet::KeychainKind;
     use bdk_wallet::Wallet;
-
-    use electrsd::bitcoind::bitcoincore_rpc::{
-        RpcApi,
-    };
 
     use std::time::Instant;
 
@@ -1136,23 +1143,21 @@ mod test {
         }
     }
 
-    fn test_xpubs() -> (Xpub, Xpub, Xpub) {
+    fn test_xpubs() -> (Xpub, Xpub) {
         (
-            Xpub::from_str("tpubDCjgmQsPz1xamjuPHqwFkdU2DfHe9oz4VSgzJD1JDWZWM1pYyk82WMN7zyQRN85F5Yx8Rs2xeGC4eZ5un27LqPu74BDQZcWkqkhnVmbWmMB").unwrap(), // Master Xpub
-            Xpub::from_str("tpubDCjgmQsPz1xarEYG4eya8HegHuun3QU5VAJKo8oPwVgMoQb961aP7nv5J9PH9jjj74MzPp1U5YzzjdZF3gFANtMNuMKyrSYKmJt7jQMonM1").unwrap(), // Recovery Xpub
-            Xpub::from_str("tpubDCjgmQsPz1xatYi9cSP3ov2CWMFcnh5FNzTtLykxpHYZXaGuYMRCgpThcmXFAHBKrR6Za69v7CcMqvEfT7wrQtWxZr4EW58NusmAGhUtj2F").unwrap(), // Withdrawal Xpub
+            Xpub::from_str("tpubDCjgmQsPz1xamjuPHqwFkdU2DfHe9oz4VSgzJD1JDWZWM1pYyk82WMN7zyQRN85F5Yx8Rs2xeGC4eZ5un27LqPu74BDQZcWkqkhnVmbWmMB").unwrap(), // hot Xpub
+            Xpub::from_str("tpubDCjgmQsPz1xarEYG4eya8HegHuun3QU5VAJKo8oPwVgMoQb961aP7nv5J9PH9jjj74MzPp1U5YzzjdZF3gFANtMNuMKyrSYKmJt7jQMonM1").unwrap(), // cold Xpub
         )
     }
 
     fn test_parameters() -> VaultParameters {
-        let (master_xpub, recovery_xpub, withdrawal_xpub) = test_xpubs();
+        let (hot_xpub, cold_xpub) = test_xpubs();
 
         VaultParameters {
-            scale: 100_000_000,
+            scale: VaultScale(100_000_000),
             max: VaultAmount(10),
-            master_xpub,
-            recovery_xpub,
-            withdrawal_xpub,
+            hot_xpub,
+            cold_xpub,
             delay_per_increment: 36,
             max_withdrawal_per_step: VaultAmount(3),
             max_deposit_per_step: VaultAmount(3),
@@ -1177,28 +1182,27 @@ mod test {
     fn test_deposit() {
         let secp = Secp256k1::new();
 
-        let (electrum, electrsd, bitcoind) = test_util::get_test_daemons();
+        let (node, client) = test_util::get_test_node();
         let test_parameters = test_parameters();
 
-        let (mut wallet, mut sqlite) = test_util::load_wallet();
+        let (xpriv, mut wallet) = test_util::get_test_wallet();
 
-        test_util::generate_to_wallet(&bitcoind, &electrum, &mut wallet, 100);
-
-        std::thread::sleep(std::time::Duration::from_secs(30));
-
-        test_util::full_scan(&electrum, &mut wallet, &mut sqlite);
+        test_util::generate_to_wallet(&mut wallet, &client, 100);
 
         let balance = wallet.balance();
 
         assert_eq!(balance.confirmed.to_sat(), 50 * 100_000_000);
 
+        let sqlite = rusqlite::Connection::open_in_memory()
+            .expect("open memory wallet should succeed");
         let mut storage = SqliteVaultStorage::from_connection(sqlite)
             .expect("initialize vault storage");
         let vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
             .expect("create vault");
 
-        //vaultinitial_script_pubkey(&secp, VaultAmount(5), next_states: &HashMap<VaultStateParameters, Transaction>) -> ScriptBuf {
+        let (deposit_amount, remainder) = vault.to_vault_amount(Amount::from_sat(100_000));
+        assert_eq!(remainder, Amount::ZERO);
 
-        todo!()
+        let (shape_tx, vault_tx) = vault.create_deposit(&secp, &mut wallet, deposit_amount, FeeRate::BROADCAST_MIN).unwrap();
     }
 }

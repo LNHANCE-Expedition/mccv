@@ -60,6 +60,63 @@ The following sequence of transactions would be made on-chain.
 | V_3,2       | 3     | 2     | Withdraw 1                | 0        | T             |
 |-------------|-------|-------|---------------------------|----------|---------------|
 
+# Transactions
+
+## Vault Prepare Transaction
+                              Randomized TxOut Order
+            +------------+
+    In 0 -> |            | -> Vault Deposit
+    In 1 -> |            | -> Change
+     ...    |            |
+    In N -> |            |
+            +------------+
+
+### Vault Deposit Output
+
+CTV into Vault
+
+OR
+
+Timelocked spendable by hot key (do we even want this? costs 32 wu to have this)
+
+## Deposit Transaction
+
+                     +------------+
+    Vault Deposit -> |            | -> Vault
+    [ Vault ]     -> |            | -> Anchor Output
+                     +------------+
+
+### Vault Input
+
+(Optional) input carrying prevoius vault balance.
+Won't be present when previous vault value is 0.
+
+### Vault Output
+
+CTV for either withdrawal or deposit
+
+## Withdrawal Transaction
+
+             +------------+
+    Vault -> |            | -> Unvault
+             |            | -> [ Vault ]
+             |            | -> Anchor Output
+             +------------+
+
+### Unvault Output
+
+Either
+
+Spendable by hot wallet after timelock
+
+or
+
+Clawback to cold wallet
+
+### Vault Output
+
+(Optional) Change for the vault.
+Same as deposit output except it carries a timelock as well.
 
 # Testing Error
 
