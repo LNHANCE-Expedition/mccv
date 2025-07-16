@@ -418,8 +418,10 @@ impl VaultParameters {
         }
     }
 
+    // Hot key can trigger recovery. This is fine because if the hot key is compromised your (hot) funds
+    // are already at risk, being griefed by your funds being sent to the cold key is the
+    // best case scenario.
     fn recovery_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
-
         let path = [
             ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
         ];
@@ -436,18 +438,21 @@ impl VaultParameters {
         ];
 
         let xpub = self.cold_xpub.derive_pub(secp, &path)
-            .expect("master key derivation");
+            .expect("non-hardened derivation of a reasonable depth shouldn't fail");
 
         xpub.to_x_only_pub()
     }
 
+    // Similar to the recovery case, if the hot key is compromised, it's actually best if they
+    // initiate a withdrawal so we can recognize the hot key is compromised and initiate a
+    // recovery.
     fn withdrawal_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
         let path = [
             ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
         ];
 
         let xpub = self.hot_xpub.derive_pub(secp, &path)
-            .expect("withdrawal key derivation");
+            .expect("non-hardened derivation of a reasonable depth shouldn't fail");
 
         xpub.to_x_only_pub()
     }
@@ -491,28 +496,37 @@ impl VaultParameters {
             return None;
         }
 
-        // FIXME: establish displine about depth
-        let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
-
         let master_key = self.master_key(secp, depth);
 
-        let timelock = self.withdrawal_timelock(value);
+        let timelock = self.withdrawal_timelock(withdrawal_amount);
         let withdrawal_script = self.withdrawal_script(secp, depth, timelock);
 
         let withdrawal = TapNodeHash::from_script(&withdrawal_script, LeafVersion::TapScript);
-        // FIXME: maybe just recovery_tx.input.len() - 1 ? OTOH then I have to worry about
-        // underflow..
-        let input_index = if recovery_tx.input.len() == 1 {
-            0
+
+        // Vault output is the first input to the recovery tx, *if* it exists, so the withdrawal
+        // output is either the first or second, depending on the presence of the vault output.
+        let input_index = if value.nonzero() { 1 } else { 0 };
+
+        let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
+        let recovery_script = self.recovery_script(secp, depth, &recovery_tx, input_index);
+        let double_recovery_leaf = TapNodeHash::from_script(recovery_script.as_script(), LeafVersion::TapScript);
+
+        let recovery_node = if value.nonzero() {
+            debug_assert!(withdrawal_amount.nonzero());
+
+            let single_recovery_template = self.recovery_template(secp, depth + 1, VaultAmount::ZERO, withdrawal_amount);
+            debug_assert!(single_recovery_template != recovery_tx);
+            let recovery_script = self.recovery_script(secp, depth, &single_recovery_template, 0);
+            let single_recovery_leaf = TapNodeHash::from_script(recovery_script.as_script(), LeafVersion::TapScript);
+            
+            TapNodeHash::from_node_hashes(single_recovery_leaf, double_recovery_leaf)
         } else {
-            1
+            // If there's no vault output, then "double_recovery_leaf" is actually just a single
+            // recovery leaf, redundant with the other one we might compute in the other branch
+            double_recovery_leaf
         };
 
-        let recovery_script = self.recovery_script(secp, depth, &recovery_tx, input_index);
-
-        let recovery = TapNodeHash::from_script(&recovery_script.as_script(), LeafVersion::TapScript);
-
-        let root_node_hash = TapNodeHash::from_node_hashes(recovery, withdrawal);
+        let root_node_hash = TapNodeHash::from_node_hashes(recovery_node, withdrawal);
 
         let script_pubkey = ScriptBuf::new_p2tr(secp, master_key, Some(root_node_hash));
 
@@ -537,8 +551,6 @@ impl VaultParameters {
             input.push(dummy_input(relative::LockTime::ZERO));
         }
 
-        let mut output: Vec<TxOut> = Vec::new();
-
         let key = self.recovery_key(secp, depth);
 
         let script_pubkey = ScriptBuf::new_p2tr(secp, key, None);
@@ -550,14 +562,11 @@ impl VaultParameters {
             script_pubkey,
         };
 
-        output.push(recovery_output);
-        output.push(ephemeral_anchor());
-
         Transaction {
             version: Version::non_standard(3),
             lock_time: LockTime::ZERO,
             input,
-            output,
+            output: vec![recovery_output, ephemeral_anchor()],
         }
     }
 
@@ -617,7 +626,7 @@ impl VaultParameters {
             // I think I was being inconsistent with things like the recovery tx which is kind of
             // it's own thing, does it belong to this depth?)
             let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
-            //let recovery_template = get_default_template(&recovery_tx, 0).expect("recovery template");
+            // This (the vault) output will always be the first input to the recovery tx
             let recovery_script = self.recovery_script(&secp, depth, &recovery_tx, 0);
 
             // FIXME: recovery weight
@@ -625,16 +634,19 @@ impl VaultParameters {
 
             // Spending path for vault-output-only recovery
             // Only create if there is actually value left in the vault after the withdrawal
-            if value > withdrawal_amount {
-                let recovery_tx = self.recovery_template(secp, depth + 1, value - withdrawal_amount, VaultAmount(0));
+            if value.nonzero() && withdrawal_amount.nonzero() {
+                // TODO: individual recovery for this tx without the withdrawal
 
-                let recovery_script = self.recovery_script(secp, depth, &recovery_tx, 1);
+                let recovery_tx = self.recovery_template(secp, depth + 1, value, VaultAmount::ZERO);
+
+                let recovery_script = self.recovery_script(secp, depth, &recovery_tx, 0);
                 // FIXME: recovery weight
                 vault_scripts.push((1, recovery_script));
             }
 
             // TODO: pull this code into its own function
-            // TODO: add complete drain script
+            // TODO: add complete drain script, eh, maybe not, cold keys can always do that if it's really
+            // desirable, that seems like a case where requiring cold keys makes sense
 
             vault_scripts
         } else {
