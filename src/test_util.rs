@@ -2,6 +2,7 @@ use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
 use bdk_bitcoind_rpc::Emitter;
 
 use bdk_wallet::{
+    template::Bip86Public,
     template::Bip86,
     KeychainKind,
     PersistedWallet,
@@ -66,6 +67,12 @@ pub fn get_test_wallet() -> (Xpriv, Wallet) {
     thread_rng().fill_bytes(&mut seed_bytes);
     let master = Xpriv::new_master(Network::Regtest, &seed_bytes).unwrap();
 
+    let secp = Secp256k1::new();
+    //let public = Bip86Public(master.clone(), KeychainKind::External);
+    let master_xpub = Xpub::from_priv(&secp, &master);
+    let public = Bip86Public(master_xpub.clone(), master_xpub.fingerprint(), KeychainKind::External);
+
+    let private = Bip86(master.clone(), KeychainKind::External);
     let wallet = Wallet::create_single(
         Bip86(master.clone(), KeychainKind::External)
     )

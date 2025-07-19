@@ -1,6 +1,9 @@
 use bdk_wallet::error::CreateTxError;
+use bdk_wallet::miniscript::descriptor::Wildcard;
+use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, MiniscriptKey, DescriptorPublicKey};
+use bdk_wallet::miniscript::plan::{AssetProvider, Plan};
 use bdk_wallet::{Wallet, KeychainKind};
-use bitcoin::{FeeRate, BlockHash};
+use bitcoin::{BlockHash, FeeRate, psbt};
 use bitcoin::hashes::{
     Hash,
     sha256::Hash as Sha256,
@@ -17,6 +20,9 @@ use bitcoin::bip32::{
     Xpub,
     Xpriv,
     ChildNumber,
+    DerivationPath,
+    IntoDerivationPath,
+    KeySource,
 };
 
 use bitcoin::secp256k1::{
@@ -87,6 +93,9 @@ use crate::migrate::{
     migrate,
     MigrationError,
 };
+
+// struct.unpack(">I", hashlib.sha256(b'mccv').digest()[:4])[0] & 0x7FFFFFFF
+const PURPOSE: u32 = 360843587;
 
 pub type Depth = u32;
 
@@ -206,6 +215,8 @@ impl std::ops::Sub for VaultAmount {
     }
 }
 
+// FIXME: confirmed a long time ago that sha256 writes never fail, so this function is actually
+// infallible, rewrite per what you've done elsewhere
 fn get_default_template(transaction: &Transaction, input_index: u32) -> std::io::Result<Sha256> {
     let mut sha256 = Sha256::engine();
 
@@ -373,12 +384,7 @@ impl<'a, 's, C: Verification> VaultGenerationIterator<'a, 's, C> {
             return None;
         }
 
-        // FIXME
-        let next_generation = if let Some(previous_generation) = &self.generation {
-            self.parameters.tx_templates(&self.secp, self.depth, previous_generation)
-        } else {
-            self.parameters.terminal_tx_templates(&self.secp, self.parameters.max_depth)
-        };
+        let next_generation = self.parameters.tx_templates(&self.secp, self.depth, self.generation.as_ref());
 
         if self.depth > 0 {
             self.depth -= 1;
@@ -570,10 +576,6 @@ impl VaultParameters {
         }
     }
 
-    fn terminal_tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters) -> Transaction {
-        self.tx_template(secp, depth, parameter, None)
-    }
-
     fn vault_scripts<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: &HashMap<VaultStateParameters, Transaction>) -> Vec<(u32, ScriptBuf)> {
         let mut counter = 0;
         if let Some((value, withdrawal_amount)) = parameter.get_result() {
@@ -716,15 +718,19 @@ impl VaultParameters {
     fn lock_time_for_withdrawal(&self, amount: &VaultAmount) -> RelativeLockTime {
         let lock_time = u32::saturating_mul(amount.to_unscaled_amount(), self.delay_per_increment);
         let lock_time = u16::try_from(lock_time)
-            .expect("16 bit lock time");
+            .expect("lock time should always fit in 16 bits");
 
         RelativeLockTime::from_height(lock_time)
     }
 
-    fn iter_withdrawal_amounts(&self, _depth: Depth) -> impl Iterator<Item=VaultAmount> {
-        (1..=self.max_withdrawal_per_step.0)
-            .into_iter()
-            .map(|withdrawal_amount| VaultAmount(withdrawal_amount))
+    fn iter_withdrawal_amounts(&self, depth: Depth) -> impl Iterator<Item=VaultAmount> {
+        if depth == 0 {
+            1..=0 // XXX: dirty, but will be empty
+        } else {
+            1..=self.max_withdrawal_per_step.0
+        }
+        .into_iter()
+        .map(|withdrawal_amount| VaultAmount(withdrawal_amount))
     }
 
     fn iter_deposit_amounts(&self, depth: Depth) -> impl Iterator<Item=VaultAmount> {
@@ -827,20 +833,12 @@ impl VaultParameters {
         input
     }
 
-    fn terminal_tx_templates<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> HashMap<VaultStateParameters, Transaction> {
-        self.state_transitions(depth)
-            .map(|parameter|
-                (parameter.clone(), self.terminal_tx_template(secp, depth, &parameter))
-            )
-            .collect()
-    }
-
-    fn tx_templates<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, next_states: &HashMap<VaultStateParameters, Transaction>) -> HashMap<VaultStateParameters, Transaction> {
+    fn tx_templates<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, next_states: Option<&HashMap<VaultStateParameters, Transaction>>) -> HashMap<VaultStateParameters, Transaction> {
         if depth == 0 {
             self.state_transitions_single(VaultAmount(0), depth)
                 .map(|parameter| (
                         parameter.clone(),
-                        self.tx_template(secp, depth, &parameter, Some(next_states))
+                        self.tx_template(secp, depth, &parameter, next_states)
                     )
                 )
                 .collect()
@@ -848,7 +846,7 @@ impl VaultParameters {
             self.state_transitions(depth)
                 .map(|parameter| (
                         parameter.clone(),
-                        self.tx_template(secp, depth, &parameter, Some(next_states))
+                        self.tx_template(secp, depth, &parameter, next_states)
                     )
                 )
                 .collect()
@@ -881,13 +879,15 @@ impl VaultParameters {
         }
     }
 
+    // FIXME: this shouldn't exist, defaults are too liable to change, amount increments will never
+    // be universal.
     pub fn from_xpriv<C: Signing>(secp: &Secp256k1<C>, xpriv: &Xpriv, vault_number: u32) -> Self {
         let h = |x: u32| ChildNumber::from_hardened_idx(x).expect("in range");
 
-        let cold_xpriv = xpriv.derive_priv(secp, &[h(69), h(vault_number), h(0)])
+        let cold_xpriv = xpriv.derive_priv(secp, &[h(PURPOSE), h(vault_number), h(0)])
             .expect("derive cold xpriv");
 
-        let hot_xpriv = xpriv.derive_priv(secp, &[h(69), h(vault_number), h(1)])
+        let hot_xpriv = xpriv.derive_priv(secp, &[h(PURPOSE), h(vault_number), h(1)])
             .expect("derive hot xpriv");
 
         let cold_xpub = Xpub::from_priv(secp, &cold_xpriv);
@@ -924,6 +924,8 @@ enum VaultOutpoints {
     /// .0 is the vault outpoint
     /// .1 is the withdrawal outpoint
     Withdrawal(VaultAmount, VaultAmount),
+    /// A sweep of a withdrawal to recovery
+    Recovery(VaultAmount),
     /// A sweep of the vault to recovery location
     Close(VaultAmount),
 }
@@ -1083,42 +1085,41 @@ impl Vault {
         Some(deposit.clone())
     }
 
-    pub fn get_vault_utxo_witness<C: Verification>(&self, secp: &Secp256k1<C>, parameters: VaultStateParameters) -> Option<Transaction> {
-        let depth = self.history.len() as Depth;
+    pub fn deposit_transaction_script(&self, tx: &Transaction) -> ScriptBuf  {
+        let template = get_default_template(&tx, 0)
+            .expect("sha256 write never fails");
+        builder_with_capacity(33 + 1 + 1 + 33 + 1)
+            .push_slice(template.to_byte_array())
+            .push_opcode(OP_CHECKTEMPLATEVERIFY)
+            .into_script()
+    }
 
-        if depth < 1 {
-            return None;
-        }
-
-        /*
-        let transactions = self.parameters.templates_at_depth(secp, depth - 1);
-
-        let parameters = match self.history.last() {
-            Some(transaction) => VaultStateParameters::try_from(transaction).ok(),
-            None => Some(
-                VaultStateParameters {
-                        transition: VaultTransition::Deposit(deposit_amount),
-                        initial_amount: VaultAmount(0),
-                }
-            ),
-        };
-
-        parameters.and_then(|parameters| transactions.get(&parameters).cloned())
-        */
-        todo!()
+    fn get_current_depth(&self) -> Depth {
+        self.history.len() as Depth
     }
 
     pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, wallet: &mut Wallet, deposit_amount: VaultAmount, fee_rate: FeeRate) -> Result<(Psbt, Psbt), VaultDepositError> {
         let mut template = self.deposit_transaction_template(secp, deposit_amount)
             .ok_or(VaultDepositError::VaultClosed)?;
 
-        // TODO: add parent utxo witness
+        let deposit_script = self.deposit_transaction_script(&template);
+        // TODO: timelocked script path allowing the hot key to recover the shaping tx output. It
+        // won't have its own fee so it really shouldn't ever be confirmed on its own, but it's a
+        // potential griefing vector.
+        
+        let deposit_script_hash = TapNodeHash::from_script(
+            deposit_script.as_script(),
+            LeafVersion::TapScript,
+        );
 
-        let address = wallet.reveal_next_address(KeychainKind::Internal);
+        let master = self.parameters.master_key(secp, self.get_current_depth());
+        // FIXME: master
+        let script_pubkey = ScriptBuf::new_p2tr(secp, master, Some(deposit_script_hash));
+
         let mut builder = wallet.build_tx();
         builder
             .fee_absolute(Amount::from_sat(0))
-            .add_recipient(address.script_pubkey(), self.parameters.scale.scale_amount(deposit_amount));
+            .add_recipient(script_pubkey, self.parameters.scale.scale_amount(deposit_amount));
 
         let shape_tx = builder.finish()
             .map_err(|e| VaultDepositError::TransactionBuildError(e))?;
@@ -1133,6 +1134,101 @@ impl Vault {
     pub fn to_vault_amount(&self, amount: Amount) -> (VaultAmount, Amount) {
         self.parameters.scale.convert_amount(amount)
     }
+}
+
+// FIXME: everything basically assumes an xpub
+fn public_match_key_source(descriptor: DescriptorPublicKey, (fingerprint, path): &KeySource) -> Vec<u32> {
+    // XXX: this will copy but whatever...
+    // TODO: eliminate copy by handling DescriptorPublicKey::Xpub
+    // separate from Multi
+    descriptor.into_single_keys().into_iter()
+        .filter_map(|single_descriptor| {
+            let descriptor_path = single_descriptor
+                .full_derivation_path()
+                .expect("descriptor must be single here");
+
+            let shared_prefix_len = descriptor_path
+                .into_iter()
+                .zip(path)
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            if shared_prefix_len < descriptor_path.len() {
+                return None;
+            }
+
+            let mut path_remainder_iter = path.into_iter().skip(shared_prefix_len);
+
+            let hardened_wildcard = match &single_descriptor {
+                DescriptorPublicKey::Single(_) => false,
+                DescriptorPublicKey::XPub(xpub) => { xpub.wildcard == Wildcard::Hardened }
+                DescriptorPublicKey::MultiXPub(multi) => { multi.wildcard == Wildcard::Hardened }
+            };
+
+            let wildcard_value = match *path_remainder_iter.next()? {
+                ChildNumber::Normal { index } if !hardened_wildcard => index,
+                ChildNumber::Hardened { index } if hardened_wildcard => index,
+                _ => { return None; }
+            };
+
+            let new_descriptor = single_descriptor
+                .at_derivation_index(wildcard_value)
+                .expect("descriptor must be single here");
+
+            let new_path = new_descriptor.full_derivation_path()
+                .expect("new descriptor must also be single here");
+
+            if new_path != *path {
+                return None;
+            }
+
+            Some(wildcard_value)
+        })
+        .collect()
+}
+
+struct AssumeKnownKeys<'a, K: MiniscriptKey>(&'a Descriptor<K>);
+
+impl<'a> AssumeKnownKeys<'a, DescriptorPublicKey> {
+    fn get_index(&self, psbt: &Psbt, input: &psbt::Input) -> Option<u32> {
+        let (taproot, master_fingerprint) = match self.0 {
+            Descriptor::Bare(_) => { return None; } // TODO
+            Descriptor::Pkh(_) =>  { return None; } // TODO
+            Descriptor::Wpkh(_) =>  { return None; } // TODO
+            Descriptor::Sh(_) => { return None; } // TODO
+            Descriptor::Wsh(_) => { return None; } // TODO
+            Descriptor::Tr(pk) => {
+                let ik = pk.internal_key();
+                let master_fingerprint = pk.internal_key().master_fingerprint();
+
+                    //BTreeMap<XOnlyPublicKey, (Vec<TapLeafHash>, KeySource)>,
+                input.tap_key_origins.iter()
+                    .filter_map(|(pubkey, (tap_leaves, (fingerprint, path)))| {
+                        if *fingerprint != master_fingerprint {
+                            return None;
+                        }
+
+                        
+
+                        Some(todo!())
+                    });
+
+                (true, ik.master_fingerprint())
+            }
+        }
+    }
+}
+
+pub fn plan<P: AssetProvider<DefiniteDescriptorKey>>(wallet: &Wallet, psbt: &Psbt, provider: &P) -> HashMap<usize, Plan> {
+    let external_descriptor = wallet.public_descriptor(KeychainKind::External);
+    let internal_descriptor = wallet.public_descriptor(KeychainKind::Internal);
+
+    psbt.inputs.into_iter()
+        .zip(psbt.unsigned_tx.input.into_iter())
+        .map(|(psbt_input, input)| {
+            input.witness_utxo
+        })
+    todo!()
 }
 
 #[cfg(test)]
@@ -1212,9 +1308,41 @@ mod test {
         let vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
             .expect("create vault");
 
-        let (deposit_amount, remainder) = vault.to_vault_amount(Amount::from_sat(100_000));
+        let (deposit_amount, remainder) = vault.to_vault_amount(Amount::from_sat(100_000_000));
         assert_eq!(remainder, Amount::ZERO);
 
         let (shape_tx, vault_tx) = vault.create_deposit(&secp, &mut wallet, deposit_amount, FeeRate::BROADCAST_MIN).unwrap();
+    }
+
+    #[test]
+    fn test_scratch_workspace() {
+        use bdk_wallet::keys::GeneratableDefaultOptions;
+        //use bdk_wallet::miniscript::ScriptContext;
+        use corepc_node::{
+            Node,
+            exe_path,
+        };
+
+        use bdk_wallet::{
+            Wallet,
+            descriptor::template::Bip86,
+            descriptor::template::DescriptorTemplate,
+            KeychainKind,
+
+        };
+
+        use bitcoin::bip32::Xpriv;
+        use bitcoin::Network;
+        use bitcoin::secp256k1::rand::{RngCore, thread_rng};
+
+        use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
+        use bdk_bitcoind_rpc::Emitter;
+
+        let (xpriv, mut wallet) = test_util::get_test_wallet();
+
+        let template = Bip86(xpriv.clone(), KeychainKind::External);
+
+        let (descriptor, key_map, networks) = template.build(Network::Regtest).unwrap();
+
     }
 }
