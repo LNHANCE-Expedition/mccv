@@ -1,5 +1,5 @@
 use bdk_wallet::error::CreateTxError;
-use bdk_wallet::miniscript::descriptor::Wildcard;
+use bdk_wallet::miniscript::descriptor::{Wildcard, DescriptorXKey, DerivPaths};
 use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, MiniscriptKey, DescriptorPublicKey};
 use bdk_wallet::miniscript::plan::{AssetProvider, Plan};
 use bdk_wallet::{Wallet, KeychainKind};
@@ -1136,43 +1136,74 @@ impl Vault {
     }
 }
 
+enum XpubMatch {
+    NoMatch,
+    Match(Option<u32>),
+}
+
 // FIXME: everything basically assumes an xpub
-fn public_match_key_source(descriptor: DescriptorPublicKey, (fingerprint, path): &KeySource) -> Vec<u32> {
+// FIXME: how to handle descriptors without a wildcard?
+fn xpub_match_key_source(xpub: DescriptorXKey<Xpub>, (fingerprint, path): &KeySource) -> XpubMatch {
+    //xpub.matches(
+    let matches = xpub.origin
+        .map(|(xpub_fingerprint, xpub_path)| xpub_fingerprint == *fingerprint && xpub_path == *path)
+        .unwrap_or(true); // If we lack the origin of this xkey we'll assume it matches and try anyway
+    
+    if !matches {
+        return XpubMatch::NoMatch;
+    }
+
     // XXX: this will copy but whatever...
     // TODO: eliminate copy by handling DescriptorPublicKey::Xpub
     // separate from Multi
-    descriptor.into_single_keys().into_iter()
+
+    let shared_prefix_len = xpub.derivation_path
+        .into_iter()
+        .zip(path)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    if shared_prefix_len < xpub.derivation_path.len() {
+        return XpubMatch::NoMatch;
+    }
+
+    if xpub.wildcard == Wildcard::None && shared_prefix_len == xpub.derivation_path.len() {
+        return XpubMatch::Match(None);
+    }
+
+    let hardened_wildcard = xpub.wildcard == Wildcard::Hardened;
+    
+    let path_remainder_iter: DerivationPath = path.into_iter().skip(shared_prefix_len).collect();
+
+    if let Some(next_path_item) = path_remainder_iter.next() {
+        let wildcard_value = match next_path_item {
+            ChildNumber::Normal { index } if !hardened_wildcard => index,
+            ChildNumber::Hardened { index } if hardened_wildcard => index,
+            _ => { return XpubMatch::NoMatch; }
+        };
+
+        let new_descriptor = xpub
+            .xkey
+            //.derive_pub(
+            .at_derivation_index(wildcard_value)
+            .expect("descriptor must be single here");
+
+
+    } else {
+        //return XpubMatch::NoMatch; 
+    }
+
+    /*
+    let wildcard_value = match *path_remainder_iter.next()? {
+        ChildNumber::Normal { index } if !hardened_wildcard => index,
+        ChildNumber::Hardened { index } if hardened_wildcard => index,
+        _ => { return XpubMatch::NoMatch; }
+    };
+
+    xpub.into_single_keys().into_iter()
         .filter_map(|single_descriptor| {
             let descriptor_path = single_descriptor
                 .full_derivation_path()
-                .expect("descriptor must be single here");
-
-            let shared_prefix_len = descriptor_path
-                .into_iter()
-                .zip(path)
-                .take_while(|(a, b)| a == b)
-                .count();
-
-            if shared_prefix_len < descriptor_path.len() {
-                return None;
-            }
-
-            let mut path_remainder_iter = path.into_iter().skip(shared_prefix_len);
-
-            let hardened_wildcard = match &single_descriptor {
-                DescriptorPublicKey::Single(_) => false,
-                DescriptorPublicKey::XPub(xpub) => { xpub.wildcard == Wildcard::Hardened }
-                DescriptorPublicKey::MultiXPub(multi) => { multi.wildcard == Wildcard::Hardened }
-            };
-
-            let wildcard_value = match *path_remainder_iter.next()? {
-                ChildNumber::Normal { index } if !hardened_wildcard => index,
-                ChildNumber::Hardened { index } if hardened_wildcard => index,
-                _ => { return None; }
-            };
-
-            let new_descriptor = single_descriptor
-                .at_derivation_index(wildcard_value)
                 .expect("descriptor must be single here");
 
             let new_path = new_descriptor.full_derivation_path()
@@ -1185,35 +1216,69 @@ fn public_match_key_source(descriptor: DescriptorPublicKey, (fingerprint, path):
             Some(wildcard_value)
         })
         .collect()
+        */
+}
+
+enum Either<A, B> {
+    A(A),
+    B(B),
+}
+
+impl<T, A, B> Iterator for Either<A, B>
+where
+    A: Iterator<Item = T>,
+    B: Iterator<Item = T>,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Either::A(a) => a.next(),
+            Either::B(b) => b.next(),
+        }
+    }
 }
 
 struct AssumeKnownKeys<'a, K: MiniscriptKey>(&'a Descriptor<K>);
 
 impl<'a> AssumeKnownKeys<'a, DescriptorPublicKey> {
-    fn get_index(&self, psbt: &Psbt, input: &psbt::Input) -> Option<u32> {
-        let (taproot, master_fingerprint) = match self.0 {
+    fn get_index<C: Signing>(&self, secp: &Secp256k1<C>, psbt: &Psbt, input: &psbt::Input) -> impl Iterator<Item = DerivationPath> {
+        match self.0 {
             Descriptor::Bare(_) => { return None; } // TODO
             Descriptor::Pkh(_) =>  { return None; } // TODO
             Descriptor::Wpkh(_) =>  { return None; } // TODO
             Descriptor::Sh(_) => { return None; } // TODO
             Descriptor::Wsh(_) => { return None; } // TODO
             Descriptor::Tr(pk) => {
-                let ik = pk.internal_key();
-                let master_fingerprint = pk.internal_key().master_fingerprint();
-
-                    //BTreeMap<XOnlyPublicKey, (Vec<TapLeafHash>, KeySource)>,
-                input.tap_key_origins.iter()
-                    .filter_map(|(pubkey, (tap_leaves, (fingerprint, path)))| {
-                        if *fingerprint != master_fingerprint {
-                            return None;
+                pk
+                    .internal_key()
+                    .into_single_keys()
+                    .iter()
+                    .flat_map(|key| match key {
+                        DescriptorPublicKey::Single(single) => {
+                            Either::A(
+                                input.tap_key_origins.into_iter()
+                                    .filter_map(|(pk, (tap_leaves, (fingerprint, path)))| {
+                                        if single.origin == Some((fingerprint, path)) && single.key.into() == pk {
+                                            Some(path)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                            )
                         }
-
-                        
-
-                        Some(todo!())
-                    });
-
-                (true, ik.master_fingerprint())
+                        DescriptorPublicKey::XPub(xpub) => {
+                            Either::B(
+                            input.tap_key_origins.into_iter()
+                                .filter_map(|(pk, (tap_leaves, (fingerprint, path)))| {
+                                    // TODO: make sure tap leaves are part of descriptor
+                                    xpub.matches(&(fingerprint, path), secp)
+                                })
+                            )
+                        }
+                        DescriptorPublicKey::MultiXPub(_) => 
+                            unreachable!("into_single_keys() should never return a MultiXPub"),
+                    })
             }
         }
     }
@@ -1223,11 +1288,11 @@ pub fn plan<P: AssetProvider<DefiniteDescriptorKey>>(wallet: &Wallet, psbt: &Psb
     let external_descriptor = wallet.public_descriptor(KeychainKind::External);
     let internal_descriptor = wallet.public_descriptor(KeychainKind::Internal);
 
-    psbt.inputs.into_iter()
+    let foo = psbt.inputs.into_iter()
         .zip(psbt.unsigned_tx.input.into_iter())
         .map(|(psbt_input, input)| {
-            input.witness_utxo
-        })
+            psbt_input.witness_utxo.clone()
+        });
     todo!()
 }
 
