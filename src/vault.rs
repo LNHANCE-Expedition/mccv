@@ -1173,7 +1173,7 @@ fn xpub_match_key_source(xpub: DescriptorXKey<Xpub>, (fingerprint, path): &KeySo
 
     let hardened_wildcard = xpub.wildcard == Wildcard::Hardened;
     
-    let path_remainder_iter: DerivationPath = path.into_iter().skip(shared_prefix_len).collect();
+    let mut path_remainder_iter = path.into_iter().skip(shared_prefix_len);
 
     if let Some(next_path_item) = path_remainder_iter.next() {
         let wildcard_value = match next_path_item {
@@ -1183,14 +1183,12 @@ fn xpub_match_key_source(xpub: DescriptorXKey<Xpub>, (fingerprint, path): &KeySo
         };
 
         let new_descriptor = xpub
-            .xkey
-            //.derive_pub(
             .at_derivation_index(wildcard_value)
             .expect("descriptor must be single here");
 
-
+        XpubMatch::Match(Some(wildcard_value))
     } else {
-        //return XpubMatch::NoMatch; 
+        return XpubMatch::NoMatch; 
     }
 
     /*
@@ -1239,47 +1237,40 @@ where
     }
 }
 
-struct AssumeKnownKeys<'a, K: MiniscriptKey>(&'a Descriptor<K>);
+struct TaprootInternalKey<T>(T);
 
-impl<'a> AssumeKnownKeys<'a, DescriptorPublicKey> {
+struct AssumeKnownKeys<T>(T);
+
+// FIXME: maybe add a set of tap leaves
+impl<'a, 'b> AssumeKnownKeys<TaprootInternalKey<&'a DescriptorPublicKey>> {
     fn get_index<C: Signing>(&self, secp: &Secp256k1<C>, psbt: &Psbt, input: &psbt::Input) -> impl Iterator<Item = DerivationPath> {
-        match self.0 {
-            Descriptor::Bare(_) => { return None; } // TODO
-            Descriptor::Pkh(_) =>  { return None; } // TODO
-            Descriptor::Wpkh(_) =>  { return None; } // TODO
-            Descriptor::Sh(_) => { return None; } // TODO
-            Descriptor::Wsh(_) => { return None; } // TODO
-            Descriptor::Tr(pk) => {
-                pk
-                    .internal_key()
-                    .into_single_keys()
-                    .iter()
-                    .flat_map(|key| match key {
-                        DescriptorPublicKey::Single(single) => {
-                            Either::A(
-                                input.tap_key_origins.into_iter()
-                                    .filter_map(|(pk, (tap_leaves, (fingerprint, path)))| {
-                                        if single.origin == Some((fingerprint, path)) && single.key.into() == pk {
-                                            Some(path)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                            )
-                        }
-                        DescriptorPublicKey::XPub(xpub) => {
-                            Either::B(
-                            input.tap_key_origins.into_iter()
-                                .filter_map(|(pk, (tap_leaves, (fingerprint, path)))| {
-                                    // TODO: make sure tap leaves are part of descriptor
-                                    xpub.matches(&(fingerprint, path), secp)
-                                })
-                            )
-                        }
-                        DescriptorPublicKey::MultiXPub(_) => 
-                            unreachable!("into_single_keys() should never return a MultiXPub"),
-                    })
+        match self.0.0 {
+            DescriptorPublicKey::Single(single) => {
+                Either::A(
+                    input.tap_key_origins.into_iter()
+                        .filter_map(|(pk, (tap_leaves, (fingerprint, path)))| {
+                            if single.origin == Some((fingerprint, path)) && single.key.into() == pk {
+                                Some(path)
+                            } else {
+                                None
+                            }
+                        })
+                )
             }
+            DescriptorPublicKey::XPub(xpub) => {
+                Either::B(
+                    input.tap_key_origins.into_iter()
+                        .filter_map(|(pk, (tap_leaves, (fingerprint, path)))| {
+                            if let Some(path) = xpub.matches(&(fingerprint, path), secp) {
+                                Some(path)
+                            } else {
+                                None
+                            }
+                        })
+                )
+            }
+            DescriptorPublicKey::MultiXPub(_) => 
+                unreachable!("into_single_keys() should never return a MultiXPub"),
         }
     }
 }
