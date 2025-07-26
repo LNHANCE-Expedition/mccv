@@ -1,7 +1,7 @@
 use bdk_wallet::error::CreateTxError;
 use bdk_wallet::miniscript::descriptor::{Wildcard, DescriptorXKey, DerivPaths};
 use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, MiniscriptKey, DescriptorPublicKey};
-use bdk_wallet::miniscript::plan::{AssetProvider, Plan};
+use bdk_wallet::miniscript::plan::{AssetProvider, Plan, Assets, TaprootCanSign, TaprootAvailableLeaves, CanSign};
 use bdk_wallet::{Wallet, KeychainKind};
 use bitcoin::{BlockHash, FeeRate, psbt};
 use bitcoin::hashes::{
@@ -46,6 +46,7 @@ use bitcoin::{
     Txid,
     transaction::TxIn,
     transaction::TxOut,
+    blockdata::locktime::absolute,
     blockdata::locktime::relative,
     blockdata::transaction::Version,
     taproot::{
@@ -85,7 +86,7 @@ use serde::{
 use std::iter;
 use std::io::Write;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::migrate::{
@@ -1136,154 +1137,99 @@ impl Vault {
     }
 }
 
-enum XpubMatch {
-    NoMatch,
-    Match(Option<u32>),
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+enum IntoAssetsError {
+    PlaceholderError,
+    UnsupportedDescriptor,
 }
 
-// FIXME: everything basically assumes an xpub
-// FIXME: how to handle descriptors without a wildcard?
-fn xpub_match_key_source(xpub: DescriptorXKey<Xpub>, (fingerprint, path): &KeySource) -> XpubMatch {
-    //xpub.matches(
-    let matches = xpub.origin
-        .map(|(xpub_fingerprint, xpub_path)| xpub_fingerprint == *fingerprint && xpub_path == *path)
-        .unwrap_or(true); // If we lack the origin of this xkey we'll assume it matches and try anyway
-    
-    if !matches {
-        return XpubMatch::NoMatch;
-    }
+pub fn into_assets(descriptor: &Descriptor<DescriptorPublicKey>) -> Result<Assets, IntoAssetsError> {
+    // TODO: other key types shouldn't be bad to handle
+    let keys: BTreeSet<(KeySource, CanSign)> = match descriptor {
+        Descriptor::Bare(_) => { return Err(IntoAssetsError::UnsupportedDescriptor); }
+        Descriptor::Pkh(_) =>  { return Err(IntoAssetsError::UnsupportedDescriptor); },
+        Descriptor::Wpkh(_) =>  { return Err(IntoAssetsError::UnsupportedDescriptor); },
+        Descriptor::Sh(_) =>  { return Err(IntoAssetsError::UnsupportedDescriptor); },
+        Descriptor::Wsh(_) =>  { return Err(IntoAssetsError::UnsupportedDescriptor); },
+        Descriptor::Tr(key) => {
+            // TODO: script path
+            let key_path_can_sign = CanSign {
+                ecdsa: false,
+                taproot: TaprootCanSign {
+                    key_spend: true,
+                    script_spend: TaprootAvailableLeaves::None,
+                    sighash_default: true,
+                },
+            };
 
-    // XXX: this will copy but whatever...
-    // TODO: eliminate copy by handling DescriptorPublicKey::Xpub
-    // separate from Multi
-
-    let shared_prefix_len = xpub.derivation_path
-        .into_iter()
-        .zip(path)
-        .take_while(|(a, b)| a == b)
-        .count();
-
-    if shared_prefix_len < xpub.derivation_path.len() {
-        return XpubMatch::NoMatch;
-    }
-
-    if xpub.wildcard == Wildcard::None && shared_prefix_len == xpub.derivation_path.len() {
-        return XpubMatch::Match(None);
-    }
-
-    let hardened_wildcard = xpub.wildcard == Wildcard::Hardened;
-    
-    let mut path_remainder_iter = path.into_iter().skip(shared_prefix_len);
-
-    if let Some(next_path_item) = path_remainder_iter.next() {
-        let wildcard_value = match next_path_item {
-            ChildNumber::Normal { index } if !hardened_wildcard => index,
-            ChildNumber::Hardened { index } if hardened_wildcard => index,
-            _ => { return XpubMatch::NoMatch; }
-        };
-
-        let new_descriptor = xpub
-            .at_derivation_index(wildcard_value)
-            .expect("descriptor must be single here");
-
-        XpubMatch::Match(Some(wildcard_value))
-    } else {
-        return XpubMatch::NoMatch; 
-    }
-
-    /*
-    let wildcard_value = match *path_remainder_iter.next()? {
-        ChildNumber::Normal { index } if !hardened_wildcard => index,
-        ChildNumber::Hardened { index } if hardened_wildcard => index,
-        _ => { return XpubMatch::NoMatch; }
+            match key.internal_key() {
+                DescriptorPublicKey::Single(key) =>
+                    key
+                        .origin
+                        .as_ref()
+                        .map(|origin| (origin.clone(), key_path_can_sign))
+                        .into_iter()
+                        .collect(),
+                DescriptorPublicKey::XPub(xpub) => 
+                    xpub
+                        .origin
+                        .as_ref()
+                        .map(|origin| (origin.clone(), key_path_can_sign))
+                        .into_iter()
+                        .collect(),
+                DescriptorPublicKey::MultiXPub(xpubs) =>
+                    xpubs.derivation_paths.paths().into_iter()
+                        .flat_map(|path| {
+                            xpubs
+                                .origin
+                                .as_ref()
+                                // FIXME: is this the right path?
+                                .map(|(fingerprint, _xpubs_path)| (
+                                        (*fingerprint, path.clone()),
+                                        key_path_can_sign.clone(),
+                                ))
+                        })
+                        .collect(),
+            }
+        }
     };
 
-    xpub.into_single_keys().into_iter()
-        .filter_map(|single_descriptor| {
-            let descriptor_path = single_descriptor
-                .full_derivation_path()
-                .expect("descriptor must be single here");
-
-            let new_path = new_descriptor.full_derivation_path()
-                .expect("new descriptor must also be single here");
-
-            if new_path != *path {
-                return None;
-            }
-
-            Some(wildcard_value)
-        })
-        .collect()
-        */
+    Ok(Assets {
+        keys,
+        sha256_preimages: BTreeSet::new(),
+        hash256_preimages: BTreeSet::new(),
+        ripemd160_preimages: BTreeSet::new(),
+        hash160_preimages: BTreeSet::new(),
+        absolute_timelock: None,
+        relative_timelock: None,
+    })
 }
 
-enum Either<A, B> {
-    A(A),
-    B(B),
-}
 
-impl<T, A, B> Iterator for Either<A, B>
-where
-    A: Iterator<Item = T>,
-    B: Iterator<Item = T>,
-{
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Either::A(a) => a.next(),
-            Either::B(b) => b.next(),
-        }
-    }
-}
-
-struct TaprootInternalKey<T>(T);
-
-struct AssumeKnownKeys<T>(T);
-
-// FIXME: maybe add a set of tap leaves
-impl<'a, 'b> AssumeKnownKeys<TaprootInternalKey<&'a DescriptorPublicKey>> {
-    fn get_index<C: Signing>(&self, secp: &Secp256k1<C>, psbt: &Psbt, input: &psbt::Input) -> impl Iterator<Item = DerivationPath> {
-        match self.0.0 {
-            DescriptorPublicKey::Single(single) => {
-                Either::A(
-                    input.tap_key_origins.into_iter()
-                        .filter_map(|(pk, (tap_leaves, (fingerprint, path)))| {
-                            if single.origin == Some((fingerprint, path)) && single.key.into() == pk {
-                                Some(path)
-                            } else {
-                                None
-                            }
-                        })
-                )
-            }
-            DescriptorPublicKey::XPub(xpub) => {
-                Either::B(
-                    input.tap_key_origins.into_iter()
-                        .filter_map(|(pk, (tap_leaves, (fingerprint, path)))| {
-                            if let Some(path) = xpub.matches(&(fingerprint, path), secp) {
-                                Some(path)
-                            } else {
-                                None
-                            }
-                        })
-                )
-            }
-            DescriptorPublicKey::MultiXPub(_) => 
-                unreachable!("into_single_keys() should never return a MultiXPub"),
-        }
-    }
-}
 
 pub fn plan<P: AssetProvider<DefiniteDescriptorKey>>(wallet: &Wallet, psbt: &Psbt, provider: &P) -> HashMap<usize, Plan> {
     let external_descriptor = wallet.public_descriptor(KeychainKind::External);
     let internal_descriptor = wallet.public_descriptor(KeychainKind::Internal);
 
+    let assets = into_assets(&external_descriptor)
+        .unwrap()
+        .add(
+            into_assets(&internal_descriptor).unwrap()
+        );
+
+    //psbt.inputs[0].plan
+    /*
+    for key in internal_assets.keys.into_iter() {
+        assets.add(key);
+    }
+    */
+    /*
     let foo = psbt.inputs.into_iter()
         .zip(psbt.unsigned_tx.input.into_iter())
         .map(|(psbt_input, input)| {
             psbt_input.witness_utxo.clone()
         });
+    */
     todo!()
 }
 
