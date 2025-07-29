@@ -3,7 +3,8 @@ use bdk_wallet::miniscript::descriptor::{Wildcard, DescriptorXKey, DerivPaths};
 use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, MiniscriptKey, DescriptorPublicKey};
 use bdk_wallet::miniscript::plan::{AssetProvider, Plan, Assets, TaprootCanSign, TaprootAvailableLeaves, CanSign};
 use bdk_wallet::{Wallet, KeychainKind};
-use bitcoin::{BlockHash, FeeRate, psbt};
+use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch};
+use bitcoin::{BlockHash, FeeRate, psbt, Weight, TapTweakHash};
 use bitcoin::hashes::{
     Hash,
     sha256::Hash as Sha256,
@@ -29,7 +30,7 @@ use bitcoin::secp256k1::{
     Secp256k1,
     Signing,
     Verification,
-    XOnlyPublicKey,
+    XOnlyPublicKey, PublicKey, Scalar,
 };
 
 use bitcoin::{
@@ -439,7 +440,7 @@ impl VaultParameters {
         xpub.to_x_only_pub()
     }
 
-    fn master_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
+    fn master_key_full<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> PublicKey {
         let path = [
             ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
         ];
@@ -447,7 +448,11 @@ impl VaultParameters {
         let xpub = self.cold_xpub.derive_pub(secp, &path)
             .expect("non-hardened derivation of a reasonable depth shouldn't fail");
 
-        xpub.to_x_only_pub()
+        xpub.to_pub().0
+    }
+
+    fn master_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
+        self.master_key_full(secp, depth).x_only_public_key().0
     }
 
     // Similar to the recovery case, if the hot key is compromised, it's actually best if they
@@ -695,12 +700,18 @@ impl VaultParameters {
     fn tx_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: Option<&HashMap<VaultStateParameters, Transaction>>) -> Transaction {
         parameter.assert_valid();
 
+        let optional_anchor_output = if let VaultTransition::Withdrawal(_) = parameter.transition {
+            Some(ephemeral_anchor())
+        } else {
+            None
+        };
+
         let output: Vec<TxOut> = iter::empty()
             .chain(
                 self.vault_output(secp, depth, parameter, next_states)
             )
             .chain(self.withdrawal_output(secp, depth, parameter))
-            .chain(Some(ephemeral_anchor()))
+            .chain(optional_anchor_output)
             .collect();
 
         Transaction {
@@ -933,6 +944,7 @@ enum VaultOutpoints {
 
 pub struct VaultTransaction {
     txid: Txid,
+    vout: Option<u32>,
     depth: Depth,
     state_parameters: VaultStateParameters,
 }
@@ -985,6 +997,20 @@ impl Deref for SqliteVaultStorage {
 impl DerefMut for SqliteVaultStorage {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.sqlite
+    }
+}
+
+pub struct DepositTransactions {
+    pub shape_transaction: Psbt,
+    pub deposit_transaction: Transaction,
+}
+
+impl std::fmt::Debug for DepositTransactions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "shape txid = {}", self.shape_transaction.unsigned_tx.compute_txid())?;
+        writeln!(f, "shape tx = {:?}", self.shape_transaction.unsigned_tx)?;
+        writeln!(f, "deposit txid = {}", self.deposit_transaction.compute_txid())?;
+        writeln!(f, "deposit tx = {:?}", self.deposit_transaction)
     }
 }
 
@@ -1069,21 +1095,43 @@ impl Vault {
     pub fn deposit_transaction_template<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Option<Transaction> {
         let depth = self.history.len() as Depth;
 
-        let parameters = match self.history.last() {
-            Some(transaction) => transaction.state_parameters.clone(),
-            None => VaultStateParameters {
-                transition: VaultTransition::Deposit(deposit_amount),
-                previous_value: VaultAmount(0),
-                parent_transition: None,
-            },
+        let (parameters, outpoint) = match self.history.last() {
+            Some(transaction) => {
+                let outpoint = transaction.vout
+                    .map(|vout| OutPoint {
+                        txid: transaction.txid,
+                        vout,
+                    })?;
+
+                (
+                    transaction.state_parameters.clone(),
+                    Some(outpoint),
+                )
+            }
+            None => (
+                VaultStateParameters {
+                    transition: VaultTransition::Deposit(deposit_amount),
+                    previous_value: VaultAmount(0),
+                    parent_transition: None,
+                },
+                None,
+            ),
         };
 
         let transactions = self.parameters.templates_at_depth(secp, depth);
 
-        let deposit = transactions.get(&parameters)
-            .expect("never call deposit_transaction_template_impl() with an invalid parameter set");
+        let mut deposit = transactions.get(&parameters)
+            .expect("never call deposit_transaction_template_impl() with an invalid parameter set")
+            .clone(); // Why does this function even return an option if we don't use it?
+                      // TODO: probably should make it fallible with a real error type
 
-        Some(deposit.clone())
+        outpoint.map(|outpoint| {
+            if parameters.previous_value.nonzero() {
+                deposit.input[0].previous_output = outpoint;
+            }
+        });
+
+        Some(deposit)
     }
 
     pub fn deposit_transaction_script(&self, tx: &Transaction) -> ScriptBuf  {
@@ -1099,11 +1147,12 @@ impl Vault {
         self.history.len() as Depth
     }
 
-    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, wallet: &mut Wallet, deposit_amount: VaultAmount, fee_rate: FeeRate) -> Result<(Psbt, Psbt), VaultDepositError> {
-        let mut template = self.deposit_transaction_template(secp, deposit_amount)
+    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, wallet: &mut Wallet, deposit_amount: VaultAmount, fee_rate: FeeRate) -> Result<DepositTransactions, VaultDepositError> {
+        let mut deposit_template = self.deposit_transaction_template(secp, deposit_amount)
             .ok_or(VaultDepositError::VaultClosed)?;
 
-        let deposit_script = self.deposit_transaction_script(&template);
+        // FIXME: index
+        let deposit_script = self.deposit_transaction_script(&deposit_template);
         // TODO: timelocked script path allowing the hot key to recover the shaping tx output. It
         // won't have its own fee so it really shouldn't ever be confirmed on its own, but it's a
         // potential griefing vector.
@@ -1114,22 +1163,128 @@ impl Vault {
         );
 
         let master = self.parameters.master_key(secp, self.get_current_depth());
-        // FIXME: master
+        let tweak = TapTweakHash::from_key_and_tweak(master, Some(deposit_script_hash));
+        let (_output_key, output_key_parity) = master.add_tweak(secp, &tweak.to_scalar())
+            .expect("tap tweak failed"); // XXX: This is ~ what XOnlyPublicKey::tap_tweak() does in newer secp so should be ok
+
         let script_pubkey = ScriptBuf::new_p2tr(secp, master, Some(deposit_script_hash));
 
-        let mut builder = wallet.build_tx();
-        builder
-            .fee_absolute(Amount::from_sat(0))
-            .add_recipient(script_pubkey, self.parameters.scale.scale_amount(deposit_amount));
+        let shape_witness = {
+            let mut witness = Witness::new();
 
-        let shape_tx = builder.finish()
-            .map_err(|e| VaultDepositError::TransactionBuildError(e))?;
+            let control_block = ControlBlock {
+                leaf_version: LeafVersion::TapScript,
+                output_key_parity,
+                internal_key: master,
+                merkle_branch: TaprootMerkleBranch::default(),
+            };
 
-        // TODO: to apply the fee rate we need to actually build the transaction, know what the
-        // total weight will be (either sign it, or make assumptions about the signed size) and
-        // then recreate it with a scaled up amount
+            witness.push(deposit_script);
+            witness.push(control_block.serialize());
 
-        todo!()
+            witness
+        };
+
+        // Set this now so we can calculate weight correctly
+        match deposit_template.input.len() {
+            1 => { deposit_template.input[0].witness = shape_witness; }
+            2 => { deposit_template.input[1].witness = shape_witness; }
+            _ => unreachable!("should never have more than 2 inputs or less than 1"),
+        }
+
+        let mut shape_weight = Weight::ZERO;
+        // FIXME: very suspect
+        let deposit_weight = deposit_template.weight();
+        let mut accepted_shape_psbt: Option<Psbt> = None;
+        let mut fee_amount = fee_rate * (shape_weight + deposit_weight);
+
+        loop {
+            let mut builder = wallet.build_tx();
+            builder
+                .version(3)
+                .fee_absolute(Amount::ZERO)
+                .add_recipient(script_pubkey.clone(), self.parameters.scale.scale_amount(deposit_amount) + fee_amount);
+
+            let shape_psbt = builder.finish()
+                .map_err(|e| VaultDepositError::TransactionBuildError(e))?;
+
+            let shape_tx = &shape_psbt.unsigned_tx;
+
+            // TODO: to apply the fee rate we need to actually build the transaction, know what the
+            // total weight will be (either sign it, or make assumptions about the signed size) and
+            // then recreate it with a scaled up amount
+
+            let index = wallet.spk_index();
+            let satisfaction_weight = shape_tx
+                .input
+                .iter()
+                .flat_map(|txin| {
+                    index
+                        .txout(txin.previous_output)
+                        .map(|((keychain, derivation_index), txout)| {
+                            let descriptor = wallet.public_descriptor(keychain);
+
+                            let derived = descriptor.at_derivation_index(derivation_index)
+                                .expect("this better work"); // FIXME: no panics
+                            
+                            // TODO: we can do better than this, but this should be fine for now
+                            derived.max_weight_to_satisfy()
+                                .expect("this better work") // FIXME: no panics
+                        })
+                })
+                .fold(Weight::ZERO, |x, y| x + y);
+
+            shape_weight = shape_tx.weight() + satisfaction_weight;
+
+            let total_weight = shape_weight + deposit_weight;
+            let effective_fee_rate = fee_amount / total_weight;
+            let min_fee = total_weight * fee_rate;
+
+            println!("weight = {shape_weight} fee rate = {effective_fee_rate}");
+
+            if dbg!(fee_amount) >= dbg!(min_fee) {
+                accepted_shape_psbt = Some(shape_psbt);
+                break;
+            } else {
+                eprintln!("fee rate = {effective_fee_rate} doesn't satisfy required fee rate of {fee_rate}");
+            }
+
+            // Update fee we will supply
+            fee_amount = if fee_amount >= min_fee {
+                fee_amount
+            } else {
+                min_fee
+            };
+        }
+
+        let shape_psbt = accepted_shape_psbt.expect("can't be none here");
+        let shape_txid = shape_psbt.unsigned_tx.compute_txid();
+
+        let (shape_output_index, _shape_txout) = shape_psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .find(|(_i, txout)| txout.script_pubkey == script_pubkey)
+            .expect("shape psbt must have output we just added to it");
+                
+        let shape_outpoint = OutPoint {
+            txid: shape_txid,
+            vout: shape_output_index as u32,
+        };
+
+        match deposit_template.input.len() {
+            1 => { deposit_template.input[0].previous_output = shape_outpoint; }
+            2 => { deposit_template.input[1].previous_output = shape_outpoint; }
+            _ => unreachable!("should never have more than 2 inputs or less than 1"),
+        }
+
+        Ok(
+            DepositTransactions {
+                shape_transaction: shape_psbt,
+                deposit_transaction: deposit_template,
+            }
+        )
     }
 
     pub fn to_vault_amount(&self, amount: Amount) -> (VaultAmount, Amount) {
@@ -1137,114 +1292,27 @@ impl Vault {
     }
 }
 
-#[derive(Clone,Copy,Debug,Eq,PartialEq)]
-enum IntoAssetsError {
-    PlaceholderError,
-    UnsupportedDescriptor,
-}
-
-pub fn into_assets(descriptor: &Descriptor<DescriptorPublicKey>) -> Result<Assets, IntoAssetsError> {
-    // TODO: other key types shouldn't be bad to handle
-    let keys: BTreeSet<(KeySource, CanSign)> = match descriptor {
-        Descriptor::Bare(_) => { return Err(IntoAssetsError::UnsupportedDescriptor); }
-        Descriptor::Pkh(_) =>  { return Err(IntoAssetsError::UnsupportedDescriptor); },
-        Descriptor::Wpkh(_) =>  { return Err(IntoAssetsError::UnsupportedDescriptor); },
-        Descriptor::Sh(_) =>  { return Err(IntoAssetsError::UnsupportedDescriptor); },
-        Descriptor::Wsh(_) =>  { return Err(IntoAssetsError::UnsupportedDescriptor); },
-        Descriptor::Tr(key) => {
-            // TODO: script path
-            let key_path_can_sign = CanSign {
-                ecdsa: false,
-                taproot: TaprootCanSign {
-                    key_spend: true,
-                    script_spend: TaprootAvailableLeaves::None,
-                    sighash_default: true,
-                },
-            };
-
-            match key.internal_key() {
-                DescriptorPublicKey::Single(key) =>
-                    key
-                        .origin
-                        .as_ref()
-                        .map(|origin| (origin.clone(), key_path_can_sign))
-                        .into_iter()
-                        .collect(),
-                DescriptorPublicKey::XPub(xpub) => 
-                    xpub
-                        .origin
-                        .as_ref()
-                        .map(|origin| (origin.clone(), key_path_can_sign))
-                        .into_iter()
-                        .collect(),
-                DescriptorPublicKey::MultiXPub(xpubs) =>
-                    xpubs.derivation_paths.paths().into_iter()
-                        .flat_map(|path| {
-                            xpubs
-                                .origin
-                                .as_ref()
-                                // FIXME: is this the right path?
-                                .map(|(fingerprint, _xpubs_path)| (
-                                        (*fingerprint, path.clone()),
-                                        key_path_can_sign.clone(),
-                                ))
-                        })
-                        .collect(),
-            }
-        }
-    };
-
-    Ok(Assets {
-        keys,
-        sha256_preimages: BTreeSet::new(),
-        hash256_preimages: BTreeSet::new(),
-        ripemd160_preimages: BTreeSet::new(),
-        hash160_preimages: BTreeSet::new(),
-        absolute_timelock: None,
-        relative_timelock: None,
-    })
-}
-
-
-
-pub fn plan<P: AssetProvider<DefiniteDescriptorKey>>(wallet: &Wallet, psbt: &Psbt, provider: &P) -> HashMap<usize, Plan> {
-    let external_descriptor = wallet.public_descriptor(KeychainKind::External);
-    let internal_descriptor = wallet.public_descriptor(KeychainKind::Internal);
-
-    let assets = into_assets(&external_descriptor)
-        .unwrap()
-        .add(
-            into_assets(&internal_descriptor).unwrap()
-        );
-
-    //psbt.inputs[0].plan
-    /*
-    for key in internal_assets.keys.into_iter() {
-        assets.add(key);
-    }
-    */
-    /*
-    let foo = psbt.inputs.into_iter()
-        .zip(psbt.unsigned_tx.input.into_iter())
-        .map(|(psbt_input, input)| {
-            psbt_input.witness_utxo.clone()
-        });
-    */
-    todo!()
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
 
-    use crate::test_util;
+    use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
+
+    use bdk_wallet::KeychainKind;
+    use bdk_wallet::SignOptions;
+    use bdk_wallet::Wallet;
+
+    use bitcoin::{
+        consensus::encode::serialize_hex,
+    };
+
+    use serde::Serialize;
+
+    use std::time::Instant;
 
     use std::str::FromStr;
 
-    use bdk_wallet::KeychainKind;
-    use bdk_wallet::Wallet;
-
-    use std::time::Instant;
+    use crate::test_util;
 
     #[test]
     fn test_ctv() {
@@ -1313,7 +1381,28 @@ mod test {
         let (deposit_amount, remainder) = vault.to_vault_amount(Amount::from_sat(100_000_000));
         assert_eq!(remainder, Amount::ZERO);
 
-        let (shape_tx, vault_tx) = vault.create_deposit(&secp, &mut wallet, deposit_amount, FeeRate::BROADCAST_MIN).unwrap();
+        let mut deposit_transactions = vault.create_deposit(&secp, &mut wallet, deposit_amount, FeeRate::BROADCAST_MIN).unwrap();
+
+        eprintln!("{:?}", deposit_transactions);
+
+        let sign_success = wallet.sign(&mut deposit_transactions.shape_transaction, SignOptions::default())
+            .expect("sign success");
+
+        let shape_transaction = deposit_transactions.shape_transaction.extract_tx()
+            .expect("tx complete");
+
+        assert!(sign_success);
+
+        let args: Vec<serde_json::Value> = vec![
+            vec![
+                serialize_hex(&shape_transaction),
+                serialize_hex(&deposit_transactions.deposit_transaction),
+            ].into(),
+        ];
+
+        let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
+
+        eprintln!("result = {result}");
     }
 
     #[test]
