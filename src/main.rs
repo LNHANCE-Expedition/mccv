@@ -14,6 +14,7 @@ use bdk_wallet::{
 use bitcoin::NetworkKind;
 use bitcoin::bip32::{
     Xpriv,
+    Xpub,
 };
 
 use bitcoin::secp256k1::{
@@ -49,10 +50,16 @@ use std::path::PathBuf;
 
 use std::time::Instant;
 
-use mccv::vault::{
-    VaultParameters,
-    Vault,
+use mccv::{
+    AccountId,
+    VaultAmount,
     VaultId,
+    VaultParameters,
+    VaultScale,
+    Vault,
+};
+
+use mccv::vault::{
     SqliteVaultStorage,
 };
 
@@ -133,8 +140,25 @@ fn main() {
     match args.command {
         Command::Generate => {
             let master_xpriv = new_xpriv(args.network.into());
+            let account = AccountId::new(0)
+                .expect("account id < 0x7FFFFFFF");
 
-            let vault_parameters = VaultParameters::from_xpriv(&secp, &master_xpriv, 0);
+            let hot_xpriv = master_xpriv.derive_priv(&secp, &account.to_hot_derivation_path())
+                .expect("xpriv derivation will not fail with a short derivation path");
+
+            let cold_xpriv = master_xpriv.derive_priv(&secp, &account.to_cold_derivation_path())
+                .expect("xpriv derivation will not fail with a short derivation path derivation");
+
+            let vault_parameters = VaultParameters::new(
+                VaultScale::from_sat(10_000_000),    // Vault granularity
+                VaultAmount::new(10),                // Max vault value
+                Xpub::from_priv(&secp, &cold_xpriv), // cold xpub
+                Xpub::from_priv(&secp, &hot_xpriv),  // hot xpub
+                6 * 6,                               // delay per increment
+                VaultAmount::new(8),                 // max_deposit
+                VaultAmount::new(8),                 // max_withdrawal
+                10,                                  // max_depth
+            );
 
             let (descriptor, _, _) = Bip86(master_xpriv, KeychainKind::External)
                 .build(args.network)

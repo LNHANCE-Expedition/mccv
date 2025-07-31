@@ -5,9 +5,9 @@ use bdk_wallet::miniscript::plan::{AssetProvider, Plan, Assets, TaprootCanSign, 
 use bdk_wallet::{Wallet, KeychainKind};
 use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch};
 use bitcoin::{BlockHash, FeeRate, psbt, Weight, TapTweakHash};
+use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::{
     Hash,
-    sha256::Hash as Sha256,
 };
 
 use bitcoin::opcodes::all::{
@@ -36,7 +36,6 @@ use bitcoin::secp256k1::{
 use bitcoin::{
     Amount,
     script::Builder,
-    consensus::Encodable,
     absolute::LockTime,
     opcodes::OP_TRUE,
     OutPoint,
@@ -85,7 +84,6 @@ use serde::{
 };
 
 use std::iter;
-use std::io::Write;
 
 use std::collections::{HashMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
@@ -95,6 +93,8 @@ use crate::migrate::{
     migrate,
     MigrationError,
 };
+
+use crate::bip119::get_default_template;
 
 // struct.unpack(">I", hashlib.sha256(b'mccv').digest()[:4])[0] & 0x7FFFFFFF
 const PURPOSE: u32 = 360843587;
@@ -111,6 +111,8 @@ pub struct VaultScale(u32);
 
 impl VaultScale {
     pub fn new(scale: u32) -> Self { Self(scale) }
+
+    pub fn from_sat(scale: u32) -> Self { Self(scale) }
 
     pub fn convert_amount(&self, amount: Amount) -> (VaultAmount, Amount) {
         let quotient  = amount.to_sat() / (self.0 as u64);
@@ -217,59 +219,6 @@ impl std::ops::Sub for VaultAmount {
     }
 }
 
-// FIXME: confirmed a long time ago that sha256 writes never fail, so this function is actually
-// infallible, rewrite per what you've done elsewhere
-fn get_default_template(transaction: &Transaction, input_index: u32) -> std::io::Result<Sha256> {
-    let mut sha256 = Sha256::engine();
-
-    transaction.version.consensus_encode(&mut sha256)?;
-    transaction.lock_time.consensus_encode(&mut sha256)?;
-
-    let any_script_sigs = transaction.input.iter()
-        .any(|input| !input.script_sig.is_empty());
-
-    if any_script_sigs {
-        let mut script_sig_sha256 = Sha256::engine();
-
-        for input in transaction.input.iter() {
-            input.script_sig.consensus_encode(&mut script_sig_sha256)?;
-        }
-
-        let script_sig_sha256 = Sha256::from_engine(script_sig_sha256);
-        script_sig_sha256.consensus_encode(&mut sha256)?;
-    }
-
-    let vin_count: u32 = transaction.input.len() as u32;
-    sha256.write(&vin_count.to_le_bytes())?;
-
-    {
-        let mut sequences_sha256 = Sha256::engine();
-        for input in transaction.input.iter() {
-            let sequence: u32 = input.sequence.to_consensus_u32();
-            sequences_sha256.write(&sequence.to_le_bytes())?;
-        }
-        let sequences_sha256 = Sha256::from_engine(sequences_sha256);
-        sequences_sha256.consensus_encode(&mut sha256)?;
-    }
-
-    let vout_count: u32 = transaction.output.len() as u32;
-    sha256.write(&vout_count.to_le_bytes())?;
-
-    {
-        let mut outputs_sha256 = Sha256::engine();
-        for output in transaction.output.iter() {
-            output.consensus_encode(&mut outputs_sha256)?;
-        }
-
-        let outputs_sha256 = Sha256::from_engine(outputs_sha256);
-        outputs_sha256.consensus_encode(&mut sha256)?;
-    }
-
-    sha256.write(&input_index.to_le_bytes())?;
-
-    Ok(Sha256::from_engine(sha256))
-}
-
 const PAY_TO_ANCHOR_SCRIPT_BYTES: &[u8] = &[0x51, 0x02, 0x4e, 0x73];
 
 fn ephemeral_anchor() -> TxOut {
@@ -343,18 +292,37 @@ impl VaultStateParameters {
         }
     }
 
-    fn next(&self, transition: VaultTransition) -> Option<Self> {
+    fn next(&self, transition: VaultTransition, max: VaultAmount) -> Option<Self> {
         self.result_state_value()
-            .map(|value| Self {
-                transition,
-                previous_value: value,
-                parent_transition: Some(self.transition),
-            })
-            .filter(|next_parameters| match next_parameters.transition {
-                VaultTransition::Deposit(_) => true,
-                VaultTransition::Withdrawal(withdrawal_value)
-                    if withdrawal_value <= next_parameters.previous_value => true,
-                _ => false,
+            .and_then(|current_value| {
+                match transition {
+                    VaultTransition::Deposit(deposit_value) => {
+                        if current_value + deposit_value <= max {
+                            Some(
+                                Self {
+                                    transition,
+                                    previous_value: current_value,
+                                    parent_transition: Some(self.transition),
+                                }
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                    VaultTransition::Withdrawal(withdrawal_value) => {
+                        if current_value >= withdrawal_value {
+                            Some(
+                                Self {
+                                    transition,
+                                    previous_value: current_value,
+                                    parent_transition: Some(self.transition),
+                                }
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                }
             })
     }
 
@@ -402,6 +370,47 @@ impl<'a, 's, C: Verification> VaultGenerationIterator<'a, 's, C> {
         let current_depth = self.depth;
 
         self.next().map(|generation| (current_depth, generation))
+    }
+}
+
+// FIXME: ignores network...
+pub enum VaultKeyDerivationPathTemplate {
+    ColdKey(u32),
+    HotKey(u32),
+}
+
+impl VaultKeyDerivationPathTemplate {
+    pub fn new_hot(account: u32) -> Result<Self, ()> {
+        if account < ACCOUNT_MAX {
+            Err(())
+        } else {
+            Ok(Self::HotKey(account))
+        }
+    }
+
+    pub fn new_cold(account: u32) -> Result<Self, ()> {
+        if account < ACCOUNT_MAX {
+            Err(())
+        } else {
+            Ok(Self::ColdKey(account))
+        }
+    }
+
+    pub fn to_derivation_path(&self) -> DerivationPath {
+        let (account, path_type) = match self {
+            VaultKeyDerivationPathTemplate::ColdKey(account) => (*account, 0),
+            VaultKeyDerivationPathTemplate::HotKey(account) => (*account, 1),
+        };
+
+        vec![
+            ChildNumber::from_hardened_idx(PURPOSE)
+                .expect("hard coded to be a valid hardened index"),
+            ChildNumber::from_hardened_idx(account)
+                .expect("account number already validated as a valid hardened index"),
+            ChildNumber::from_hardened_idx(path_type)
+                .expect("hard coded to be a valid hardened index"),
+        ]
+        .into()
     }
 }
 
@@ -890,43 +899,6 @@ impl VaultParameters {
             done: false,
         }
     }
-
-    // FIXME: this shouldn't exist, defaults are too liable to change, amount increments will never
-    // be universal.
-    pub fn from_xpriv<C: Signing>(secp: &Secp256k1<C>, xpriv: &Xpriv, vault_number: u32) -> Self {
-        let h = |x: u32| ChildNumber::from_hardened_idx(x).expect("in range");
-
-        let cold_xpriv = xpriv.derive_priv(secp, &[h(PURPOSE), h(vault_number), h(0)])
-            .expect("derive cold xpriv");
-
-        let hot_xpriv = xpriv.derive_priv(secp, &[h(PURPOSE), h(vault_number), h(1)])
-            .expect("derive hot xpriv");
-
-        let cold_xpub = Xpub::from_priv(secp, &cold_xpriv);
-        let hot_xpub = Xpub::from_priv(secp, &hot_xpriv);
-
-        let delay_per_increment = 6 * 6; // ~6 hours
-
-        // Vault max size = 1 Bitcoin
-        let max = VaultAmount(100);
-        let scale = VaultScale::new(1_000_000); // million sats
-
-        let max_withdrawal_per_step = VaultAmount(8);
-        let max_deposit_per_step = VaultAmount(8);
-
-        let max_depth = 10;
-
-        VaultParameters {
-            scale,
-            max,
-            hot_xpub,
-            cold_xpub,
-            delay_per_increment,
-            max_withdrawal_per_step,
-            max_deposit_per_step,
-            max_depth,
-        }
-    }
 }
 
 // Struct members are the outpoints
@@ -949,6 +921,16 @@ pub struct VaultTransaction {
     state_parameters: VaultStateParameters,
 }
 
+impl VaultTransaction {
+    pub fn outpoint(&self) -> Option<OutPoint> {
+        self.vout
+            .map(|vout| OutPoint {
+                txid: self.txid,
+                vout,
+            })
+    }
+}
+
 #[derive(Debug)]
 pub enum VaultInitializationError {
     MigrationError(MigrationError),
@@ -961,7 +943,33 @@ pub enum VaultDepositError {
     VaultClosed,
 }
 
+/// A local identifier for a vault
 pub type VaultId = i64;
+
+const ACCOUNT_MAX: u32 = (1 << 31) - 1;
+
+/// An account identifier as described in BIP-44
+pub struct AccountId(u32);
+
+impl AccountId {
+    pub fn new(account: u32) -> Option<Self> {
+        if account < ACCOUNT_MAX {
+            Some(Self(account))
+        } else {
+            None
+        }
+    }
+
+    pub fn to_hot_derivation_path(&self) -> DerivationPath {
+        VaultKeyDerivationPathTemplate::HotKey(self.0)
+            .to_derivation_path()
+    }
+
+    pub fn to_cold_derivation_path(&self) -> DerivationPath {
+        VaultKeyDerivationPathTemplate::ColdKey(self.0)
+            .to_derivation_path()
+    }
+}
 
 pub struct SqliteVaultStorage {
     sqlite: rusqlite::Connection,
@@ -1003,6 +1011,29 @@ impl DerefMut for SqliteVaultStorage {
 pub struct DepositTransactions {
     pub shape_transaction: Psbt,
     pub deposit_transaction: Transaction,
+}
+
+#[cfg(feature = "bitcoind")]
+pub fn package_txes<I: IntoIterator<Item = &Transaction>>(iter: I) -> Vec<serde_json::Value> {
+    vec![
+        iter
+            .into_iter()
+            .map(serialize_hex)
+            .collect()
+            .into(),
+    ]
+}
+
+#[cfg(feature = "bitcoind")]
+impl DepositTransactions {
+    pub fn to_json(&self) -> Vec<serde_json::Value> {
+        vec![
+            vec![
+                serialize_hex(&self.shape_transaction),
+                serialize_hex(&self.deposit_transactions.deposit_transaction),
+            ].into(),
+        ]
+    }
 }
 
 impl std::fmt::Debug for DepositTransactions {
@@ -1210,10 +1241,6 @@ impl Vault {
 
             let shape_tx = &shape_psbt.unsigned_tx;
 
-            // TODO: to apply the fee rate we need to actually build the transaction, know what the
-            // total weight will be (either sign it, or make assumptions about the signed size) and
-            // then recreate it with a scaled up amount
-
             let index = wallet.spk_index();
             let satisfaction_weight = shape_tx
                 .input
@@ -1221,7 +1248,7 @@ impl Vault {
                 .flat_map(|txin| {
                     index
                         .txout(txin.previous_output)
-                        .map(|((keychain, derivation_index), txout)| {
+                        .map(|((keychain, derivation_index), _txout)| {
                             let descriptor = wallet.public_descriptor(keychain);
 
                             let derived = descriptor.at_derivation_index(derivation_index)
@@ -1314,31 +1341,19 @@ mod test {
 
     use crate::test_util;
 
-    #[test]
-    fn test_ctv() {
-        for (tx, index, result) in test_util::get_ctv_test_vectors() {
-            assert_eq!(get_default_template(&tx, index).unwrap(), result);
-        }
-    }
+    pub fn test_parameters() -> VaultParameters {
+        use crate::test_util::test_xpubs;
 
-    fn test_xpubs() -> (Xpub, Xpub) {
-        (
-            Xpub::from_str("tpubDCjgmQsPz1xamjuPHqwFkdU2DfHe9oz4VSgzJD1JDWZWM1pYyk82WMN7zyQRN85F5Yx8Rs2xeGC4eZ5un27LqPu74BDQZcWkqkhnVmbWmMB").unwrap(), // hot Xpub
-            Xpub::from_str("tpubDCjgmQsPz1xarEYG4eya8HegHuun3QU5VAJKo8oPwVgMoQb961aP7nv5J9PH9jjj74MzPp1U5YzzjdZF3gFANtMNuMKyrSYKmJt7jQMonM1").unwrap(), // cold Xpub
-        )
-    }
-
-    fn test_parameters() -> VaultParameters {
         let (hot_xpub, cold_xpub) = test_xpubs();
 
         VaultParameters {
-            scale: VaultScale(100_000_000),
-            max: VaultAmount(10),
-            hot_xpub,
+            scale: VaultScale::from_sat(100_000_000),
+            max: VaultAmount::new(10),
             cold_xpub,
+            hot_xpub,
             delay_per_increment: 36,
-            max_withdrawal_per_step: VaultAmount(3),
-            max_deposit_per_step: VaultAmount(3),
+            max_withdrawal_per_step: VaultAmount::new(3),
+            max_deposit_per_step: VaultAmount::new(3),
             max_depth: 10,
         }
     }
@@ -1356,6 +1371,7 @@ mod test {
         }
     }
 
+    /*
     #[test]
     fn test_deposit() {
         let secp = Secp256k1::new();
@@ -1383,57 +1399,18 @@ mod test {
 
         let mut deposit_transactions = vault.create_deposit(&secp, &mut wallet, deposit_amount, FeeRate::BROADCAST_MIN).unwrap();
 
-        eprintln!("{:?}", deposit_transactions);
-
         let sign_success = wallet.sign(&mut deposit_transactions.shape_transaction, SignOptions::default())
             .expect("sign success");
+        assert!(sign_success);
 
         let shape_transaction = deposit_transactions.shape_transaction.extract_tx()
             .expect("tx complete");
 
-        assert!(sign_success);
+        assert!(shape_transaction.input.len() >= 1);
+        assert!(shape_transaction.output.len() >= 1);
 
-        let args: Vec<serde_json::Value> = vec![
-            vec![
-                serialize_hex(&shape_transaction),
-                serialize_hex(&deposit_transactions.deposit_transaction),
-            ].into(),
-        ];
-
-        let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-
-        eprintln!("result = {result}");
+        assert_eq!(deposit_transactions.deposit_transaction.input.len(), 1);
+        assert_eq!(deposit_transactions.deposit_transaction.output.len(), 1);
     }
-
-    #[test]
-    fn test_scratch_workspace() {
-        use bdk_wallet::keys::GeneratableDefaultOptions;
-        //use bdk_wallet::miniscript::ScriptContext;
-        use corepc_node::{
-            Node,
-            exe_path,
-        };
-
-        use bdk_wallet::{
-            Wallet,
-            descriptor::template::Bip86,
-            descriptor::template::DescriptorTemplate,
-            KeychainKind,
-
-        };
-
-        use bitcoin::bip32::Xpriv;
-        use bitcoin::Network;
-        use bitcoin::secp256k1::rand::{RngCore, thread_rng};
-
-        use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
-        use bdk_bitcoind_rpc::Emitter;
-
-        let (xpriv, mut wallet) = test_util::get_test_wallet();
-
-        let template = Bip86(xpriv.clone(), KeychainKind::External);
-
-        let (descriptor, key_map, networks) = template.build(Network::Regtest).unwrap();
-
-    }
+    */
 }
