@@ -96,7 +96,7 @@ pub fn generate_to_wallet(wallet: &mut Wallet, client: &Client, num_blocks: u64)
     update_wallet(wallet, client);
 }
 
-// master xpriv derived from milk sad key, 
+// master xpriv derived from milk sad key (at least I'm pretty sure...)
 fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) {
     let milk_sad_master = Xpriv::from_str("tprv8ZgxMBicQKsPd1EzCPZcQSPhsotX5HvRDCivA7ASNQFmjWuTsW3WWEwUNKFAZrnD9qpz55rtyLdphqkwRZUqNWYXwSEzd6P4pYvXGByRim3").unwrap();
 

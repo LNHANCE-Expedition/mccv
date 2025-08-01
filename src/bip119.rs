@@ -1,6 +1,6 @@
 use bitcoin::hashes::{
     Hash,
-    sha256::Hash as Sha256,
+    sha256,
 };
 
 use bitcoin::{
@@ -10,57 +10,71 @@ use bitcoin::{
 
 use std::io::Write;
 
+const CTV_ENC_EXPECT_MSG: &str = "hash writes are infallible";
+
 // FIXME: confirmed a long time ago that sha256 writes never fail, so this function is actually
 // infallible, rewrite per what you've done elsewhere
-pub fn get_default_template(transaction: &Transaction, input_index: u32) -> std::io::Result<Sha256> {
-    let mut sha256 = Sha256::engine();
+pub fn get_default_template(transaction: &Transaction, input_index: u32) -> sha256::Hash {
+    let mut sha256 = sha256::Hash::engine();
 
-    transaction.version.consensus_encode(&mut sha256)?;
-    transaction.lock_time.consensus_encode(&mut sha256)?;
+    let _ = transaction.version.consensus_encode(&mut sha256)
+        .expect(CTV_ENC_EXPECT_MSG);
+    let _ = transaction.lock_time.consensus_encode(&mut sha256)
+        .expect(CTV_ENC_EXPECT_MSG);
 
     let any_script_sigs = transaction.input.iter()
         .any(|input| !input.script_sig.is_empty());
 
     if any_script_sigs {
-        let mut script_sig_sha256 = Sha256::engine();
+        let mut script_sig_sha256 = sha256::Hash::engine();
 
         for input in transaction.input.iter() {
-            input.script_sig.consensus_encode(&mut script_sig_sha256)?;
+            let _ = input.script_sig.consensus_encode(&mut script_sig_sha256)
+                .expect(CTV_ENC_EXPECT_MSG);
         }
 
-        let script_sig_sha256 = Sha256::from_engine(script_sig_sha256);
-        script_sig_sha256.consensus_encode(&mut sha256)?;
+        let script_sig_sha256 = sha256::Hash::from_engine(script_sig_sha256);
+        let _ = script_sig_sha256.consensus_encode(&mut sha256)
+            .expect(CTV_ENC_EXPECT_MSG);
     }
 
     let vin_count: u32 = transaction.input.len() as u32;
-    sha256.write(&vin_count.to_le_bytes())?;
+    let _ = sha256.write(&vin_count.to_le_bytes())
+        .expect(CTV_ENC_EXPECT_MSG);
 
     {
-        let mut sequences_sha256 = Sha256::engine();
+        let mut sequences_sha256 = sha256::Hash::engine();
         for input in transaction.input.iter() {
             let sequence: u32 = input.sequence.to_consensus_u32();
-            sequences_sha256.write(&sequence.to_le_bytes())?;
+            let _ = sequences_sha256.write(&sequence.to_le_bytes())
+                .expect(CTV_ENC_EXPECT_MSG);
         }
-        let sequences_sha256 = Sha256::from_engine(sequences_sha256);
-        sequences_sha256.consensus_encode(&mut sha256)?;
+        let sequences_sha256 = sha256::Hash::from_engine(sequences_sha256);
+        let _ = sequences_sha256.consensus_encode(&mut sha256)
+            .expect(CTV_ENC_EXPECT_MSG);
     }
 
     let vout_count: u32 = transaction.output.len() as u32;
-    sha256.write(&vout_count.to_le_bytes())?;
+    let _ = sha256.write(&vout_count.to_le_bytes())
+        .expect(CTV_ENC_EXPECT_MSG);
 
     {
-        let mut outputs_sha256 = Sha256::engine();
+        let mut outputs_sha256 = sha256::Hash::engine();
         for output in transaction.output.iter() {
-            output.consensus_encode(&mut outputs_sha256)?;
+            let _ = output.consensus_encode(&mut outputs_sha256)
+                .expect(CTV_ENC_EXPECT_MSG);
         }
 
-        let outputs_sha256 = Sha256::from_engine(outputs_sha256);
-        outputs_sha256.consensus_encode(&mut sha256)?;
+        let outputs_sha256 = sha256::Hash::from_engine(outputs_sha256);
+        let _ = outputs_sha256.consensus_encode(&mut sha256)
+            .expect(CTV_ENC_EXPECT_MSG);
+
     }
 
-    sha256.write(&input_index.to_le_bytes())?;
+    let _ = sha256.write(&input_index.to_le_bytes())
+        .expect(CTV_ENC_EXPECT_MSG);
 
-    Ok(Sha256::from_engine(sha256))
+    sha256::Hash::from_engine(sha256)
 }
 
 #[cfg(test)]
@@ -116,7 +130,7 @@ mod test {
     struct Sha256VecVisitor(PhantomData<()>);
 
     impl<'de> Visitor<'de> for Sha256VecVisitor {
-        type Value = Vec<Sha256>;
+        type Value = Vec<sha256::Hash>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             write!(formatter, "sequence of Sha256 hex")
@@ -126,12 +140,12 @@ mod test {
         where
             A: serde::de::SeqAccess<'de>,
         {
-            let mut result: Vec<Sha256> = Vec::new();
+            let mut result: Vec<sha256::Hash> = Vec::new();
             while let Some(element) = seq.next_element()? {
                 let bytes: Vec<u8> = FromHex::from_hex(element)
                     .map_err(serde::de::Error::custom)?;
 
-                let sha256 = Sha256::from_slice(&bytes)
+                let sha256 = sha256::Hash::from_slice(&bytes)
                     .map_err(serde::de::Error::custom)?;
 
                 result.push(sha256);
@@ -141,7 +155,7 @@ mod test {
         }
     }
 
-    fn deserialize_sha256_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Sha256>, D::Error> {
+    fn deserialize_sha256_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<sha256::Hash>, D::Error> {
         if deserializer.is_human_readable() {
             deserializer.deserialize_seq(Sha256VecVisitor(PhantomData::default()))
         } else {
@@ -157,7 +171,7 @@ mod test {
         spend_index: Vec<u32>,
 
         #[serde(deserialize_with = "deserialize_sha256_vec")]
-        result: Vec<Sha256>,
+        result: Vec<sha256::Hash>,
 
         #[serde(flatten)]
         _remainder: HashMap<String, serde_json::Value>,
@@ -170,7 +184,7 @@ mod test {
         Documentation(String),
     }
 
-    pub(crate) fn get_ctv_test_vectors() -> impl Iterator<Item=(Transaction, u32, Sha256)> {
+    pub(crate) fn get_ctv_test_vectors() -> impl Iterator<Item=(Transaction, u32, sha256::Hash)> {
         let ctv_test_vectors = include_str!("../data/tests/ctvhash.json");
         let ctv_test_vectors: Vec<CtvTestVectorEntry> = serde_json::from_str(ctv_test_vectors).expect("failed to parse ctv test vectors");
 
@@ -191,7 +205,7 @@ mod test {
     #[test]
     fn test_ctv() {
         for (tx, index, result) in get_ctv_test_vectors() {
-            assert_eq!(get_default_template(&tx, index).unwrap(), result);
+            assert_eq!(get_default_template(&tx, index), result);
         }
     }
 }

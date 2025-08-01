@@ -497,8 +497,7 @@ impl VaultParameters {
 
     /// Script for spending recovering an unvault output to the cold key
     fn recovery_script<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, recovery_tx: &Transaction, input_index: u32) -> ScriptBuf {
-        let recovery_template = get_default_template(recovery_tx, input_index)
-            .expect("recovery tx template");
+        let recovery_template = get_default_template(recovery_tx, input_index);
 
         builder_with_capacity(33 + 1 + 1 + 33 + 1)
             .push_slice(recovery_template.to_byte_array())
@@ -612,8 +611,7 @@ impl VaultParameters {
                         } + VaultAmount(1);
 
                         // Vault UTXO will always be input 0
-                        let next_state_template = get_default_template(&next_state, 0)
-                            .expect("vault tx template");
+                        let next_state_template = get_default_template(&next_state, 0);
 
                         // uh checksequence? I guess we already enforce sequence by CTV
                         let transition_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
@@ -1166,8 +1164,7 @@ impl Vault {
     }
 
     pub fn deposit_transaction_script(&self, tx: &Transaction) -> ScriptBuf  {
-        let template = get_default_template(&tx, 0)
-            .expect("sha256 write never fails");
+        let template = get_default_template(&tx, 0);
         builder_with_capacity(33 + 1 + 1 + 33 + 1)
             .push_slice(template.to_byte_array())
             .push_opcode(OP_CHECKTEMPLATEVERIFY)
@@ -1341,16 +1338,32 @@ mod test {
 
     use crate::test_util;
 
-    pub fn test_parameters() -> VaultParameters {
-        use crate::test_util::test_xpubs;
+    // master xpriv derived from milk sad key, 
+    // XXX: copied in two places
+    fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) {
+        let milk_sad_master = Xpriv::from_str("tprv8ZgxMBicQKsPd1EzCPZcQSPhsotX5HvRDCivA7ASNQFmjWuTsW3WWEwUNKFAZrnD9qpz55rtyLdphqkwRZUqNWYXwSEzd6P4pYvXGByRim3").unwrap();
 
-        let (hot_xpub, cold_xpub) = test_xpubs();
+        let account = AccountId::new(account)
+            .expect("Valid account");
+
+        (
+            milk_sad_master
+                .derive_priv(secp, &account.to_cold_derivation_path())
+                .expect("success"),
+            milk_sad_master
+                .derive_priv(secp, &account.to_hot_derivation_path())
+                .expect("success"),
+        )
+    }
+
+    fn test_parameters<C: Signing>(secp: &Secp256k1<C>) -> VaultParameters {
+        let (cold_xpriv, hot_xpriv) = test_xprivs(secp, 0);
 
         VaultParameters {
             scale: VaultScale::from_sat(100_000_000),
             max: VaultAmount::new(10),
-            cold_xpub,
-            hot_xpub,
+            cold_xpub: Xpub::from_priv(&secp, &cold_xpriv), //
+            hot_xpub: Xpub::from_priv(&secp, &hot_xpriv),  //
             delay_per_increment: 36,
             max_withdrawal_per_step: VaultAmount::new(3),
             max_deposit_per_step: VaultAmount::new(3),
@@ -1361,7 +1374,7 @@ mod test {
     #[test]
     fn test_simple() {
         let secp = Secp256k1::new();
-        let test_parameters = test_parameters();
+        let test_parameters = test_parameters(&secp);
 
         let templates = test_parameters.templates_at_depth(&secp, 0);
 
@@ -1377,7 +1390,7 @@ mod test {
         let secp = Secp256k1::new();
 
         let (node, client) = test_util::get_test_node();
-        let test_parameters = test_parameters();
+        let test_parameters = test_parameters(&secp);
 
         let (xpriv, mut wallet) = test_util::get_test_wallet();
 
