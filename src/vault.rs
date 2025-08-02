@@ -3,12 +3,16 @@ use bdk_wallet::miniscript::descriptor::{Wildcard, DescriptorXKey, DerivPaths};
 use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, MiniscriptKey, DescriptorPublicKey};
 use bdk_wallet::miniscript::plan::{AssetProvider, Plan, Assets, TaprootCanSign, TaprootAvailableLeaves, CanSign};
 use bdk_wallet::{Wallet, KeychainKind};
+use bitcoin::psbt::ExtractTxError;
 use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch};
 use bitcoin::{BlockHash, FeeRate, psbt, Weight, TapTweakHash};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::{
     Hash,
 };
+
+use bitcoin::consensus::Encodable;
+
 
 use bitcoin::opcodes::all::{
     OP_CSV,
@@ -1006,32 +1010,34 @@ impl DerefMut for SqliteVaultStorage {
     }
 }
 
+#[derive(Clone)]
 pub struct DepositTransactions {
     pub shape_transaction: Psbt,
     pub deposit_transaction: Transaction,
 }
 
-#[cfg(feature = "bitcoind")]
-pub fn package_txes<I: IntoIterator<Item = &Transaction>>(iter: I) -> Vec<serde_json::Value> {
-    vec![
-        iter
-            .into_iter()
-            .map(serialize_hex)
-            .collect()
-            .into(),
-    ]
+impl DepositTransactions {
+    pub fn extract(self) -> Result<(Transaction, Transaction), ExtractTxError> {
+        self.shape_transaction
+            .extract_tx()
+            .map(|shape_transaction| (shape_transaction, self.deposit_transaction))
+    }
 }
 
 #[cfg(feature = "bitcoind")]
-impl DepositTransactions {
-    pub fn to_json(&self) -> Vec<serde_json::Value> {
-        vec![
-            vec![
-                serialize_hex(&self.shape_transaction),
-                serialize_hex(&self.deposit_transactions.deposit_transaction),
-            ].into(),
-        ]
-    }
+//pub fn package_txes<I: IntoIterator<Item = &Transaction> + Sized>(iter: I) -> Vec<serde_json::Value> {
+//pub fn package_txes<I>(iter: I) -> Vec<serde_json::Value>
+//where
+    //I: IntoIterator<Item = &Transaction>,
+pub fn package_encodable<E, I>(iter: I) -> serde_json::Value
+where
+    I: IntoIterator<Item = E>,
+    E: Encodable,
+{
+    iter
+        .into_iter()
+        .map(|e| serialize_hex(&e))
+        .collect()
 }
 
 impl std::fmt::Debug for DepositTransactions {

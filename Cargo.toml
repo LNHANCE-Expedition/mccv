@@ -21,7 +21,7 @@ toml = "0.8.19"
 bitcoind = [ "bdk_bitcoind_rpc", "serde_json" ]
 
 [dev-dependencies]
-mccv = { path = ".", features = [ "bdk_bitcoind_rpc" ] }
+mccv = { path = ".", features = [ "bitcoind" ] }
 criterion = "0.5.1"
 serde_json = "1.0.133"
 bdk_bitcoind_rpc = "0.20.0"

@@ -163,10 +163,12 @@ fn test_deposit() {
     assert!(sign_success);
 
     let args: Vec<serde_json::Value> = vec![
-        vec![
-            serialize_hex(&shape_transaction),
-            serialize_hex(&deposit_transactions.deposit_transaction),
-        ].into(),
+        mccv::vault::package_encodable(
+            vec![
+                &shape_transaction,
+                &deposit_transactions.deposit_transaction,
+            ],
+        ),
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
