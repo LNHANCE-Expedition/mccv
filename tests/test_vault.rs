@@ -174,6 +174,24 @@ fn test_deposit() {
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
 
     eprintln!("result = {result}");
+
+    let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
+        .expect("shape tx in mempool");
+
+
+    let _ = client.get_mempool_entry(&deposit_transactions.deposit_transaction.compute_txid())
+        .expect("deposit tx in mempool");
+
+
+    generate_to_wallet(&mut wallet, &client, 6);
+
+    let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
+        .expect_err("shape tx has been mined");
+
+
+    let _ = client.get_mempool_entry(&deposit_transactions.deposit_transaction.compute_txid())
+        .expect_err("deposit tx has been mined");
+
 }
 
 #[test]

@@ -1025,10 +1025,6 @@ impl DepositTransactions {
 }
 
 #[cfg(feature = "bitcoind")]
-//pub fn package_txes<I: IntoIterator<Item = &Transaction> + Sized>(iter: I) -> Vec<serde_json::Value> {
-//pub fn package_txes<I>(iter: I) -> Vec<serde_json::Value>
-//where
-    //I: IntoIterator<Item = &Transaction>,
 pub fn package_encodable<E, I>(iter: I) -> serde_json::Value
 where
     I: IntoIterator<Item = E>,
@@ -1052,8 +1048,7 @@ impl std::fmt::Debug for DepositTransactions {
 pub struct Vault {
     id: VaultId,
     parameters: VaultParameters,
-    history: Vec<VaultTransaction>,
-    confirmations: Vec<(u32, BlockHash)>,
+    history: Vec<(VaultTransaction, Option<(u32, BlockHash)>)>,
 }
 
 #[derive(Debug)]
@@ -1087,7 +1082,6 @@ impl Vault {
             id: vault_ids[0],
             parameters,
             history: Vec::new(),
-            confirmations: Vec::new(),
         })
     }
 
@@ -1098,7 +1092,6 @@ impl Vault {
             id,
             parameters: todo!(),
             history: todo!(),
-            confirmations: todo!(),
         })
     }
 
@@ -1131,7 +1124,7 @@ impl Vault {
         let depth = self.history.len() as Depth;
 
         let (parameters, outpoint) = match self.history.last() {
-            Some(transaction) => {
+            Some((transaction, _)) => {
                 let outpoint = transaction.vout
                     .map(|vout| OutPoint {
                         txid: transaction.txid,
@@ -1270,13 +1263,13 @@ impl Vault {
             let effective_fee_rate = fee_amount / total_weight;
             let min_fee = total_weight * fee_rate;
 
-            println!("weight = {shape_weight} fee rate = {effective_fee_rate}");
+            println!("weight = {shape_weight} fee rate = {effective_fee_rate}sat/kwu");
 
             if dbg!(fee_amount) >= dbg!(min_fee) {
                 accepted_shape_psbt = Some(shape_psbt);
                 break;
             } else {
-                eprintln!("fee rate = {effective_fee_rate} doesn't satisfy required fee rate of {fee_rate}");
+                eprintln!("fee rate = {effective_fee_rate}sat/kwu doesn't satisfy required fee rate of {fee_rate}sat/kwu");
             }
 
             // Update fee we will supply
