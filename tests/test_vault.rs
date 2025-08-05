@@ -23,6 +23,7 @@ use bitcoin::{
     secp256k1::Signing,
     secp256k1::Verification,
     Transaction,
+    Txid,
 };
 
 use bitcoin::secp256k1::rand::{RngCore, thread_rng};
@@ -88,6 +89,13 @@ pub fn update_wallet(wallet: &mut Wallet, client: &Client) {
     }
 }
 
+pub fn update_vault(vault: &mut Vault, emitter: &mut Emitter<&Client>) {
+    while let Some(block) = emitter.next_block().unwrap() {
+        eprintln!("applying block {}", block.block.block_hash());
+        vault.apply_block(&block.block, block.block_height());
+    }
+}
+
 pub fn generate_to_wallet(wallet: &mut Wallet, client: &Client, num_blocks: u64) {
     let address = wallet.reveal_next_address(KeychainKind::External);
 
@@ -134,6 +142,8 @@ fn test_deposit() {
 
     let (xpriv, mut wallet) = get_test_wallet();
 
+    let genesis_checkpoint = wallet.local_chain().get(0).expect("chain has genesis block");
+
     generate_to_wallet(&mut wallet, &client, 100);
 
     let balance = wallet.balance();
@@ -144,15 +154,18 @@ fn test_deposit() {
         .expect("open memory wallet should succeed");
     let mut storage = SqliteVaultStorage::from_connection(sqlite)
         .expect("initialize vault storage");
-    let vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
+    let mut vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
         .expect("create vault");
 
-    let (deposit_amount, remainder) = vault.to_vault_amount(Amount::from_sat(100_000_000));
+    const DEPOSIT_AMOUNT: Amount = Amount::from_sat(100_000_000);
+    let (deposit_amount, remainder) = vault.to_vault_amount(DEPOSIT_AMOUNT);
     assert_eq!(remainder, Amount::ZERO);
 
     let mut deposit_transactions = vault.create_deposit(&secp, &mut wallet, deposit_amount, FeeRate::BROADCAST_MIN).unwrap();
 
-    eprintln!("{:?}", deposit_transactions);
+    assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
+
+    //eprintln!("{:?}", deposit_transactions);
 
     let sign_success = wallet.sign(&mut deposit_transactions.shape_transaction, SignOptions::default())
         .expect("sign success");
@@ -173,7 +186,7 @@ fn test_deposit() {
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
 
-    eprintln!("result = {result}");
+    //eprintln!("result = {result}");
 
     let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
         .expect("shape tx in mempool");
@@ -192,6 +205,13 @@ fn test_deposit() {
     let _ = client.get_mempool_entry(&deposit_transactions.deposit_transaction.compute_txid())
         .expect_err("deposit tx has been mined");
 
+    let mut vault_block_emitter = Emitter::new(&client, genesis_checkpoint, 0, Option::<Txid>::None);
+
+    assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
+
+    update_vault(&mut vault, &mut vault_block_emitter);
+
+    assert_eq!(vault.get_confirmed_balance(), DEPOSIT_AMOUNT);
 }
 
 #[test]
@@ -214,6 +234,8 @@ fn test_scratch_workspace() {
     use bitcoin::bip32::Xpriv;
     use bitcoin::Network;
     use bitcoin::secp256k1::rand::{RngCore, thread_rng};
+
+    use bitcoin::blockdata::constants::genesis_block;
 
     use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
     use bdk_bitcoind_rpc::Emitter;

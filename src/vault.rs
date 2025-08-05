@@ -1,3 +1,4 @@
+use bdk_wallet::coin_selection::InsufficientFunds;
 use bdk_wallet::error::CreateTxError;
 use bdk_wallet::miniscript::descriptor::{Wildcard, DescriptorXKey, DerivPaths};
 use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, MiniscriptKey, DescriptorPublicKey};
@@ -11,7 +12,12 @@ use bitcoin::hashes::{
     Hash,
 };
 
+use bitcoin::blockdata::constants::genesis_block;
+
 use bitcoin::consensus::Encodable;
+
+#[cfg(feature = "bitcoind")]
+use bitcoin::Block;
 
 
 use bitcoin::opcodes::all::{
@@ -941,6 +947,7 @@ pub enum VaultInitializationError {
 
 #[derive(Debug)]
 pub enum VaultDepositError {
+    InsufficientFunds(InsufficientFunds),
     TransactionBuildError(CreateTxError),
     VaultClosed,
 }
@@ -1174,6 +1181,57 @@ impl Vault {
         self.history.len() as Depth
     }
 
+    // TODO: add current height arg
+    pub fn get_confirmed_balance(&self) -> Amount {
+        self.history.iter().rev()
+            .skip_while(|(_tx, confirmation)| confirmation.is_none())
+            .next()
+            .map(|(tx, _confirmation)| tx.state_parameters.result_state_value()
+                 .map(|result_value| self.parameters.scale.scale_amount(result_value))
+                 .unwrap_or(Amount::ZERO)
+             )
+            .unwrap_or(Amount::ZERO)
+    }
+
+    #[cfg(feature = "bitcoind")]
+    pub fn apply_block(&mut self, block: &Block, block_height: u32) -> usize {
+        // Pretty naive attempt at handling reorgs, will need testing
+        let history_iter = self.history.iter_mut()
+            // Skip any vault history that already has a confirmation recorded, unless it could be
+            // replaced or invalidated by this block
+            .skip_while(|history_tx| {
+                history_tx.1.map(|(tx_height, _block)| tx_height <= block_height).unwrap_or(false)
+            });
+
+        let mut block_txes = block.txdata.iter();
+
+        for (history_tx, ref mut confirmation) in history_iter {
+            // clear the previously seen block inclusion
+            *confirmation = None;
+
+            while confirmation.is_none() {
+                if let Some(block_tx) = block_txes.next() {
+                    if block_tx.compute_txid() == history_tx.txid {
+                        eprintln!("found tx {}", history_tx.txid);
+                        *confirmation = Some((block_height, block.block_hash()));
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        return self.history.len();
+    }
+
+    // FIXME: I think this should be refactored into a stateless version on VaultParameters
+    // Possibly also remove the dependency on wallet, instead return the deposit transaction and
+    // any extra context that might be necessary (like output amount, tap tree if the deposit
+    // ends up getting more than one output, caller can try to build the right shape tx instead
+    // of this function)
+    //  FIXME: return value should probably also have some kind of token for keeping track of
+    //  replacements, preventing invalid deposit transactions from being tracked
     pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, wallet: &mut Wallet, deposit_amount: VaultAmount, fee_rate: FeeRate) -> Result<DepositTransactions, VaultDepositError> {
         let mut deposit_template = self.deposit_transaction_template(secp, deposit_amount)
             .ok_or(VaultDepositError::VaultClosed)?;
@@ -1220,12 +1278,11 @@ impl Vault {
         }
 
         let mut shape_weight = Weight::ZERO;
-        // FIXME: very suspect
+        // This weight should be correct already 
         let deposit_weight = deposit_template.weight();
-        let mut accepted_shape_psbt: Option<Psbt> = None;
         let mut fee_amount = fee_rate * (shape_weight + deposit_weight);
 
-        loop {
+        let shape_psbt = loop {
             let mut builder = wallet.build_tx();
             builder
                 .version(3)
@@ -1233,7 +1290,12 @@ impl Vault {
                 .add_recipient(script_pubkey.clone(), self.parameters.scale.scale_amount(deposit_amount) + fee_amount);
 
             let shape_psbt = builder.finish()
-                .map_err(|e| VaultDepositError::TransactionBuildError(e))?;
+                .map_err(|e| {
+                    match e {
+                        CreateTxError::CoinSelection(cs) => VaultDepositError::InsufficientFunds(cs),
+                        _ => VaultDepositError::TransactionBuildError(e),
+                    }
+                })?;
 
             let shape_tx = &shape_psbt.unsigned_tx;
 
@@ -1260,27 +1322,20 @@ impl Vault {
             shape_weight = shape_tx.weight() + satisfaction_weight;
 
             let total_weight = shape_weight + deposit_weight;
-            let effective_fee_rate = fee_amount / total_weight;
             let min_fee = total_weight * fee_rate;
 
-            println!("weight = {shape_weight} fee rate = {effective_fee_rate}sat/kwu");
-
-            if dbg!(fee_amount) >= dbg!(min_fee) {
-                accepted_shape_psbt = Some(shape_psbt);
-                break;
-            } else {
-                eprintln!("fee rate = {effective_fee_rate}sat/kwu doesn't satisfy required fee rate of {fee_rate}sat/kwu");
+            if fee_amount >= min_fee {
+                break shape_psbt;
             }
 
-            // Update fee we will supply
+            // Update the absolute fee we must supply
             fee_amount = if fee_amount >= min_fee {
                 fee_amount
             } else {
                 min_fee
             };
-        }
+        };
 
-        let shape_psbt = accepted_shape_psbt.expect("can't be none here");
         let shape_txid = shape_psbt.unsigned_tx.compute_txid();
 
         let (shape_output_index, _shape_txout) = shape_psbt
@@ -1308,6 +1363,15 @@ impl Vault {
                 deposit_transaction: deposit_template,
             }
         )
+    }
+
+    // FIXME: return types
+    pub fn add_vault_transaction(&mut self, depth: Depth, tx: &Transaction, vout: Option<u32>) -> Result<(), ()> {
+        if (depth as usize) != self.history.len() {
+            return Err(());
+        }
+
+        todo!()
     }
 
     pub fn to_vault_amount(&self, amount: Amount) -> (VaultAmount, Amount) {

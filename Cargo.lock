@@ -906,6 +906,7 @@ name = "mccv"
 version = "0.1.0"
 dependencies = [
  "bdk_bitcoind_rpc",
+ "bdk_core",
  "bdk_electrum",
  "bdk_wallet",
  "bitcoin",
