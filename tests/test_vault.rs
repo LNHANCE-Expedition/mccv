@@ -45,6 +45,7 @@ use mccv::{
     VaultParameters,
     VaultScale,
     Vault,
+    VaultDepositor,
     vault::SqliteVaultStorage,
 };
 
@@ -121,6 +122,14 @@ fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) 
     )
 }
 
+// Test cases to add:
+// - withdrawal
+// - withdrawal greater than available balance
+// - deposit greater than max
+// - clawback
+// - load and store
+// - reorgs
+
 #[test]
 fn test_deposit() {
     let secp = Secp256k1::new();
@@ -129,8 +138,10 @@ fn test_deposit() {
 
     let (cold_xpriv, hot_xpriv) = test_xprivs(&secp, 0);
 
+    const VAULT_SCALE: Amount = Amount::from_sat(100_000_000);
+
     let test_parameters = VaultParameters::new(
-        VaultScale::from_sat(100_000_000),   // scale
+        VaultScale::from_sat(VAULT_SCALE.to_sat() as u32),   // scale
         VaultAmount::new(10),                // max amount
         Xpub::from_priv(&secp, &cold_xpriv), //
         Xpub::from_priv(&secp, &hot_xpriv),  //
@@ -157,20 +168,22 @@ fn test_deposit() {
     let mut vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
         .expect("create vault");
 
-    const DEPOSIT_AMOUNT: Amount = Amount::from_sat(100_000_000);
-    let (deposit_amount, remainder) = vault.to_vault_amount(DEPOSIT_AMOUNT);
+    let deposit_amount_raw = VAULT_SCALE * 3;
+    let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw);
     assert_eq!(remainder, Amount::ZERO);
 
-    let mut deposit_transactions = vault.create_deposit(&secp, &mut wallet, deposit_amount, FeeRate::BROADCAST_MIN).unwrap();
+    let mut deposit_transaction = vault.create_deposit(&secp, deposit_amount).unwrap();
 
     assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
 
+    let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
+        .expect("create shape success");
     //eprintln!("{:?}", deposit_transactions);
 
-    let sign_success = wallet.sign(&mut deposit_transactions.shape_transaction, SignOptions::default())
+    let sign_success = wallet.sign(&mut shape_psbt, SignOptions::default())
         .expect("sign success");
 
-    let shape_transaction = deposit_transactions.shape_transaction.extract_tx()
+    let shape_transaction = shape_psbt.extract_tx()
         .expect("tx complete");
 
     assert!(sign_success);
@@ -179,39 +192,81 @@ fn test_deposit() {
         mccv::vault::package_encodable(
             vec![
                 &shape_transaction,
-                &deposit_transactions.deposit_transaction,
+                deposit_transaction.as_transaction(),
             ],
         ),
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-
-    //eprintln!("result = {result}");
+    assert_eq!(dbg!(result).get("package_msg"), Some(&"success".into()));
 
     let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
         .expect("shape tx in mempool");
 
-
-    let _ = client.get_mempool_entry(&deposit_transactions.deposit_transaction.compute_txid())
+    let _ = client.get_mempool_entry(&deposit_transaction.as_transaction().compute_txid())
         .expect("deposit tx in mempool");
-
 
     generate_to_wallet(&mut wallet, &client, 6);
 
     let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
         .expect_err("shape tx has been mined");
 
-
-    let _ = client.get_mempool_entry(&deposit_transactions.deposit_transaction.compute_txid())
+    let _ = client.get_mempool_entry(&deposit_transaction.as_transaction().compute_txid())
         .expect_err("deposit tx has been mined");
 
     let mut vault_block_emitter = Emitter::new(&client, genesis_checkpoint, 0, Option::<Txid>::None);
 
     assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
 
+    vault.add_deposit_transaction(&deposit_transaction)
+        .expect("deposit transaction should add cleanly");
+
     update_vault(&mut vault, &mut vault_block_emitter);
 
-    assert_eq!(vault.get_confirmed_balance(), DEPOSIT_AMOUNT);
+    assert_eq!(vault.get_confirmed_balance(), deposit_amount_raw);
+
+    let deposit_amount_raw = VAULT_SCALE * 2;
+    let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw);
+    assert_eq!(remainder, Amount::ZERO);
+
+    let mut deposit_transaction = vault.create_deposit(&secp, deposit_amount).unwrap();
+
+    let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
+        .expect("create shape success");
+
+    let sign_success = wallet.sign(&mut shape_psbt, SignOptions::default())
+        .expect("sign success");
+
+    assert!(sign_success);
+
+    let shape_transaction = shape_psbt.extract_tx()
+        .expect("tx complete");
+
+    let args: Vec<serde_json::Value> = vec![
+        mccv::vault::package_encodable(
+            vec![
+                &shape_transaction,
+                deposit_transaction.as_transaction(),
+            ],
+        ),
+    ];
+
+    let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
+    assert_eq!(result.get("package_msg"), Some(&"success".into()));
+
+    vault.add_deposit_transaction(&deposit_transaction)
+        .expect("deposit transaction should add cleanly");
+
+    generate_to_wallet(&mut wallet, &client, 6);
+
+    update_vault(&mut vault, &mut vault_block_emitter);
+
+    assert_eq!(vault.get_confirmed_balance(), deposit_amount_raw);
+
+
+    let withdrawal_amount = VAULT_SCALE * 2;
+
+
 }
 
 #[test]

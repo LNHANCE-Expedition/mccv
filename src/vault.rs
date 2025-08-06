@@ -51,6 +51,7 @@ use bitcoin::{
     OutPoint,
     relative::LockTime as RelativeLockTime,
     ScriptBuf,
+    Script,
     TapNodeHash,
     Transaction,
     Txid,
@@ -174,6 +175,10 @@ impl VaultAmount {
 
     pub fn to_amount(&self, scale: u32) -> Amount {
         Amount::from_sat(self.to_sats(scale))
+    }
+
+    pub fn checked_sub(&self, other: VaultAmount) -> Option<VaultAmount> {
+        self.0.checked_sub(other.0).map(VaultAmount::new)
     }
 
     fn to_unscaled_amount(&self) -> u32 {
@@ -926,7 +931,8 @@ pub struct VaultTransaction {
     txid: Txid,
     vout: Option<u32>,
     depth: Depth,
-    state_parameters: VaultStateParameters,
+    transition: VaultTransition,
+    result_value: VaultAmount,
 }
 
 impl VaultTransaction {
@@ -950,6 +956,7 @@ pub enum VaultDepositError {
     InsufficientFunds(InsufficientFunds),
     TransactionBuildError(CreateTxError),
     VaultClosed,
+    VaultOverflow(VaultAmount),
 }
 
 /// A local identifier for a vault
@@ -1052,6 +1059,39 @@ impl std::fmt::Debug for DepositTransactions {
     }
 }
 
+pub struct DepositTransaction{
+    depth: Depth,
+    amount: Amount,
+    vault_total: VaultAmount,
+    vault_deposit: VaultAmount,
+    script_pubkey: ScriptBuf,
+    transaction: Transaction,
+}
+
+impl DepositTransaction {
+    pub fn to_transaction(self) -> Transaction { self.transaction }
+
+    pub fn as_transaction(&self) -> &Transaction { &self.transaction }
+
+    fn deposit_input_mut(&mut self) -> &mut TxIn {
+        match self.transaction.input.len() {
+            1 => &mut self.transaction.input[0],
+            2 => &mut self.transaction.input[1],
+            _ => unreachable!("should never have more than 2 inputs or less than 1"),
+        }
+    }
+
+    pub fn script_pubkey(&self) -> &Script { self.script_pubkey.as_script() }
+
+    pub fn deposit_amount(&self) -> Amount { self.amount }
+
+    pub fn connect_input(&mut self, outpoint: OutPoint) {
+        self.deposit_input_mut().previous_output = outpoint;
+    }
+
+    pub fn weight(&self) -> Weight { self.transaction.weight() }
+}
+
 pub struct Vault {
     id: VaultId,
     parameters: VaultParameters,
@@ -1139,7 +1179,11 @@ impl Vault {
                     })?;
 
                 (
-                    transaction.state_parameters.clone(),
+                    VaultStateParameters {
+                        transition: VaultTransition::Deposit(deposit_amount),
+                        previous_value: transaction.result_value,
+                        parent_transition: Some(transaction.transition),
+                    },
                     Some(outpoint),
                 )
             }
@@ -1150,15 +1194,20 @@ impl Vault {
                     parent_transition: None,
                 },
                 None,
-            ),
+            )
         };
 
-        let transactions = self.parameters.templates_at_depth(secp, depth);
+        let transactions = self.parameters.templates_at_depth(secp, dbg!(depth));
 
-        let mut deposit = transactions.get(&parameters)
-            .expect("never call deposit_transaction_template_impl() with an invalid parameter set")
-            .clone(); // Why does this function even return an option if we don't use it?
-                      // TODO: probably should make it fallible with a real error type
+        let mut deposit = if let Some(deposit) = transactions.get(dbg!(&parameters)) {
+            deposit.clone()
+        } else {
+            // Why does this function even return an option if we don't use it?
+            // TODO: probably should make it fallible with a real error type
+            let template_keys: Vec<_> = transactions.keys().collect();
+            dbg!(template_keys);
+            panic!("never call deposit_transaction_template_impl() with an invalid parameter set")
+        };
 
         outpoint.map(|outpoint| {
             if parameters.previous_value.nonzero() {
@@ -1186,9 +1235,8 @@ impl Vault {
         self.history.iter().rev()
             .skip_while(|(_tx, confirmation)| confirmation.is_none())
             .next()
-            .map(|(tx, _confirmation)| tx.state_parameters.result_state_value()
-                 .map(|result_value| self.parameters.scale.scale_amount(result_value))
-                 .unwrap_or(Amount::ZERO)
+            .map(|(tx, _confirmation)| 
+                 self.parameters.scale.scale_amount(tx.result_value)
              )
             .unwrap_or(Amount::ZERO)
     }
@@ -1232,7 +1280,7 @@ impl Vault {
     // of this function)
     //  FIXME: return value should probably also have some kind of token for keeping track of
     //  replacements, preventing invalid deposit transactions from being tracked
-    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, wallet: &mut Wallet, deposit_amount: VaultAmount, fee_rate: FeeRate) -> Result<DepositTransactions, VaultDepositError> {
+    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Result<DepositTransaction, VaultDepositError> {
         let mut deposit_template = self.deposit_transaction_template(secp, deposit_amount)
             .ok_or(VaultDepositError::VaultClosed)?;
 
@@ -1277,17 +1325,78 @@ impl Vault {
             _ => unreachable!("should never have more than 2 inputs or less than 1"),
         }
 
+        let current_vault_amount = self.history.last()
+            .map(|(tx, _)| tx.result_value)
+            .unwrap_or(VaultAmount::ZERO);
+
+        // Ensure vault_total <= self.parameters.max
+        let vault_total = current_vault_amount + deposit_amount;
+        let overflow_amount = vault_total
+            .checked_sub(self.parameters.max);
+        if let Some(overflow_amount) = overflow_amount {
+            if overflow_amount > VaultAmount::ZERO {
+                return Err(VaultDepositError::VaultOverflow(overflow_amount));
+            }
+        }
+
+        Ok(
+            DepositTransaction{
+                depth: self.get_current_depth(),
+                amount: self.parameters.scale.scale_amount(deposit_amount),
+                script_pubkey,
+                transaction: deposit_template,
+                vault_deposit: deposit_amount,
+                vault_total,
+            }
+        )
+    }
+
+    // FIXME: return types
+    // FIXME: part of me wants to have one add_*_transaction for deposit and withdrawal
+    pub fn add_deposit_transaction(&mut self, tx: &DepositTransaction) -> Result<(), ()> {
+        if (tx.depth as usize) != self.history.len() {
+            return Err(());
+        }
+
+        self.history.push(
+            (
+                VaultTransaction {
+                    txid: tx.transaction.compute_txid(),
+                    vout: Some(0),
+                    depth: tx.depth,
+                    transition: VaultTransition::Deposit(tx.vault_deposit),
+                    result_value: tx.vault_total,
+                },
+                None,
+            )
+        );
+
+        Ok(())
+    }
+
+    pub fn to_vault_amount(&self, amount: Amount) -> (VaultAmount, Amount) {
+        self.parameters.scale.convert_amount(amount)
+    }
+}
+
+pub trait VaultDepositor {
+    fn create_shape<C: Verification>(&mut self, secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError>;
+}
+
+impl VaultDepositor for Wallet {
+    fn create_shape<C: Verification>(&mut self, secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError> {
+        let script_pubkey = deposit_transaction.script_pubkey();
         let mut shape_weight = Weight::ZERO;
         // This weight should be correct already 
-        let deposit_weight = deposit_template.weight();
+        let deposit_weight = deposit_transaction.weight();
         let mut fee_amount = fee_rate * (shape_weight + deposit_weight);
 
         let shape_psbt = loop {
-            let mut builder = wallet.build_tx();
+            let mut builder = self.build_tx();
             builder
                 .version(3)
                 .fee_absolute(Amount::ZERO)
-                .add_recipient(script_pubkey.clone(), self.parameters.scale.scale_amount(deposit_amount) + fee_amount);
+                .add_recipient(script_pubkey, deposit_transaction.deposit_amount() + fee_amount);
 
             let shape_psbt = builder.finish()
                 .map_err(|e| {
@@ -1299,7 +1408,7 @@ impl Vault {
 
             let shape_tx = &shape_psbt.unsigned_tx;
 
-            let index = wallet.spk_index();
+            let index = self.spk_index();
             let satisfaction_weight = shape_tx
                 .input
                 .iter()
@@ -1307,7 +1416,7 @@ impl Vault {
                     index
                         .txout(txin.previous_output)
                         .map(|((keychain, derivation_index), _txout)| {
-                            let descriptor = wallet.public_descriptor(keychain);
+                            let descriptor = self.public_descriptor(keychain);
 
                             let derived = descriptor.at_derivation_index(derivation_index)
                                 .expect("this better work"); // FIXME: no panics
@@ -1343,39 +1452,15 @@ impl Vault {
             .output
             .iter()
             .enumerate()
-            .find(|(_i, txout)| txout.script_pubkey == script_pubkey)
+            .find(|(_i, txout)| txout.script_pubkey == *script_pubkey)
             .expect("shape psbt must have output we just added to it");
-                
-        let shape_outpoint = OutPoint {
+
+        deposit_transaction.connect_input(OutPoint {
             txid: shape_txid,
             vout: shape_output_index as u32,
-        };
+        });
 
-        match deposit_template.input.len() {
-            1 => { deposit_template.input[0].previous_output = shape_outpoint; }
-            2 => { deposit_template.input[1].previous_output = shape_outpoint; }
-            _ => unreachable!("should never have more than 2 inputs or less than 1"),
-        }
-
-        Ok(
-            DepositTransactions {
-                shape_transaction: shape_psbt,
-                deposit_transaction: deposit_template,
-            }
-        )
-    }
-
-    // FIXME: return types
-    pub fn add_vault_transaction(&mut self, depth: Depth, tx: &Transaction, vout: Option<u32>) -> Result<(), ()> {
-        if (depth as usize) != self.history.len() {
-            return Err(());
-        }
-
-        todo!()
-    }
-
-    pub fn to_vault_amount(&self, amount: Amount) -> (VaultAmount, Amount) {
-        self.parameters.scale.convert_amount(amount)
+        Ok(shape_psbt)
     }
 }
 
@@ -1441,10 +1526,16 @@ mod test {
 
         let templates = test_parameters.templates_at_depth(&secp, 0);
 
+        assert_eq!(templates.len(), 10);
+
         for (params, template) in templates.into_iter() {
             assert_eq!(template.input.len(), 1);
             assert_eq!(params.previous_value, VaultAmount(0));
         }
+
+        let templates = test_parameters.templates_at_depth(&secp, 1);
+
+        let template_keys: Vec<VaultStateParameters> = templates.into_keys().collect();
     }
 
     /*

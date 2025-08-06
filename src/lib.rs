@@ -10,6 +10,7 @@ pub use vault::{
     VaultParameters,
     VaultScale,
     Vault,
+    VaultDepositor,
 };
 
 #[cfg(test)]
