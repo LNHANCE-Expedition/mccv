@@ -242,6 +242,9 @@ fn test_deposit() {
     let shape_transaction = shape_psbt.extract_tx()
         .expect("tx complete");
 
+    eprintln!("tx {} = {shape_transaction:?}", shape_transaction.compute_txid());
+    eprintln!("tx {} = {:?}", deposit_transaction.as_transaction().compute_txid(), deposit_transaction.as_transaction());
+
     let args: Vec<serde_json::Value> = vec![
         mccv::vault::package_encodable(
             vec![
@@ -252,6 +255,7 @@ fn test_deposit() {
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
+    eprintln!("{result}");
     assert_eq!(result.get("package_msg"), Some(&"success".into()));
 
     vault.add_deposit_transaction(&deposit_transaction)

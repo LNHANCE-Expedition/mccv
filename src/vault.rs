@@ -189,9 +189,8 @@ impl VaultAmount {
         self.0 > 0
     }
 
-    fn iter_from(&self, start: VaultAmount) -> impl ParallelIterator<Item=VaultAmount> {
+    fn iter_from(&self, start: VaultAmount) -> impl Iterator<Item=VaultAmount> {
         (start.0..=self.0)
-            .into_par_iter()
             .map(|amount| VaultAmount(amount))
     }
 }
@@ -822,7 +821,8 @@ impl VaultParameters {
                             match parent_transition {
                                 // greater-than because we assume the "equal" case is covered by
                                 // no_grandparents since that would be the initial deposit
-                                VaultTransition::Deposit(deposit_amount) if parameters.previous_value > deposit_amount => {
+                                // FIXME: what?
+                                VaultTransition::Deposit(deposit_amount) if parameters.previous_value >= deposit_amount => {
                                     let mut parameters = parameters.clone();
                                     parameters.parent_transition = Some(parent_transition);
                                     Some(parameters)
@@ -1325,6 +1325,14 @@ impl Vault {
             _ => unreachable!("should never have more than 2 inputs or less than 1"),
         }
 
+        match deposit_template.input.len() {
+            1 => { }
+            2 => {
+                todo!()
+            }
+            _ => unreachable!("should never have more than 2 inputs or less than 1"),
+        }
+
         let current_vault_amount = self.history.last()
             .map(|(tx, _)| tx.result_value)
             .unwrap_or(VaultAmount::ZERO);
@@ -1533,51 +1541,24 @@ mod test {
             assert_eq!(params.previous_value, VaultAmount(0));
         }
 
-        let templates = test_parameters.templates_at_depth(&secp, 1);
+        let next_templates = test_parameters.templates_at_depth(&secp, 1);
 
-        let template_keys: Vec<VaultStateParameters> = templates.into_keys().collect();
+        todo!("check next_templates for every template and transition");
+
+        for (params, template) in templates.into_iter() {
+            /*
+            for withdrawal_amount in test_parameters.max_withdrawal_per_step.iter_from(VaultAmount::ZERO) {
+                let next_params = VaultStateParameters {
+                    transition: ,
+                    previous_value: todo!(),
+                    parent_transition: todo!(),
+                };
+            }
+
+            for deposit_amount in test_parameters.max_withdrawal_per_step.iter_from(VaultAmount::ZERO) {
+
+            }
+            */
+        }
     }
-
-    /*
-    #[test]
-    fn test_deposit() {
-        let secp = Secp256k1::new();
-
-        let (node, client) = test_util::get_test_node();
-        let test_parameters = test_parameters(&secp);
-
-        let (xpriv, mut wallet) = test_util::get_test_wallet();
-
-        test_util::generate_to_wallet(&mut wallet, &client, 100);
-
-        let balance = wallet.balance();
-
-        assert_eq!(balance.confirmed.to_sat(), 50 * 100_000_000);
-
-        let sqlite = rusqlite::Connection::open_in_memory()
-            .expect("open memory wallet should succeed");
-        let mut storage = SqliteVaultStorage::from_connection(sqlite)
-            .expect("initialize vault storage");
-        let vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
-            .expect("create vault");
-
-        let (deposit_amount, remainder) = vault.to_vault_amount(Amount::from_sat(100_000_000));
-        assert_eq!(remainder, Amount::ZERO);
-
-        let mut deposit_transactions = vault.create_deposit(&secp, &mut wallet, deposit_amount, FeeRate::BROADCAST_MIN).unwrap();
-
-        let sign_success = wallet.sign(&mut deposit_transactions.shape_transaction, SignOptions::default())
-            .expect("sign success");
-        assert!(sign_success);
-
-        let shape_transaction = deposit_transactions.shape_transaction.extract_tx()
-            .expect("tx complete");
-
-        assert!(shape_transaction.input.len() >= 1);
-        assert!(shape_transaction.output.len() >= 1);
-
-        assert_eq!(deposit_transactions.deposit_transaction.input.len(), 1);
-        assert_eq!(deposit_transactions.deposit_transaction.output.len(), 1);
-    }
-    */
 }
