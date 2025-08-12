@@ -5,11 +5,12 @@ use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, MiniscriptKey, D
 use bdk_wallet::miniscript::plan::{AssetProvider, Plan, Assets, TaprootCanSign, TaprootAvailableLeaves, CanSign};
 use bdk_wallet::{Wallet, KeychainKind};
 use bitcoin::psbt::ExtractTxError;
-use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch};
+use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch, TaprootSpendInfo};
 use bitcoin::{BlockHash, FeeRate, psbt, Weight, TapTweakHash};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::{
     Hash,
+    sha256,
 };
 
 use bitcoin::blockdata::constants::genesis_block;
@@ -96,7 +97,7 @@ use serde::{
 
 use std::iter;
 
-use std::collections::{HashMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::migrate::{
@@ -193,6 +194,30 @@ impl VaultAmount {
         (start.0..=self.0)
             .map(|amount| VaultAmount(amount))
     }
+
+    pub fn apply_transition(&self, transition: VaultTransition, max: Option<VaultAmount>) -> Option<VaultAmount> {
+        match transition {
+            VaultTransition::Deposit(deposit_amount) => {
+                let result = *self + deposit_amount;
+                if let Some(max) = max {
+                    if result > max {
+                        None
+                    } else {
+                        Some(result)
+                    }
+                } else {
+                    Some(result)
+                }
+            }
+            VaultTransition::Withdrawal(withdrawal_amount) => {
+                if withdrawal_amount > *self {
+                    None
+                } else {
+                    Some(*self - withdrawal_amount)
+                }
+            }
+        }
+    }
 }
 
 impl PartialEq<u32> for VaultAmount {
@@ -263,14 +288,10 @@ pub enum VaultTransition {
 }
 
 impl VaultTransition {
-    fn next_value(&self, initial_value: VaultAmount) -> VaultAmount {
+    fn invert(&self) -> VaultTransition {
         match self {
-            VaultTransition::Deposit(ref value) => {
-                initial_value + *value
-            }
-            VaultTransition::Withdrawal(ref value) => {
-                initial_value - *value
-            }
+            VaultTransition::Deposit(amount) => VaultTransition::Withdrawal(*amount),
+            VaultTransition::Withdrawal(amount) => VaultTransition::Deposit(*amount),
         }
     }
 }
@@ -284,6 +305,14 @@ pub struct VaultStateParameters {
 }
 
 impl VaultStateParameters {
+    // XXX: Assumes we never construct an invalid parameter set! Must enforce this!
+    fn get_result_value(&self) -> VaultAmount {
+        match self.transition {
+            VaultTransition::Deposit(deposit_amount) => self.previous_value + deposit_amount,
+            VaultTransition::Withdrawal(withdrawal_amount) => self.previous_value - withdrawal_amount,
+        }
+    }
+
     fn get_result(&self) -> Option<(VaultAmount, VaultAmount)> {
         match self.transition {
             VaultTransition::Deposit(value) => Some((self.previous_value + value, VaultAmount(0))),
@@ -604,10 +633,10 @@ impl VaultParameters {
         }
     }
 
-    fn vault_scripts<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: &HashMap<VaultStateParameters, Transaction>) -> Vec<(u32, ScriptBuf)> {
+    fn vault_output_spend_conditions<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: &HashMap<VaultStateParameters, Transaction>) -> Vec<(VaultOutputSpendCondition, SignedNextStateTemplate)> {
         let mut counter = 0;
         if let Some((value, withdrawal_amount)) = parameter.get_result() {
-            let mut vault_scripts: Vec<(u32, ScriptBuf)> =
+            let mut transitions: Vec<_> =
             self.state_transitions_single(value, depth + 1)
                 .filter_map(|params| {
                     if params.parent_transition != Some(parameter.transition) {
@@ -615,29 +644,27 @@ impl VaultParameters {
                     }
 
                     if let Some(next_state) = next_states.get(&params) {
-                        let weight = match params.transition {
-                            VaultTransition::Withdrawal(ref amount) => {
-                                self.max_withdrawal_per_step - *amount
-                            }
-                            VaultTransition::Deposit(ref amount) => {
-                                self.max_deposit_per_step - *amount
-                            }
-                        } + VaultAmount(1);
-
                         // Vault UTXO will always be input 0
-                        let next_state_template = get_default_template(&next_state, 0);
+                        let next_state_template_hash = get_default_template(&next_state, 0);
 
-                        // uh checksequence? I guess we already enforce sequence by CTV
-                        let transition_script = builder_with_capacity(33 + 1 + 1 + 33 + 1)
-                            .push_slice(next_state_template.to_byte_array())
-                            .push_opcode(OP_CHECKTEMPLATEVERIFY)
-                            .push_opcode(OP_DROP)
-                            .push_x_only_key(&self.withdrawal_key(secp, depth))
-                            .push_opcode(OP_CHECKSIG);
+                        let transition_script_template = SignedNextStateTemplate {
+                            pubkey: self.withdrawal_key(secp, depth),
+                            next_state_template_hash,
+                        };
 
-                        Some((weight.to_unscaled_amount(), transition_script.into_script()))
+                        Some(
+                            (
+                                match params.transition {
+                                    VaultTransition::Withdrawal(amount) =>
+                                        VaultOutputSpendCondition::Withdrawal(amount),
+                                    VaultTransition::Deposit(amount) =>
+                                        VaultOutputSpendCondition::Deposit(amount),
+                                },
+                                transition_script_template,
+                            )
+                        )
                     } else {
-                        //eprintln!("Depth {depth} (Value: {value:?}): No next state for {:?} at depth", params);
+                        eprintln!("Depth {depth} (Value: {value:?}): No next state for {:?} at depth", params);
                         counter += 1;
                         None
                     }
@@ -656,41 +683,85 @@ impl VaultParameters {
             // it's own thing, does it belong to this depth?)
             let recovery_tx = self.recovery_template(secp, depth + 1, value, withdrawal_amount);
             // This (the vault) output will always be the first input to the recovery tx
-            let recovery_script = self.recovery_script(&secp, depth, &recovery_tx, 0);
+            let recovery_key = self.recovery_key(secp, depth);
 
-            // FIXME: recovery weight
-            vault_scripts.push((1, recovery_script));
+            transitions.push(
+                (
+                    VaultOutputSpendCondition::Recovery {
+                        vault_balance: value,
+                        withdrawal_amount,
+                    },
+                    SignedNextStateTemplate {
+                        pubkey: recovery_key,
+                        next_state_template_hash: get_default_template(&recovery_tx, 0),
+                    },
+                )
+            );
 
             // Spending path for vault-output-only recovery
-            // Only create if there is actually value left in the vault after the withdrawal
+            // Only create if there is actually value left in the vault after the withdrawal, and
+            // if this is a withdrawal (otherwise this template is redundant)
             if value.nonzero() && withdrawal_amount.nonzero() {
-                // TODO: individual recovery for this tx without the withdrawal
-
                 let recovery_tx = self.recovery_template(secp, depth + 1, value, VaultAmount::ZERO);
 
-                let recovery_script = self.recovery_script(secp, depth, &recovery_tx, 0);
-                // FIXME: recovery weight
-                vault_scripts.push((1, recovery_script));
+                transitions.push(
+                    (
+                        VaultOutputSpendCondition::Recovery {
+                            vault_balance: value,
+                            withdrawal_amount: VaultAmount::ZERO,
+                        },
+                        SignedNextStateTemplate {
+                            pubkey: recovery_key,
+                            next_state_template_hash: get_default_template(&recovery_tx, 0),
+                        },
+                    )
+                );
             }
 
             // TODO: pull this code into its own function
             // TODO: add complete drain script, eh, maybe not, cold keys can always do that if it's really
             // desirable, that seems like a case where requiring cold keys makes sense
 
-            vault_scripts
+            transitions
         } else {
             Vec::new()
         }
     }
 
+    // FIXME: should have a starting amount to calculate this
+    fn spend_condition_weight(&self, condition: &VaultOutputSpendCondition) -> u32 {
+        (match condition {
+            VaultOutputSpendCondition::Deposit(amount) => amount.to_unscaled_amount(),
+            VaultOutputSpendCondition::Withdrawal(amount) => amount.to_unscaled_amount(),
+            VaultOutputSpendCondition::Recovery {..} => 0,
+        }) + 1
+    }
+
+    fn spend_conditions_into_spend_info<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, conditions: &Vec<(VaultOutputSpendCondition, SignedNextStateTemplate)>) -> VaultOutputSpendInfo {
+        let master_key = self.master_key(secp, depth);
+
+        let spend_info = TaprootBuilder::with_huffman_tree(
+                conditions.iter().map(|(condition, script)| (self.spend_condition_weight(&condition), script.to_scriptbuf()))
+            )
+            .expect("taproot tree builder")
+            .finalize(secp, master_key)
+            .expect("taproot tree finalize");
+
+        VaultOutputSpendInfo {
+            spend_info,
+            branches: conditions.into_iter().cloned().collect(),
+        }
+    }
+
     fn vault_output<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: Option<&HashMap<VaultStateParameters, Transaction>>) -> Option<TxOut> {
         if let Some(next_value) = parameter.result_state_value() {
-            let master_key = self.master_key(secp, depth);
-
             if let Some(next_states) = next_states {
-                let vault_scripts = self.vault_scripts(secp, depth, parameter, next_states);
+                let spend_conditions = self.vault_output_spend_conditions(secp, depth, parameter, next_states);
 
-                let spend_info = TaprootBuilder::with_huffman_tree(vault_scripts)
+                let master_key = self.master_key(secp, depth);
+                let spend_info = TaprootBuilder::with_huffman_tree(
+                        spend_conditions.iter().map(|(condition, script)| (self.spend_condition_weight(&condition), script.to_scriptbuf()))
+                    )
                     .expect("taproot tree builder")
                     .finalize(secp, master_key)
                     .expect("taproot tree finalize");
@@ -703,6 +774,8 @@ impl VaultParameters {
                 )
             // Final state, only spendable by master
             } else {
+                let master_key = self.master_key(secp, depth);
+
                 // TODO: CSFS delegated recursion
                 let script_pubkey = ScriptBuf::new_p2tr(secp, master_key, None);
 
@@ -788,52 +861,100 @@ impl VaultParameters {
         withdrawals.chain(deposits)
     }
 
+    fn iter_parent_transitions(&self, depth: Depth) -> impl Iterator<Item=Option<VaultTransition>> {
+        if depth > 1 {
+            let withdrawals = self.iter_withdrawal_amounts(depth)
+                .map(|withdrawal| Some(VaultTransition::Withdrawal(withdrawal)));
+
+            let deposits = self.iter_deposit_amounts(depth)
+                .map(|deposit| Some(VaultTransition::Deposit(deposit)));
+
+            Either::A(withdrawals.chain(deposits))
+        } else {
+            Either::B(
+                if depth == 1 {
+                    Either::A(
+                        self.iter_deposit_amounts(depth)
+                            .map(|deposit| Some(VaultTransition::Deposit(deposit)))
+                    )
+                } else {
+                    Either::B(std::iter::once(None))
+                }
+            )
+        }
+    }
+
+    #[inline]
+    fn validate_parameters(&self, parameters: VaultStateParameters, depth: Depth) -> Option<VaultStateParameters> {
+        if depth > 0 && parameters.previous_value == VaultAmount::ZERO {
+            return None;
+        }
+
+        // TODO: also validate parent params
+        match parameters.transition {
+            VaultTransition::Deposit(deposit_amount) => {
+                if deposit_amount + parameters.previous_value <= self.max {
+                    Some(parameters)
+                } else {
+                    None
+                }
+            }
+            VaultTransition::Withdrawal(withdrawal_amount) => {
+                if parameters.previous_value >= withdrawal_amount {
+                    Some(parameters)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn history_to_parameters(&self, tx: &VaultTransaction, parent_tx: Option<&VaultTransaction>, depth: Depth) -> Option<VaultStateParameters> {
+        let previous_value = tx.result_value.apply_transition(
+            tx.transition.invert(),
+            Some(self.max),
+        );
+
+        if let Some(previous_value) = previous_value {
+            self.validate_parameters(
+                VaultStateParameters {
+                    transition: tx.transition,
+                    previous_value,
+                    parent_transition: parent_tx.map(|tx| tx.transition),
+                },
+                depth,
+            )
+        } else {
+            None
+        }
+    }
+
     fn state_transitions_single(&self, previous_value: VaultAmount, depth: Depth) -> impl Iterator<Item=VaultStateParameters> + '_ {
         self.iter_transitions(depth)
             .filter_map(move |transition| {
-                match transition {
-                    VaultTransition::Deposit(deposit_amount) if (previous_value + deposit_amount) <= self.max => Some(
-                        VaultStateParameters {
-                            transition,
-                            previous_value,
-                            parent_transition: None,
-                        }
-                    ),
-                    VaultTransition::Withdrawal(withdrawal_amount) if withdrawal_amount <= previous_value => Some(
-                        VaultStateParameters {
-                            transition,
-                            previous_value,
-                            parent_transition: None,
-                        }
-                    ),
-                    _ => None,
-                }
+                self.validate_parameters(
+                    VaultStateParameters {
+                        transition,
+                        previous_value,
+                        parent_transition: None,
+                    },
+                    depth,
+                )
             })
             .flat_map(move |parameters| {
-                self.iter_transitions(depth)
+                self.iter_parent_transitions(depth)
                     .filter_map(move |parent_transition|
                         if depth == 0 {
                             Some(parameters.clone())
                         } else {
-                            // Note this is "backwards" from other tests because we want to make
-                            // sure the ancestor state is valid, which means inverting the
-                            // operation and making sure the previous value is valid
-                            match parent_transition {
-                                // greater-than because we assume the "equal" case is covered by
-                                // no_grandparents since that would be the initial deposit
-                                // FIXME: what?
-                                VaultTransition::Deposit(deposit_amount) if parameters.previous_value >= deposit_amount => {
-                                    let mut parameters = parameters.clone();
-                                    parameters.parent_transition = Some(parent_transition);
-                                    Some(parameters)
-                                }
-                                VaultTransition::Withdrawal(withdrawal_amount) if (parameters.previous_value + withdrawal_amount) <= self.max => {
-                                    let mut parameters = parameters.clone();
-                                    parameters.parent_transition = Some(parent_transition);
-                                    Some(parameters)
-                                }
-                                _ => None,
-                            }
+                            self.validate_parameters(
+                                VaultStateParameters {
+                                    transition: parameters.transition,
+                                    previous_value, // FIXME: is that right?..
+                                    parent_transition: parent_transition,
+                                },
+                                depth
+                            )
                         }
                     )
             })
@@ -841,7 +962,7 @@ impl VaultParameters {
 
     fn state_transitions(&self, depth: Depth) -> impl ParallelIterator<Item=VaultStateParameters> + '_ {
         let range = if depth == 0 {
-            0..=0
+            1..=0
         } else {
             1..=self.max.0
         };
@@ -941,6 +1062,24 @@ impl VaultTransaction {
             .map(|vout| OutPoint {
                 txid: self.txid,
                 vout,
+            })
+    }
+
+    pub fn into_parameters(&self,
+        parent_transition: Option<VaultTransition>, 
+        max: Option<VaultAmount>
+    ) -> Option<VaultStateParameters> {
+        self.result_value
+            .apply_transition(
+                self.transition.invert(),
+                max,
+            )
+            .map(|previous_value| {
+                VaultStateParameters {
+                    transition: self.transition,
+                    previous_value,
+                    parent_transition,
+                }
             })
     }
 }
@@ -1059,6 +1198,50 @@ impl std::fmt::Debug for DepositTransactions {
     }
 }
 
+#[derive(Clone,Hash,Eq,PartialEq)]
+struct SignedNextStateTemplate {
+    pubkey: XOnlyPublicKey,
+    next_state_template_hash: sha256::Hash,
+}
+
+impl SignedNextStateTemplate {
+    fn to_scriptbuf(&self) -> ScriptBuf {
+        // We enforce sequence indirectly via CTV
+        builder_with_capacity(33 + 1 + 1 + 33 + 1)
+            .push_slice(self.next_state_template_hash.to_byte_array())
+            .push_opcode(OP_CHECKTEMPLATEVERIFY)
+            .push_opcode(OP_DROP)
+            .push_x_only_key(&self.pubkey)
+            .push_opcode(OP_CHECKSIG)
+            .into_script()
+    }
+
+    fn into_scriptbuf(self) -> ScriptBuf {
+        self.to_scriptbuf()
+    }
+}
+
+impl PartialEq<Script> for SignedNextStateTemplate {
+    fn eq(&self, other: &Script) -> bool {
+        self.to_scriptbuf().as_script() == other
+    }
+}
+
+#[derive(Clone,Hash,Eq,PartialEq)]
+enum VaultOutputSpendCondition {
+    Deposit(VaultAmount),
+    Withdrawal(VaultAmount),
+    Recovery {
+        vault_balance: VaultAmount,
+        withdrawal_amount: VaultAmount,
+    },
+}
+
+pub struct VaultOutputSpendInfo {
+    spend_info: TaprootSpendInfo,
+    branches: HashMap<VaultOutputSpendCondition, SignedNextStateTemplate>,
+}
+
 pub struct DepositTransaction{
     depth: Depth,
     amount: Amount,
@@ -1167,7 +1350,7 @@ impl Vault {
     }
 
     // FIXME: and parent utxo scripts
-    pub fn deposit_transaction_template<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Option<Transaction> {
+    pub fn deposit_transaction_template<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Option<(Option<VaultOutputSpendInfo>, Transaction)> {
         let depth = self.history.len() as Depth;
 
         let (parameters, outpoint) = match self.history.last() {
@@ -1215,7 +1398,60 @@ impl Vault {
             }
         });
 
-        Some(deposit)
+        let second_to_last_history_tx = if self.history.len() >= 2 {
+            Some(&self.history[self.history.len() - 2].0)
+        } else {
+            None
+        };
+
+        let parent_parameters = match (self.history.last(), second_to_last_history_tx) {
+            (Some((parent_tx, _confirmations)), Some(grandparent_tx)) => {
+                debug_assert!(
+                    grandparent_tx.result_value == parent_tx
+                        .result_value
+                        .apply_transition(
+                            parent_tx.transition.invert(),
+                            Some(self.parameters.max),
+                        ).unwrap()
+                );
+
+                let parent_parameters = parent_tx.into_parameters(
+                    Some(grandparent_tx.transition),
+                    Some(self.parameters.max)
+                );
+                debug_assert!(parent_parameters.is_some());
+                parent_parameters
+            }
+            (Some((parent_tx, _confirmations)), None) => {
+                let parent_parameters = parent_tx.into_parameters(
+                    None,
+                    Some(self.parameters.max)
+                );
+                debug_assert!(parent_parameters.is_some());
+                parent_parameters
+            }
+            (None, None) => None,
+            (None, Some(_)) => unreachable!("can't have a grandparent without a parent"),
+        };
+
+        let spend_info = parent_parameters
+            .map(|parent_parameters| {
+                debug_assert!(depth > 0, "Depth 0 has no ancestors");
+
+                let templates = self.parameters.templates_at_depth(secp, depth);
+
+                let spend_conditions = self.parameters.vault_output_spend_conditions(secp, depth, &parent_parameters, &templates);
+
+
+                self.parameters.spend_conditions_into_spend_info(
+                    secp,
+                    depth - 1,
+                    &spend_conditions,
+                )
+            });
+
+        // Need to generate taproot spend info
+        Some((spend_info, deposit))
     }
 
     pub fn deposit_transaction_script(&self, tx: &Transaction) -> ScriptBuf  {
@@ -1274,14 +1510,11 @@ impl Vault {
     }
 
     // FIXME: I think this should be refactored into a stateless version on VaultParameters
-    // Possibly also remove the dependency on wallet, instead return the deposit transaction and
-    // any extra context that might be necessary (like output amount, tap tree if the deposit
-    // ends up getting more than one output, caller can try to build the right shape tx instead
-    // of this function)
     //  FIXME: return value should probably also have some kind of token for keeping track of
     //  replacements, preventing invalid deposit transactions from being tracked
     pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Result<DepositTransaction, VaultDepositError> {
-        let mut deposit_template = self.deposit_transaction_template(secp, deposit_amount)
+        // FIXME: is that the right depth?
+        let (spend_info, mut deposit_template) = self.deposit_transaction_template(secp, deposit_amount)
             .ok_or(VaultDepositError::VaultClosed)?;
 
         // FIXME: index
@@ -1328,6 +1561,18 @@ impl Vault {
         match deposit_template.input.len() {
             1 => { }
             2 => {
+                let (history_tx, _) = self.history.last()
+                    .expect("deposit template will only have two inputs if depth > 0");
+
+                let second_to_last_history_tx = if self.history.len() >= 2 {
+                    Some(&self.history[self.history.len() - 2].0)
+                } else {
+                    None
+                };
+
+                let parent_parameters = self.parameters.history_to_parameters(history_tx, second_to_last_history_tx, self.get_current_depth());
+
+                //let parent_parameters = history_tx.transition
                 todo!()
             }
             _ => unreachable!("should never have more than 2 inputs or less than 1"),
@@ -1472,6 +1717,26 @@ impl VaultDepositor for Wallet {
     }
 }
 
+enum Either<A, B> {
+    A(A),
+    B(B),
+}
+
+impl<T, A, B> Iterator for Either<A, B>
+where
+    A: Iterator<Item = T>,
+    B: Iterator<Item = T>,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Either::A(a) => a.next(),
+            Either::B(b) => b.next(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1528,22 +1793,116 @@ mod test {
     }
 
     #[test]
+    fn test_vault_amount() {
+        assert_eq!(
+            VaultAmount(3)
+                .apply_transition(
+                    VaultTransition::Deposit(VaultAmount(39)),
+                    None,
+                ),
+            Some(VaultAmount(42)),
+        );
+
+        assert_eq!(
+            VaultAmount(3)
+                .apply_transition(
+                    VaultTransition::Deposit(VaultAmount(39)),
+                    Some(VaultAmount(41)),
+                ),
+            None,
+        );
+
+        assert_eq!(
+            VaultAmount(3)
+                .apply_transition(
+                    VaultTransition::Deposit(VaultAmount(39)),
+                    Some(VaultAmount(42)),
+                ),
+            Some(VaultAmount(42)),
+        );
+
+        assert_eq!(
+            VaultAmount(3)
+                .apply_transition(
+                    VaultTransition::Withdrawal(VaultAmount(1)),
+                    Some(VaultAmount(42)),
+                ),
+            Some(VaultAmount(2)),
+        );
+
+        assert_eq!(
+            VaultAmount(3)
+                .apply_transition(
+                    VaultTransition::Withdrawal(VaultAmount(1)),
+                    None,
+                ),
+            Some(VaultAmount(2)),
+        );
+
+        assert_eq!(
+            VaultAmount(3)
+                .apply_transition(
+                    VaultTransition::Withdrawal(VaultAmount(3)),
+                    None,
+                ),
+            Some(VaultAmount(0)),
+        );
+
+        assert_eq!(
+            VaultAmount(3)
+                .apply_transition(
+                    VaultTransition::Withdrawal(VaultAmount(4)),
+                    None,
+                ),
+            None,
+        );
+    }
+
+    #[test]
     fn test_simple() {
         let secp = Secp256k1::new();
         let test_parameters = test_parameters(&secp);
 
         let templates = test_parameters.templates_at_depth(&secp, 0);
 
+        // FIXME: wtf?
         assert_eq!(templates.len(), 10);
 
-        for (params, template) in templates.into_iter() {
+        for (params, template) in &templates {
             assert_eq!(template.input.len(), 1);
             assert_eq!(params.previous_value, VaultAmount(0));
         }
 
         let next_templates = test_parameters.templates_at_depth(&secp, 1);
 
-        todo!("check next_templates for every template and transition");
+        for (params, _template) in &templates {
+            for amount in 1..test_parameters.max_withdrawal_per_step.to_unscaled_amount() {
+                if let Some(next) = params.next(VaultTransition::Withdrawal(VaultAmount(amount)), test_parameters.max) {
+                    eprintln!("foo");
+                    // previous_value can only be zero for depth = 0
+                    if next.previous_value == VaultAmount::ZERO {
+                        continue;
+                    }
+
+                    dbg!(next_templates.keys().filter(|params| params.previous_value == next.previous_value).collect::<Vec<_>>());
+
+                    let next = next_templates.get(&dbg!(next));
+                    assert!(next.is_some());
+                }
+            }
+
+            for amount in 1..test_parameters.max_deposit_per_step.to_unscaled_amount() {
+                if let Some(next) = params.next(VaultTransition::Deposit(VaultAmount(amount)), test_parameters.max) {
+                    // previous_value can only be zero for depth = 0
+                    if next.previous_value == VaultAmount::ZERO {
+                        continue;
+                    }
+
+                    let next = next_templates.get(&dbg!(next));
+                    assert!(next.is_some());
+                }
+            }
+        }
 
         for (params, template) in templates.into_iter() {
             /*
@@ -1560,5 +1919,7 @@ mod test {
             }
             */
         }
+
+        todo!("more tests")
     }
 }
