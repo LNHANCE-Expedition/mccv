@@ -868,28 +868,6 @@ impl VaultParameters {
         RelativeLockTime::from_height(lock_time)
     }
 
-    fn iter_withdrawal_amounts(&self, depth: Depth) -> impl Iterator<Item=VaultAmount> {
-        if depth == 0 {
-            1..=0 // XXX: dirty, but will be empty
-        } else {
-            1..=self.max_withdrawal_per_step.0
-        }
-        .into_iter()
-        .map(|withdrawal_amount| VaultAmount(withdrawal_amount))
-    }
-
-    fn iter_deposit_amounts(&self, depth: Depth) -> impl Iterator<Item=VaultAmount> {
-        let range = if depth == 0 {
-            1..=self.max.0
-        } else {
-            1..=self.max_deposit_per_step.0
-        };
-
-        range
-            .into_iter()
-            .map(|deposit_amount| VaultAmount(deposit_amount))
-    }
-
     /// Iter transitions depth >= 1
     fn iter_tail_transitions(&self) -> impl Iterator<Item=VaultTransition> {
         let withdrawals = (1..=self.max_withdrawal_per_step.0).rev()
@@ -899,29 +877,6 @@ impl VaultParameters {
             .map(|deposit| VaultTransition::Deposit(VaultAmount(deposit)));
 
         withdrawals.chain(deposits)
-    }
-
-    fn iter_parent_transitions(&self, depth: Depth) -> impl Iterator<Item=Option<VaultTransition>> {
-        if depth > 1 {
-            let withdrawals = self.iter_withdrawal_amounts(depth)
-                .map(|withdrawal| Some(VaultTransition::Withdrawal(withdrawal)));
-
-            let deposits = self.iter_deposit_amounts(depth)
-                .map(|deposit| Some(VaultTransition::Deposit(deposit)));
-
-            Either::A(withdrawals.chain(deposits))
-        } else {
-            Either::B(
-                if depth == 1 {
-                    Either::A(
-                        self.iter_deposit_amounts(depth)
-                            .map(|deposit| Some(VaultTransition::Deposit(deposit)))
-                    )
-                } else {
-                    Either::B(std::iter::once(None))
-                }
-            )
-        }
     }
 
     #[inline]
@@ -958,20 +913,18 @@ impl VaultParameters {
 
         match parameters.transition {
             VaultTransition::Deposit(deposit_amount) => {
-                if deposit_amount + parameters.previous_value <= self.max {
-                    Some(parameters)
-                } else {
-                    None
+                if (deposit_amount + parameters.previous_value) > self.max {
+                    return None;
                 }
             }
             VaultTransition::Withdrawal(withdrawal_amount) => {
-                if parameters.previous_value >= withdrawal_amount {
-                    Some(parameters)
-                } else {
-                    None
+                if parameters.previous_value < withdrawal_amount {
+                    return None;
                 }
             }
         }
+
+        Some(parameters)
     }
 
     fn history_to_parameters(&self, tx: &VaultTransaction, parent_tx: Option<&VaultTransaction>, depth: Depth) -> Option<VaultStateParameters> {
@@ -994,78 +947,57 @@ impl VaultParameters {
         }
     }
 
-    fn state_transitions_single(&self, previous_value: VaultAmount, depth: Depth) -> impl Iterator<Item=VaultStateParameters> + '_ {
-        self.iter_transitions(depth)
-            .filter_map(move |transition| {
-                self.validate_parameters(
-                    VaultStateParameters {
-                        transition,
-                        previous_value,
-                        parent_transition: None,
-                    },
-                    depth,
-                )
-            })
-            .flat_map(move |parameters| {
-                self.iter_parent_transitions(depth)
-                    .filter_map(move |parent_transition|
-                        if depth == 0 {
-                            Some(parameters.clone())
-                        } else {
-                            self.validate_parameters(
-                                VaultStateParameters {
-                                    transition: parameters.transition,
-                                    previous_value, // FIXME: is that right?..
-                                    parent_transition: parent_transition,
-                                },
-                                depth
-                            )
-                        }
-                    )
-            })
+    // FIXME: don't like that we generate *more* transitions than we need then filter, but oh
+    // well... for now
+    fn state_transitions_single(&self, previous_value: VaultAmount, depth: Depth) -> impl Iterator<Item=VaultStateParameters> {
+        self.state_transitions(depth)
+            .into_iter()
+            .filter(move |parameters| parameters.previous_value == previous_value)
     }
 
-    fn state_transitions(&self, depth: Depth) -> impl Iterator<Item=VaultStateParameters> + '_ {
+    // FIXME: Would love for this to return an iterator again...
+    // but maybe this plays better with rayon... who knows
+    fn state_transitions(&self, depth: Depth) -> Vec<VaultStateParameters> {
         if depth == 0 {
-            Either::A(
-                (0..self.max.0)
-                    .map(|amount| VaultStateParameters {
-                        parent_transition: None,
-                        previous_value: VaultAmount(0),
-                        transition: VaultTransition::Deposit(
-                            VaultAmount(amount)
-                        ),
-                    })
-            )
-        } else {
-            let previous_values = (1..=self.max.0)
-                .map(|pv| VaultAmount(pv));
-
-            let parent_transitions = if depth == 1 {
-                Either::A(
-                    (0..=self.max.0)
-                        .map(|amount| Some(
-                            VaultTransition::Deposit(
-                                VaultAmount(amount)
+            (1..=self.max.0)
+                .map(|amount| VaultStateParameters {
+                    parent_transition: None,
+                    previous_value: VaultAmount(0),
+                    transition: VaultTransition::Deposit(
+                        VaultAmount(amount)
+                    ),
+                })
+                .collect()
+        } else if depth == 1 {
+            (1..=self.max.0)
+                .flat_map(|amount|
+                    self.iter_tail_transitions()
+                        .filter_map(move |transition|
+                             self.validate_parameters(
+                                VaultStateParameters {
+                                    parent_transition: Some(VaultTransition::Deposit(
+                                        VaultAmount(amount)
+                                    )),
+                                    previous_value: VaultAmount(amount),
+                                    transition,
+                                },
+                                depth,
                             )
-                        ))
+                        )
                 )
-            } else {
-                Either::B(
-                    self
-                        .iter_tail_transitions()
-                        .map(|transition| Some(transition))
-                )
-            };
-
-            let parameters = self.iter_tail_transitions()
+                .collect()
+        } else {
+            // FIXME: I'd love to avoid the collect...
+            // Since I gave up on returning an iterator maybe I can?...
+            // FIXME: might actually have a chance now...
+            self.iter_tail_transitions()
                 .flat_map(|transition| {
-                    parent_transitions
-                        .into_iter()
-                        .flat_map(|parent_transition| {
-                            previous_values
-                                .into_iter()
-                                .filter_map(|previous_value| {
+                    self.iter_tail_transitions()
+                        .map(|transition| Some(transition))
+                        .flat_map(move |parent_transition| {
+                            (1..=self.max.0)
+                                .map(|pv| VaultAmount(pv))
+                                .filter_map(move |previous_value| {
                                     self.validate_parameters(
                                         VaultStateParameters {
                                             transition,
@@ -1077,10 +1009,8 @@ impl VaultParameters {
                                 })
                         })
                 })
-
-            Either::B(parameters)
+                .collect()
         }
-        //.par_bridge()
     }
 
     fn dummy_inputs(&self, depth: Depth, parameter: &VaultStateParameters) -> Vec<TxIn> {
@@ -1100,23 +1030,14 @@ impl VaultParameters {
     }
 
     fn tx_templates<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, next_states: Option<&HashMap<VaultStateParameters, Transaction>>) -> HashMap<VaultStateParameters, Transaction> {
-        if depth == 0 {
-            self.state_transitions_single(VaultAmount(0), depth)
-                .map(|parameter| (
-                        parameter.clone(),
-                        self.tx_template(secp, depth, &parameter, next_states)
-                    )
+        self.state_transitions(depth)
+            .into_par_iter()
+            .map(|parameter| (
+                    parameter.clone(),
+                    self.tx_template(secp, depth, &parameter, next_states)
                 )
-                .collect()
-        } else {
-            self.state_transitions(depth)
-                .map(|parameter| (
-                        parameter.clone(),
-                        self.tx_template(secp, depth, &parameter, next_states)
-                    )
-                )
-                .collect()
-        }
+            )
+            .collect()
     }
 
     // FIXME: Probably should create some sort of cache structure to pass around
@@ -1999,20 +1920,8 @@ mod test {
             history: Vec::new(),
         };
 
-        let mut initial_deposit_amounts: Vec<_> = test_parameters.iter_deposit_amounts(0).collect();
-        initial_deposit_amounts.sort();
-
-        assert_eq!(
-            initial_deposit_amounts, 
-            vec![
-                VaultAmount(1),
-                VaultAmount(2),
-                VaultAmount(3),
-                VaultAmount(4),
-            ],
-        );
-
-        let mut initial_deposits: Vec<_> = test_parameters.iter_transitions(0).collect();
+        let mut initial_deposits = test_parameters.state_transitions(0);
+        initial_deposits.sort();
 
         assert_eq!(
             initial_deposits, 
@@ -2040,24 +1949,92 @@ mod test {
             ],
         );
 
-        let mut deposit_amounts: Vec<_> = test_parameters.iter_deposit_amounts(1).collect();
+        let mut generation = test_parameters.state_transitions(1);
+        generation.sort();
 
         assert_eq!(
-            deposit_amounts.len(), 
-            test_parameters.max_deposit_per_step.to_unscaled_amount() as usize,
-        );
-
-        deposit_amounts.sort();
-        assert_eq!(
-            deposit_amounts,
+            generation, 
             vec![
-                VaultAmount(1),
-                VaultAmount(2),
-                VaultAmount(3),
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: VaultAmount(1),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: VaultAmount(1),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: VaultAmount(1),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(3),
+                    previous_value: VaultAmount(1),
+                    parent_transition: Some(deposit(1)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: VaultAmount(2),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: VaultAmount(2),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: VaultAmount(2),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: VaultAmount(2),
+                    parent_transition: Some(deposit(2)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: VaultAmount(3),
+                    parent_transition: Some(deposit(3)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: VaultAmount(3),
+                    parent_transition: Some(deposit(3)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: VaultAmount(3),
+                    parent_transition: Some(deposit(3)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: VaultAmount(3),
+                    parent_transition: Some(deposit(3)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: VaultAmount(4),
+                    parent_transition: Some(deposit(4)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: VaultAmount(4),
+                    parent_transition: Some(deposit(4)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: VaultAmount(4),
+                    parent_transition: Some(deposit(4)),
+                },
             ],
         );
-
-        
     }
 
     #[test]
