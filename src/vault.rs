@@ -1061,69 +1061,26 @@ impl VaultParameters {
             let parameters = self.iter_tail_transitions()
                 .flat_map(|transition| {
                     parent_transitions
-                })
-        }
-        let previous_values = if depth == 0 {
-            0..=0
-        } else {
-            1..=self.max.0
-        }
-        .map(|value| VaultAmount(value));
-
-        let previous_transitions = if depth == 0 {
-            Either::A(previous_values.map(|pv| (pv, None)))
-        } else if depth == 1 {
-            Either::B(
-                Either::A(
-                    previous_values.map(|pv| (
-                            pv,
-                            VaultTransition::Deposit(pv),
-                        )
-                    )
-                ),
-            )
-        } else {
-            Either::B(
-                Either::B(
-                    // FIXME: eugh
-                    self.iter_tail_transitions()
-                        .flat_map(|transition| 
+                        .into_iter()
+                        .flat_map(|parent_transition| {
                             previous_values
-                                .filter_map(|pv| {
-                                    match transition {
-                                        VaultTransition::Deposit(amount) => {
-                                            if amount > pv {
-                                                None
-                                            } else {
-                                                Some((pv, transition))
-                                            }
-                                        }
-                                        VaultTransition::Withdrawal(amount) => {
-                                            if (amount + pv) > self.max {
-                                                None
-                                            } else {
-                                                Some((pv, transition))
-                                            }
-                                        }
-                                    }
+                                .into_iter()
+                                .filter_map(|previous_value| {
+                                    self.validate_parameters(
+                                        VaultStateParameters {
+                                            transition,
+                                            previous_value,
+                                            parent_transition,
+                                        },
+                                        depth,
+                                    )
                                 })
-                        )
-                ),
-            )
-        };
+                        })
+                })
 
-        previous_transitions 
-            .flat_map(|(previous_value, parent_transition)| {
-                if depth == 0 {
-                    Either::A(
-                } else {
-                    Either::B
-                    self.iter_tail_transitions()
-                }
-            })
-        range
-            .flat_map(move |value| self.state_transitions_single(VaultAmount(value), depth))
-            .par_bridge()
+            Either::B(parameters)
+        }
+        //.par_bridge()
     }
 
     fn dummy_inputs(&self, depth: Depth, parameter: &VaultStateParameters) -> Vec<TxIn> {
