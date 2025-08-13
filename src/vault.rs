@@ -1025,7 +1025,44 @@ impl VaultParameters {
             })
     }
 
-    fn state_transitions(&self, depth: Depth) -> impl ParallelIterator<Item=VaultStateParameters> + '_ {
+    fn state_transitions(&self, depth: Depth) -> impl Iterator<Item=VaultStateParameters> + '_ {
+        if depth == 0 {
+            Either::A(
+                (0..self.max.0)
+                    .map(|amount| VaultStateParameters {
+                        parent_transition: None,
+                        previous_value: VaultAmount(0),
+                        transition: VaultTransition::Deposit(
+                            VaultAmount(amount)
+                        ),
+                    })
+            )
+        } else {
+            let previous_values = (1..=self.max.0)
+                .map(|pv| VaultAmount(pv));
+
+            let parent_transitions = if depth == 1 {
+                Either::A(
+                    (0..=self.max.0)
+                        .map(|amount| Some(
+                            VaultTransition::Deposit(
+                                VaultAmount(amount)
+                            )
+                        ))
+                )
+            } else {
+                Either::B(
+                    self
+                        .iter_tail_transitions()
+                        .map(|transition| Some(transition))
+                )
+            };
+
+            let parameters = self.iter_tail_transitions()
+                .flat_map(|transition| {
+                    parent_transitions
+                })
+        }
         let previous_values = if depth == 0 {
             0..=0
         } else {
@@ -1079,11 +1116,6 @@ impl VaultParameters {
             .flat_map(|(previous_value, parent_transition)| {
                 if depth == 0 {
                     Either::A(
-                        (0..self.max.0)
-                            .map(|amount| VaultTransition::Deposit(
-                                    VaultAmount(amount)
-                                )
-                            )
                 } else {
                     Either::B
                     self.iter_tail_transitions()
