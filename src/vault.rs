@@ -1981,6 +1981,89 @@ mod test {
             vec![
                 VaultStateParameters {
                     transition: withdrawal(1),
+                    previous_value: VaultAmount(1),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: VaultAmount(1),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: VaultAmount(1),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(3),
+                    previous_value: VaultAmount(1),
+                    parent_transition: Some(deposit(1)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: VaultAmount(2),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: VaultAmount(2),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: VaultAmount(2),
+                    parent_transition: Some(deposit(2)),
+
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: VaultAmount(3),
+                    parent_transition: Some(deposit(3)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: VaultAmount(3),
+                    parent_transition: Some(deposit(3)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: VaultAmount(3),
+                    parent_transition: Some(deposit(3)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: VaultAmount(3),
+                    parent_transition: Some(deposit(3)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: VaultAmount(4),
+                    parent_transition: Some(deposit(4)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: VaultAmount(4),
+                    parent_transition: Some(deposit(4)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: VaultAmount(4),
+                    parent_transition: Some(deposit(4)),
+                },
+            ],
+        );
+
+        let mut generation = test_parameters.state_transitions(2);
+        generation.sort();
+
+        assert_eq!(
+            generation, 
+            vec![
+                VaultStateParameters {
+                    transition: withdrawal(1),
                     previous_value: v(1),
                     parent_transition: Some(withdrawal(3)),
                 },
