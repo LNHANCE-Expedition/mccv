@@ -2014,6 +2014,11 @@ mod test {
                     transition: deposit(1),
                     previous_value: VaultAmount(2),
                     parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: VaultAmount(2),
+                    parent_transition: Some(deposit(2)),
 
                 },
 
