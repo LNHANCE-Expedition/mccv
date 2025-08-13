@@ -294,6 +294,25 @@ impl VaultTransition {
             VaultTransition::Withdrawal(amount) => VaultTransition::Deposit(*amount),
         }
     }
+
+    fn to_signed(&self) -> i64 {
+        match self {
+            VaultTransition::Deposit(value) => i64::from(value.0),
+            VaultTransition::Withdrawal(value) => -i64::from(value.0),
+        }
+    }
+}
+
+impl PartialOrd for VaultTransition {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.to_signed().partial_cmp(&other.to_signed())
+    }
+}
+
+impl Ord for VaultTransition {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.to_signed().cmp(&other.to_signed())
+    }
 }
 
 #[derive(Clone,Debug,Eq,Hash,PartialEq)]
@@ -377,6 +396,26 @@ impl VaultStateParameters {
                 assert!(amount <= self.previous_value);
             }
         }
+    }
+}
+
+impl Ord for VaultStateParameters {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.parent_transition,
+            self.previous_value,
+            self.transition,
+        ).cmp(&(
+            other.parent_transition,
+            other.previous_value,
+            other.transition,
+        ))
+    }
+}
+
+impl PartialOrd for VaultStateParameters {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -851,12 +890,13 @@ impl VaultParameters {
             .map(|deposit_amount| VaultAmount(deposit_amount))
     }
 
-    fn iter_transitions(&self, depth: Depth) -> impl Iterator<Item=VaultTransition> {
-        let withdrawals = self.iter_withdrawal_amounts(depth)
-            .map(|withdrawal| VaultTransition::Withdrawal(withdrawal));
+    /// Iter transitions depth >= 1
+    fn iter_tail_transitions(&self) -> impl Iterator<Item=VaultTransition> {
+        let withdrawals = (1..=self.max_withdrawal_per_step.0).rev()
+            .map(|withdrawal| VaultTransition::Withdrawal(VaultAmount(withdrawal)));
 
-        let deposits = self.iter_deposit_amounts(depth)
-            .map(|deposit| VaultTransition::Deposit(deposit));
+        let deposits = (1..=self.max_deposit_per_step.0)
+            .map(|deposit| VaultTransition::Deposit(VaultAmount(deposit)));
 
         withdrawals.chain(deposits)
     }
@@ -890,7 +930,32 @@ impl VaultParameters {
             return None;
         }
 
-        // TODO: also validate parent params
+        match parameters.parent_transition {
+            Some(VaultTransition::Deposit(amount)) => {
+                if depth == 0 {
+                    return None;
+                }
+
+                if amount > parameters.previous_value {
+                    return None;
+                }
+            }
+            Some(VaultTransition::Withdrawal(amount)) => {
+                if depth == 0 {
+                    return None;
+                }
+
+                if (amount + parameters.previous_value) > self.max {
+                    return None
+                }
+            }
+            None => {
+                if depth > 0 {
+                    return None;
+                }
+            }
+        }
+
         match parameters.transition {
             VaultTransition::Deposit(deposit_amount) => {
                 if deposit_amount + parameters.previous_value <= self.max {
@@ -961,12 +1026,69 @@ impl VaultParameters {
     }
 
     fn state_transitions(&self, depth: Depth) -> impl ParallelIterator<Item=VaultStateParameters> + '_ {
-        let range = if depth == 0 {
-            1..=0
+        let previous_values = if depth == 0 {
+            0..=0
         } else {
             1..=self.max.0
+        }
+        .map(|value| VaultAmount(value));
+
+        let previous_transitions = if depth == 0 {
+            Either::A(previous_values.map(|pv| (pv, None)))
+        } else if depth == 1 {
+            Either::B(
+                Either::A(
+                    previous_values.map(|pv| (
+                            pv,
+                            VaultTransition::Deposit(pv),
+                        )
+                    )
+                ),
+            )
+        } else {
+            Either::B(
+                Either::B(
+                    // FIXME: eugh
+                    self.iter_tail_transitions()
+                        .flat_map(|transition| 
+                            previous_values
+                                .filter_map(|pv| {
+                                    match transition {
+                                        VaultTransition::Deposit(amount) => {
+                                            if amount > pv {
+                                                None
+                                            } else {
+                                                Some((pv, transition))
+                                            }
+                                        }
+                                        VaultTransition::Withdrawal(amount) => {
+                                            if (amount + pv) > self.max {
+                                                None
+                                            } else {
+                                                Some((pv, transition))
+                                            }
+                                        }
+                                    }
+                                })
+                        )
+                ),
+            )
         };
 
+        previous_transitions 
+            .flat_map(|(previous_value, parent_transition)| {
+                if depth == 0 {
+                    Either::A(
+                        (0..self.max.0)
+                            .map(|amount| VaultTransition::Deposit(
+                                    VaultAmount(amount)
+                                )
+                            )
+                } else {
+                    Either::B
+                    self.iter_tail_transitions()
+                }
+            })
         range
             .flat_map(move |value| self.state_transitions_single(VaultAmount(value), depth))
             .par_bridge()
@@ -1858,6 +1980,97 @@ mod test {
         );
     }
 
+    fn deposit(amount: u32) -> VaultTransition {
+        VaultTransition::Deposit(VaultAmount(amount))
+    }
+
+    fn withdrawal(amount: u32) -> VaultTransition {
+        VaultTransition::Withdrawal(VaultAmount(amount))
+    }
+
+    #[test]
+    fn test_parameter_generation() {
+        let secp = Secp256k1::new();
+        let (cold_xpriv, hot_xpriv) = test_xprivs(&secp, 0);
+
+        let test_parameters = VaultParameters {
+            scale: VaultScale::from_sat(100_000_000),
+            max: VaultAmount::new(4),
+            cold_xpub: Xpub::from_priv(&secp, &cold_xpriv), //
+            hot_xpub: Xpub::from_priv(&secp, &hot_xpriv),  //
+            delay_per_increment: 36,
+            max_withdrawal_per_step: VaultAmount::new(3),
+            max_deposit_per_step: VaultAmount::new(3),
+            max_depth: 10,
+        };
+
+        let vault = Vault {
+            id: 0,
+            parameters: test_parameters.clone(),
+            history: Vec::new(),
+        };
+
+        let mut initial_deposit_amounts: Vec<_> = test_parameters.iter_deposit_amounts(0).collect();
+        initial_deposit_amounts.sort();
+
+        assert_eq!(
+            initial_deposit_amounts, 
+            vec![
+                VaultAmount(1),
+                VaultAmount(2),
+                VaultAmount(3),
+                VaultAmount(4),
+            ],
+        );
+
+        let mut initial_deposits: Vec<_> = test_parameters.iter_transitions(0).collect();
+
+        assert_eq!(
+            initial_deposits, 
+            vec![
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: VaultAmount(0),
+                    parent_transition: None,
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: VaultAmount(0),
+                    parent_transition: None,
+                },
+                VaultStateParameters {
+                    transition: deposit(3),
+                    previous_value: VaultAmount(0),
+                    parent_transition: None,
+                },
+                VaultStateParameters {
+                    transition: deposit(4),
+                    previous_value: VaultAmount(0),
+                    parent_transition: None,
+                },
+            ],
+        );
+
+        let mut deposit_amounts: Vec<_> = test_parameters.iter_deposit_amounts(1).collect();
+
+        assert_eq!(
+            deposit_amounts.len(), 
+            test_parameters.max_deposit_per_step.to_unscaled_amount() as usize,
+        );
+
+        deposit_amounts.sort();
+        assert_eq!(
+            deposit_amounts,
+            vec![
+                VaultAmount(1),
+                VaultAmount(2),
+                VaultAmount(3),
+            ],
+        );
+
+        
+    }
+
     #[test]
     fn test_simple() {
         let secp = Secp256k1::new();
@@ -1865,7 +2078,6 @@ mod test {
 
         let templates = test_parameters.templates_at_depth(&secp, 0);
 
-        // FIXME: wtf?
         assert_eq!(templates.len(), 10);
 
         for (params, template) in &templates {
@@ -1875,10 +2087,11 @@ mod test {
 
         let next_templates = test_parameters.templates_at_depth(&secp, 1);
 
+        eprintln!("foo");
         for (params, _template) in &templates {
             for amount in 1..test_parameters.max_withdrawal_per_step.to_unscaled_amount() {
                 if let Some(next) = params.next(VaultTransition::Withdrawal(VaultAmount(amount)), test_parameters.max) {
-                    eprintln!("foo");
+                    eprintln!("============================ PARAM ============================");
                     // previous_value can only be zero for depth = 0
                     if next.previous_value == VaultAmount::ZERO {
                         continue;
