@@ -1898,6 +1898,18 @@ mod test {
         VaultTransition::Withdrawal(VaultAmount(amount))
     }
 
+    fn parent_deposit(amount: u32) -> Option<VaultTransition> {
+        Some(deposit(amount))
+    }
+
+    fn parent_withdrawal(amount: u32) -> Option<VaultTransition> {
+        Some(withdrawal(amount))
+    }
+
+    fn v(amount: u32) -> VaultAmount {
+        VaultAmount(amount)
+    }
+
     #[test]
     fn test_parameter_generation() {
         let secp = Secp256k1::new();
@@ -1919,6 +1931,18 @@ mod test {
             parameters: test_parameters.clone(),
             history: Vec::new(),
         };
+
+        fn params(
+            parent_transition: Option<VaultTransition>,
+            previous_value: VaultAmount,
+            transition: VaultTransition
+        ) -> VaultStateParameters {
+            VaultStateParameters {
+                transition,
+                previous_value,
+                parent_transition,
+            }
+        }
 
         let mut initial_deposits = test_parameters.state_transitions(0);
         initial_deposits.sort();
@@ -1957,81 +1981,300 @@ mod test {
             vec![
                 VaultStateParameters {
                     transition: withdrawal(1),
-                    previous_value: VaultAmount(1),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(3)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(3)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(3)),
+                },
+                VaultStateParameters {
+                    transition: deposit(3),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(3)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(3),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(2)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: v(2),
+                    parent_transition: Some(withdrawal(2)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(2),
+                    parent_transition: Some(withdrawal(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(2),
+                    parent_transition: Some(withdrawal(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: v(2),
+                    parent_transition: Some(withdrawal(2)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(3),
+                    previous_value: v(1),
+                    parent_transition: Some(withdrawal(1)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: v(2),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(2),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(2),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: v(2),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: v(3),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: v(3),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(3),
+                    parent_transition: Some(withdrawal(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(3),
+                    parent_transition: Some(withdrawal(1)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(1),
                     parent_transition: Some(deposit(1)),
                 },
                 VaultStateParameters {
                     transition: deposit(1),
-                    previous_value: VaultAmount(1),
+                    previous_value: v(1),
                     parent_transition: Some(deposit(1)),
                 },
                 VaultStateParameters {
                     transition: deposit(2),
-                    previous_value: VaultAmount(1),
+                    previous_value: v(1),
                     parent_transition: Some(deposit(1)),
                 },
                 VaultStateParameters {
                     transition: deposit(3),
-                    previous_value: VaultAmount(1),
+                    previous_value: v(1),
                     parent_transition: Some(deposit(1)),
                 },
 
                 VaultStateParameters {
                     transition: withdrawal(2),
-                    previous_value: VaultAmount(2),
+                    previous_value: v(2),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(2),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(2),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(2),
+                    previous_value: v(2),
+                    parent_transition: Some(deposit(1)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: v(3),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: v(3),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(3),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(3),
+                    parent_transition: Some(deposit(1)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(1)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(1)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: v(2),
                     parent_transition: Some(deposit(2)),
                 },
                 VaultStateParameters {
                     transition: withdrawal(1),
-                    previous_value: VaultAmount(2),
+                    previous_value: v(2),
                     parent_transition: Some(deposit(2)),
                 },
                 VaultStateParameters {
                     transition: deposit(1),
-                    previous_value: VaultAmount(2),
+                    previous_value: v(2),
                     parent_transition: Some(deposit(2)),
                 },
                 VaultStateParameters {
                     transition: deposit(2),
-                    previous_value: VaultAmount(2),
+                    previous_value: v(2),
                     parent_transition: Some(deposit(2)),
                 },
 
                 VaultStateParameters {
                     transition: withdrawal(3),
-                    previous_value: VaultAmount(3),
+                    previous_value: v(3),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: v(3),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(3),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: deposit(1),
+                    previous_value: v(3),
+                    parent_transition: Some(deposit(2)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(2),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(2)),
+                },
+                VaultStateParameters {
+                    transition: withdrawal(1),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(2)),
+                },
+
+                VaultStateParameters {
+                    transition: withdrawal(3),
+                    previous_value: v(3),
                     parent_transition: Some(deposit(3)),
                 },
                 VaultStateParameters {
                     transition: withdrawal(2),
-                    previous_value: VaultAmount(3),
+                    previous_value: v(3),
                     parent_transition: Some(deposit(3)),
                 },
                 VaultStateParameters {
                     transition: withdrawal(1),
-                    previous_value: VaultAmount(3),
+                    previous_value: v(3),
                     parent_transition: Some(deposit(3)),
                 },
                 VaultStateParameters {
                     transition: deposit(1),
-                    previous_value: VaultAmount(3),
+                    previous_value: v(3),
                     parent_transition: Some(deposit(3)),
                 },
 
                 VaultStateParameters {
                     transition: withdrawal(3),
-                    previous_value: VaultAmount(4),
-                    parent_transition: Some(deposit(4)),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(3)),
                 },
                 VaultStateParameters {
                     transition: withdrawal(2),
-                    previous_value: VaultAmount(4),
-                    parent_transition: Some(deposit(4)),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(3)),
                 },
                 VaultStateParameters {
                     transition: withdrawal(1),
-                    previous_value: VaultAmount(4),
-                    parent_transition: Some(deposit(4)),
+                    previous_value: v(4),
+                    parent_transition: Some(deposit(3)),
                 },
             ],
         );
