@@ -355,9 +355,9 @@ impl VaultStateParameters {
     }
 
     fn next(&self, transition: VaultTransition, max: VaultAmount) -> Option<Self> {
-        self.result_state_value()
+        dbg!(self).result_state_value()
             .and_then(|current_value| {
-                match transition {
+                match dbg!(transition) {
                     VaultTransition::Deposit(deposit_value) => {
                         if current_value + deposit_value <= max {
                             Some(
@@ -594,7 +594,7 @@ impl VaultParameters {
         let value = parameter.result_state_value().unwrap_or(VaultAmount(0));
         let withdrawal_amount = parameter.withdrawal_value();
 
-        if !withdrawal_amount.nonzero() {
+        if withdrawal_amount == VaultAmount::ZERO {
             return None;
         }
 
@@ -634,7 +634,7 @@ impl VaultParameters {
 
         Some(
             TxOut {
-                value: self.scale.scale_amount(value),
+                value: self.scale.scale_amount(withdrawal_amount),
                 script_pubkey,
             }
         )
@@ -793,7 +793,8 @@ impl VaultParameters {
     }
 
     fn vault_output<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameter: &VaultStateParameters, next_states: Option<&HashMap<VaultStateParameters, Transaction>>) -> Option<TxOut> {
-        if let Some(next_value) = parameter.result_state_value() {
+        let next_value = parameter.result_state_value().unwrap_or(VaultAmount::ZERO);
+        if next_value != VaultAmount::ZERO {
             if let Some(next_states) = next_states {
                 let spend_conditions = self.vault_output_spend_conditions(secp, depth, parameter, next_states);
 
@@ -1014,19 +1015,20 @@ impl VaultParameters {
     }
 
     fn dummy_inputs(&self, depth: Depth, parameter: &VaultStateParameters) -> Vec<TxIn> {
-        let (input_count, lock_time) = match (depth, &parameter.transition) {
-            (0, _) => (1, RelativeLockTime::ZERO),
-            (_, VaultTransition::Deposit(ref value)) => (2, self.lock_time_for_deposit(value)),
-            (_, VaultTransition::Withdrawal(ref value)) => (1, self.lock_time_for_withdrawal(value)),
+        let lock_time = match parameter.parent_transition {
+            Some(VaultTransition::Deposit(amount)) => self.lock_time_for_deposit(&amount),
+            Some(VaultTransition::Withdrawal(amount)) => self.lock_time_for_deposit(&amount),
+            None => RelativeLockTime::ZERO,
         };
 
-        let mut input: Vec<TxIn> = Vec::new();
-
-        for _ in 0..input_count {
-            input.push(dummy_input(lock_time));
+        match (depth, &parameter.transition) {
+            (0, _) => vec![dummy_input(RelativeLockTime::ZERO)],
+            (_, VaultTransition::Deposit(_)) => vec![
+                dummy_input(lock_time),
+                dummy_input(RelativeLockTime::ZERO),
+            ],
+            (_, VaultTransition::Withdrawal(_)) => vec![dummy_input(lock_time)],
         }
-
-        input
     }
 
     fn tx_templates<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, next_states: Option<&HashMap<VaultStateParameters, Transaction>>) -> HashMap<VaultStateParameters, Transaction> {
@@ -2384,20 +2386,34 @@ mod test {
 
         let next_templates = test_parameters.templates_at_depth(&secp, 1);
 
-        eprintln!("foo");
+        fn expected_output_count(params: &VaultStateParameters) -> usize {
+            match params.get_result() {
+                Some((VaultAmount(0), VaultAmount(0))) => unreachable!("impossible"),
+                None => unreachable!("impossible"),
+                Some((vault_remainder, withdrawal_amount)) => {
+                    if vault_remainder.nonzero() && withdrawal_amount.nonzero() {
+                        3
+                    } else if vault_remainder.nonzero() || withdrawal_amount.nonzero() {
+                        2
+                    } else {
+                        unreachable!();
+                    }
+                }
+            }
+        }
+
         for (params, _template) in &templates {
             for amount in 1..test_parameters.max_withdrawal_per_step.to_unscaled_amount() {
                 if let Some(next) = params.next(VaultTransition::Withdrawal(VaultAmount(amount)), test_parameters.max) {
-                    eprintln!("============================ PARAM ============================");
                     // previous_value can only be zero for depth = 0
                     if next.previous_value == VaultAmount::ZERO {
                         continue;
                     }
 
-                    dbg!(next_templates.keys().filter(|params| params.previous_value == next.previous_value).collect::<Vec<_>>());
-
-                    let next = next_templates.get(&dbg!(next));
-                    assert!(next.is_some());
+                    let template = next_templates.get(&next)
+                        .expect("template exists");
+                    assert_eq!(template.input.len(), 1);
+                    assert_eq!(template.output.len(), expected_output_count(&next));
                 }
             }
 
@@ -2408,28 +2424,82 @@ mod test {
                         continue;
                     }
 
-                    let next = next_templates.get(&dbg!(next));
-                    assert!(next.is_some());
+                    let template = next_templates.get(&next)
+                        .expect("template exists");
+                    assert_eq!(template.input.len(), 2);
+                    assert_eq!(template.output.len(), 1);
+                    //assert_eq!(params.previous_value, VaultAmount(0));
                 }
             }
         }
 
-        for (params, template) in templates.into_iter() {
-            /*
-            for withdrawal_amount in test_parameters.max_withdrawal_per_step.iter_from(VaultAmount::ZERO) {
-                let next_params = VaultStateParameters {
-                    transition: ,
-                    previous_value: todo!(),
-                    parent_transition: todo!(),
-                };
+        let next_next_templates = test_parameters.templates_at_depth(&secp, 2);
+
+        for (params, _template) in &next_templates {
+            for amount in 1..test_parameters.max_withdrawal_per_step.to_unscaled_amount() {
+                if let Some(next) = params.next(VaultTransition::Withdrawal(VaultAmount(amount)), test_parameters.max) {
+                    // previous_value can only be zero for depth = 0
+                    if next.previous_value == VaultAmount::ZERO {
+                        continue;
+                    }
+
+                    let template = next_next_templates.get(&next)
+                        .expect("template exists");
+                    assert_eq!(template.input.len(), 1);
+                    assert_eq!(template.output.len(), expected_output_count(&next));
+                    //assert_eq!(params.previous_value, VaultAmount(0));
+                }
             }
 
-            for deposit_amount in test_parameters.max_withdrawal_per_step.iter_from(VaultAmount::ZERO) {
+            for amount in 1..test_parameters.max_deposit_per_step.to_unscaled_amount() {
+                if let Some(next) = params.next(VaultTransition::Deposit(VaultAmount(amount)), test_parameters.max) {
+                    // previous_value can only be zero for depth = 0
+                    if next.previous_value == VaultAmount::ZERO {
+                        continue;
+                    }
 
+                    let template = next_next_templates.get(&next)
+                        .expect("template exists");
+                    assert_eq!(template.input.len(), 2);
+                    assert_eq!(template.output.len(), 1);
+                    //assert_eq!(params.previous_value, VaultAmount(0));
+                }
             }
-            */
         }
 
-        todo!("more tests")
+        let last_templates = test_parameters.templates_at_depth(&secp, test_parameters.max_depth);
+
+        // Since depth > 1 parameters should all be the same we're reuse them
+        for (params, _template) in &next_next_templates {
+            for amount in 1..test_parameters.max_withdrawal_per_step.to_unscaled_amount() {
+                if let Some(next) = params.next(VaultTransition::Withdrawal(VaultAmount(amount)), test_parameters.max) {
+                    // previous_value can only be zero for depth = 0
+                    if next.previous_value == VaultAmount::ZERO {
+                        continue;
+                    }
+
+                    let template = last_templates.get(&next)
+                        .expect("template exists");
+                    assert_eq!(template.input.len(), 1);
+                    assert_eq!(template.output.len(), expected_output_count(&next));
+                    //assert_eq!(params.previous_value, VaultAmount(0));
+                }
+            }
+
+            for amount in 1..test_parameters.max_deposit_per_step.to_unscaled_amount() {
+                if let Some(next) = params.next(VaultTransition::Deposit(VaultAmount(amount)), test_parameters.max) {
+                    // previous_value can only be zero for depth = 0
+                    if next.previous_value == VaultAmount::ZERO {
+                        continue;
+                    }
+
+                    let template = last_templates.get(&next)
+                        .expect("template exists");
+                    assert_eq!(template.input.len(), 2);
+                    assert_eq!(template.output.len(), 1);
+                    //assert_eq!(params.previous_value, VaultAmount(0));
+                }
+            }
+        }
     }
 }
