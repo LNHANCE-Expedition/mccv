@@ -12,6 +12,3 @@ pub use vault::{
     Vault,
     VaultDepositor,
 };
-
-#[cfg(test)]
-pub mod test_util;

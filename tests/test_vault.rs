@@ -5,7 +5,6 @@ use bdk_wallet::{
     template::Bip86Public,
     template::Bip86,
     KeychainKind,
-    PersistedWallet,
     SignOptions,
     Wallet,
 };
@@ -14,28 +13,14 @@ use bitcoin::{
     Amount,
     bip32::Xpriv,
     bip32::Xpub,
-    consensus::encode::serialize_hex,
     FeeRate,
-    hashes::Hash,
-    hashes::sha256::Hash as Sha256,
     Network,
     secp256k1::Secp256k1,
     secp256k1::Signing,
-    secp256k1::Verification,
-    Transaction,
     Txid,
 };
 
 use bitcoin::secp256k1::rand::{RngCore, thread_rng};
-
-use corepc_node::{
-    Node,
-    exe_path,
-};
-
-use serde::Serialize;
-
-use std::time::Instant;
 
 use std::str::FromStr;
 
@@ -49,9 +34,9 @@ use mccv::{
     vault::SqliteVaultStorage,
 };
 
-pub fn get_test_node() -> (Node, Client) {
+pub fn get_test_node() -> (corepc_node::Node, Client) {
     let path = corepc_node::exe_path().expect("Failed to get bitcoind path. See README.md \"Testing Error\" section.");
-    let node = Node::new(path).unwrap();
+    let node = corepc_node::Node::new(path).unwrap();
     let url = node.rpc_url();
     let auth = Auth::CookieFile(node.params.cookie_file.clone());
     (node, Client::new(&url, auth).unwrap())
@@ -62,12 +47,6 @@ pub fn get_test_wallet() -> (Xpriv, Wallet) {
     thread_rng().fill_bytes(&mut seed_bytes);
     let master = Xpriv::new_master(Network::Regtest, &seed_bytes).unwrap();
 
-    let secp = Secp256k1::new();
-    //let public = Bip86Public(master.clone(), KeychainKind::External);
-    let master_xpub = Xpub::from_priv(&secp, &master);
-    let public = Bip86Public(master_xpub.clone(), master_xpub.fingerprint(), KeychainKind::External);
-
-    let private = Bip86(master.clone(), KeychainKind::External);
     let wallet = Wallet::create_single(
         Bip86(master.clone(), KeychainKind::External)
     )
@@ -270,38 +249,5 @@ fn test_deposit() {
 
     let withdrawal_amount = VAULT_SCALE * 2;
 
-
-}
-
-#[test]
-fn test_scratch_workspace() {
-    use bdk_wallet::keys::GeneratableDefaultOptions;
-    //use bdk_wallet::miniscript::ScriptContext;
-    use corepc_node::{
-        Node,
-        exe_path,
-    };
-
-    use bdk_wallet::{
-        Wallet,
-        descriptor::template::Bip86,
-        descriptor::template::DescriptorTemplate,
-        KeychainKind,
-
-    };
-
-    use bitcoin::bip32::Xpriv;
-    use bitcoin::Network;
-    use bitcoin::secp256k1::rand::{RngCore, thread_rng};
-
-    use bitcoin::blockdata::constants::genesis_block;
-
-    use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
-    use bdk_bitcoind_rpc::Emitter;
-
-    let (xpriv, mut wallet) = get_test_wallet();
-
-    let template = Bip86(xpriv.clone(), KeychainKind::External);
-
-    let (descriptor, key_map, networks) = template.build(Network::Regtest).unwrap();
+    todo!()
 }

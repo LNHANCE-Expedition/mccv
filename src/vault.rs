@@ -1,25 +1,18 @@
 use bdk_wallet::coin_selection::InsufficientFunds;
 use bdk_wallet::error::CreateTxError;
-use bdk_wallet::miniscript::descriptor::{Wildcard, DescriptorXKey, DerivPaths};
-use bdk_wallet::miniscript::{DefiniteDescriptorKey, Descriptor, MiniscriptKey, DescriptorPublicKey};
-use bdk_wallet::miniscript::plan::{AssetProvider, Plan, Assets, TaprootCanSign, TaprootAvailableLeaves, CanSign};
-use bdk_wallet::{Wallet, KeychainKind};
-use bitcoin::psbt::ExtractTxError;
+use bdk_wallet::Wallet;
+
 use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch, TaprootSpendInfo};
-use bitcoin::{BlockHash, FeeRate, psbt, Weight, TapTweakHash};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::{
     Hash,
     sha256,
 };
 
-use bitcoin::blockdata::constants::genesis_block;
-
 use bitcoin::consensus::Encodable;
 
 #[cfg(feature = "bitcoind")]
 use bitcoin::Block;
-
 
 use bitcoin::opcodes::all::{
     OP_CSV,
@@ -30,26 +23,26 @@ use bitcoin::opcodes::all::{
 
 use bitcoin::bip32::{
     Xpub,
-    Xpriv,
     ChildNumber,
     DerivationPath,
-    IntoDerivationPath,
-    KeySource,
 };
 
 use bitcoin::secp256k1::{
+    PublicKey,
     Secp256k1,
-    Signing,
     Verification,
-    XOnlyPublicKey, PublicKey, Scalar,
+    XOnlyPublicKey,
 };
 
 use bitcoin::{
     Amount,
+    BlockHash,
+    FeeRate,
     script::Builder,
     absolute::LockTime,
-    opcodes::OP_TRUE,
     OutPoint,
+    psbt,
+    Psbt,
     relative::LockTime as RelativeLockTime,
     ScriptBuf,
     Script,
@@ -58,18 +51,16 @@ use bitcoin::{
     Txid,
     transaction::TxIn,
     transaction::TxOut,
-    blockdata::locktime::absolute,
     blockdata::locktime::relative,
     blockdata::transaction::Version,
     taproot::{
         LeafVersion,
         TaprootBuilder,
     },
+    TapTweakHash,
+    Weight,
     Witness,
-    Psbt,
 };
-use rayon::prelude::ParallelBridge;
-use rusqlite::Row;
 
 use rand::{
     RngCore,
@@ -84,6 +75,7 @@ use rayon::iter::{
 use rusqlite::{
     Connection,
     params,
+    Row,
     types::{
         ToSql,
         FromSql,
@@ -97,7 +89,7 @@ use serde::{
 
 use std::iter;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use crate::migrate::{
@@ -188,11 +180,6 @@ impl VaultAmount {
 
     fn nonzero(&self) -> bool {
         self.0 > 0
-    }
-
-    fn iter_from(&self, start: VaultAmount) -> impl Iterator<Item=VaultAmount> {
-        (start.0..=self.0)
-            .map(|amount| VaultAmount(amount))
     }
 
     pub fn apply_transition(&self, transition: VaultTransition, max: Option<VaultAmount>) -> Option<VaultAmount> {
@@ -355,9 +342,9 @@ impl VaultStateParameters {
     }
 
     fn next(&self, transition: VaultTransition, max: VaultAmount) -> Option<Self> {
-        dbg!(self).result_state_value()
+        self.result_state_value()
             .and_then(|current_value| {
-                match dbg!(transition) {
+                match transition {
                     VaultTransition::Deposit(deposit_value) => {
                         if current_value + deposit_value <= max {
                             Some(
@@ -1204,7 +1191,7 @@ pub struct DepositTransactions {
 }
 
 impl DepositTransactions {
-    pub fn extract(self) -> Result<(Transaction, Transaction), ExtractTxError> {
+    pub fn extract(self) -> Result<(Transaction, Transaction), psbt::ExtractTxError> {
         self.shape_transaction
             .extract_tx()
             .map(|shape_transaction| (shape_transaction, self.deposit_transaction))
@@ -1379,7 +1366,7 @@ impl Vault {
         result
     }
 
-    pub fn store(&self, connection: &mut Connection) -> Result<Self, rusqlite::Error> {
+    pub fn store(&self, _connection: &mut Connection) -> Result<Self, rusqlite::Error> {
         todo!()
     }
 
@@ -1414,9 +1401,9 @@ impl Vault {
             )
         };
 
-        let transactions = self.parameters.templates_at_depth(secp, dbg!(depth));
+        let transactions = self.parameters.templates_at_depth(secp, depth);
 
-        let mut deposit = if let Some(deposit) = transactions.get(dbg!(&parameters)) {
+        let mut deposit = if let Some(deposit) = transactions.get(&parameters) {
             deposit.clone()
         } else {
             // Why does this function even return an option if we don't use it?
@@ -1592,24 +1579,29 @@ impl Vault {
             _ => unreachable!("should never have more than 2 inputs or less than 1"),
         }
 
-        match deposit_template.input.len() {
-            1 => { }
-            2 => {
-                let (history_tx, _) = self.history.last()
-                    .expect("deposit template will only have two inputs if depth > 0");
+        if let Some((last_history_tx, _)) = self.history.last() {
+            let second_to_last_history_tx = if self.history.len() >= 2 {
+                Some(&self.history[self.history.len() - 2].0)
+            } else {
+                None
+            };
 
-                let second_to_last_history_tx = if self.history.len() >= 2 {
-                    Some(&self.history[self.history.len() - 2].0)
-                } else {
-                    None
-                };
+            let parent_depth = self.get_current_depth() - 1;
+            let parent_parameters = self.parameters.history_to_parameters(last_history_tx, second_to_last_history_tx, parent_depth)
+                .expect("history must be valid");
 
-                let parent_parameters = self.parameters.history_to_parameters(history_tx, second_to_last_history_tx, self.get_current_depth());
+            let templates = self.parameters.templates_at_depth(secp, self.get_current_depth());
 
-                //let parent_parameters = history_tx.transition
-                todo!()
-            }
-            _ => unreachable!("should never have more than 2 inputs or less than 1"),
+            let parent_spend_conditions = self.parameters.vault_output_spend_conditions(secp, parent_depth, &parent_parameters, &templates);
+
+            let spend_info = self.parameters.spend_conditions_into_spend_info(secp, parent_depth, &parent_spend_conditions);
+
+            let branch = spend_info
+                .branches
+                .get(&VaultOutputSpendCondition::Deposit(deposit_amount))
+                .expect("spend condition should exist"); // FIXME: I think this is an invalid assumption, caller could give bad deposit amount, return error instead
+            
+            todo!()
         }
 
         let current_vault_amount = self.history.last()
@@ -1671,7 +1663,7 @@ pub trait VaultDepositor {
 }
 
 impl VaultDepositor for Wallet {
-    fn create_shape<C: Verification>(&mut self, secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError> {
+    fn create_shape<C: Verification>(&mut self, _secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError> {
         let script_pubkey = deposit_transaction.script_pubkey();
         let mut shape_weight = Weight::ZERO;
         // This weight should be correct already 
@@ -1751,47 +1743,27 @@ impl VaultDepositor for Wallet {
     }
 }
 
-enum Either<A, B> {
-    A(A),
-    B(B),
-}
-
-impl<T, A, B> Iterator for Either<A, B>
-where
-    A: Iterator<Item = T>,
-    B: Iterator<Item = T>,
-{
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Either::A(a) => a.next(),
-            Either::B(b) => b.next(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
 
-    use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
+    use bitcoin::bip32::Xpriv;
 
-    use bdk_wallet::KeychainKind;
-    use bdk_wallet::SignOptions;
-    use bdk_wallet::Wallet;
-
-    use bitcoin::{
-        consensus::encode::serialize_hex,
-    };
-
-    use serde::Serialize;
-
-    use std::time::Instant;
+    use bitcoin::secp256k1::Signing;
 
     use std::str::FromStr;
 
-    use crate::test_util;
+    fn deposit(amount: u32) -> VaultTransition {
+        VaultTransition::Deposit(VaultAmount(amount))
+    }
+
+    fn withdrawal(amount: u32) -> VaultTransition {
+        VaultTransition::Withdrawal(VaultAmount(amount))
+    }
+
+    fn v(amount: u32) -> VaultAmount {
+        VaultAmount(amount)
+    }
 
     // master xpriv derived from milk sad key, 
     // XXX: copied in two places
@@ -1892,26 +1864,6 @@ mod test {
         );
     }
 
-    fn deposit(amount: u32) -> VaultTransition {
-        VaultTransition::Deposit(VaultAmount(amount))
-    }
-
-    fn withdrawal(amount: u32) -> VaultTransition {
-        VaultTransition::Withdrawal(VaultAmount(amount))
-    }
-
-    fn parent_deposit(amount: u32) -> Option<VaultTransition> {
-        Some(deposit(amount))
-    }
-
-    fn parent_withdrawal(amount: u32) -> Option<VaultTransition> {
-        Some(withdrawal(amount))
-    }
-
-    fn v(amount: u32) -> VaultAmount {
-        VaultAmount(amount)
-    }
-
     #[test]
     fn test_parameter_generation() {
         let secp = Secp256k1::new();
@@ -1927,24 +1879,6 @@ mod test {
             max_deposit_per_step: VaultAmount::new(3),
             max_depth: 10,
         };
-
-        let vault = Vault {
-            id: 0,
-            parameters: test_parameters.clone(),
-            history: Vec::new(),
-        };
-
-        fn params(
-            parent_transition: Option<VaultTransition>,
-            previous_value: VaultAmount,
-            transition: VaultTransition
-        ) -> VaultStateParameters {
-            VaultStateParameters {
-                transition,
-                previous_value,
-                parent_transition,
-            }
-        }
 
         let mut initial_deposits = test_parameters.state_transitions(0);
         initial_deposits.sort();
