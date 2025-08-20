@@ -71,7 +71,7 @@ pub fn update_wallet(wallet: &mut Wallet, client: &Client) {
 
 pub fn update_vault(vault: &mut Vault, emitter: &mut Emitter<&Client>) {
     while let Some(block) = emitter.next_block().unwrap() {
-        eprintln!("applying block {}", block.block.block_hash());
+        //eprintln!("applying block {}", block.block.block_hash());
         vault.apply_block(&block.block, block.block_height());
     }
 }
@@ -84,7 +84,7 @@ pub fn generate_to_wallet(wallet: &mut Wallet, client: &Client, num_blocks: u64)
     update_wallet(wallet, client);
 }
 
-// master xpriv derived from milk sad key (at least I'm pretty sure...)
+// master xpriv derived from milk sad key (at least I'm pretty sure... it's been a while...)
 fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) {
     let milk_sad_master = Xpriv::from_str("tprv8ZgxMBicQKsPd1EzCPZcQSPhsotX5HvRDCivA7ASNQFmjWuTsW3WWEwUNKFAZrnD9qpz55rtyLdphqkwRZUqNWYXwSEzd6P4pYvXGByRim3").unwrap();
 
@@ -147,7 +147,9 @@ fn test_deposit() {
     let mut vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
         .expect("create vault");
 
+    let mut total_deposit = Amount::ZERO;
     let deposit_amount_raw = VAULT_SCALE * 3;
+    total_deposit += deposit_amount_raw;
     let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw);
     assert_eq!(remainder, Amount::ZERO);
 
@@ -157,7 +159,8 @@ fn test_deposit() {
 
     let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
         .expect("create shape success");
-    //eprintln!("{:?}", deposit_transactions);
+
+    let transmittable_deposit_transaction = deposit_transaction.to_transaction().expect("initial deposit doesn't require signing");
 
     let sign_success = wallet.sign(&mut shape_psbt, SignOptions::default())
         .expect("sign success");
@@ -171,18 +174,18 @@ fn test_deposit() {
         mccv::vault::package_encodable(
             vec![
                 &shape_transaction,
-                deposit_transaction.as_transaction(),
+                &transmittable_deposit_transaction,
             ],
         ),
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(dbg!(result).get("package_msg"), Some(&"success".into()));
+    assert_eq!(result.get("package_msg"), Some(&"success".into()));
 
     let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
         .expect("shape tx in mempool");
 
-    let _ = client.get_mempool_entry(&deposit_transaction.as_transaction().compute_txid())
+    let _ = client.get_mempool_entry(&transmittable_deposit_transaction.compute_txid())
         .expect("deposit tx in mempool");
 
     generate_to_wallet(&mut wallet, &client, 6);
@@ -190,7 +193,7 @@ fn test_deposit() {
     let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
         .expect_err("shape tx has been mined");
 
-    let _ = client.get_mempool_entry(&deposit_transaction.as_transaction().compute_txid())
+    let _ = client.get_mempool_entry(&transmittable_deposit_transaction.compute_txid())
         .expect_err("deposit tx has been mined");
 
     let mut vault_block_emitter = Emitter::new(&client, genesis_checkpoint, 0, Option::<Txid>::None);
@@ -202,9 +205,10 @@ fn test_deposit() {
 
     update_vault(&mut vault, &mut vault_block_emitter);
 
-    assert_eq!(vault.get_confirmed_balance(), deposit_amount_raw);
+    assert_eq!(vault.get_confirmed_balance(), total_deposit);
 
     let deposit_amount_raw = VAULT_SCALE * 2;
+    total_deposit += deposit_amount_raw;
     let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw);
     assert_eq!(remainder, Amount::ZERO);
 
@@ -221,20 +225,27 @@ fn test_deposit() {
     let shape_transaction = shape_psbt.extract_tx()
         .expect("tx complete");
 
-    eprintln!("tx {} = {shape_transaction:?}", shape_transaction.compute_txid());
-    eprintln!("tx {} = {:?}", deposit_transaction.as_transaction().compute_txid(), deposit_transaction.as_transaction());
+    let hot_keypair = deposit_transaction.hot_keypair(&secp, &hot_xpriv)
+        .expect("successful key derivation");
+
+    let _ = deposit_transaction.sign(&secp, &hot_keypair)
+        .expect("sign success");
+
+    let transmittable_deposit_transaction = deposit_transaction.to_transaction().expect("deposit transaction signed");
+
+    //eprintln!("tx {} = {shape_transaction:?}", shape_transaction.compute_txid());
+    //eprintln!("tx {} = {:?}", transmittable_deposit_transaction.compute_txid(), &transmittable_deposit_transaction);
 
     let args: Vec<serde_json::Value> = vec![
         mccv::vault::package_encodable(
             vec![
                 &shape_transaction,
-                deposit_transaction.as_transaction(),
+                &transmittable_deposit_transaction,
             ],
         ),
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    eprintln!("{result}");
     assert_eq!(result.get("package_msg"), Some(&"success".into()));
 
     vault.add_deposit_transaction(&deposit_transaction)
@@ -244,10 +255,9 @@ fn test_deposit() {
 
     update_vault(&mut vault, &mut vault_block_emitter);
 
-    assert_eq!(vault.get_confirmed_balance(), deposit_amount_raw);
-
+    assert_eq!(vault.get_confirmed_balance(), total_deposit);
 
     let withdrawal_amount = VAULT_SCALE * 2;
 
-    todo!()
+    todo!("withdrawal test")
 }
