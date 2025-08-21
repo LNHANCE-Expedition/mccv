@@ -10,14 +10,19 @@ use bdk_wallet::{
 };
 
 use bitcoin::{
+    Address,
     Amount,
     bip32::Xpriv,
     bip32::Xpub,
     FeeRate,
     Network,
-    secp256k1::Secp256k1,
-    secp256k1::Signing,
     Txid,
+};
+
+use bitcoin::secp256k1::{
+    Secp256k1,
+    Signing,
+    XOnlyPublicKey,
 };
 
 use bitcoin::secp256k1::rand::{RngCore, thread_rng};
@@ -31,6 +36,7 @@ use mccv::{
     VaultScale,
     Vault,
     VaultDepositor,
+    vault::VaultWithdrawer,
     vault::SqliteVaultStorage,
 };
 
@@ -106,6 +112,9 @@ fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) 
 // - withdrawal greater than available balance
 // - deposit greater than max
 // - clawback
+//   - clawback vault UTXO only
+//   - clawback withdrawal UTXO only
+//   - clawback both UTXOs simultaneously
 // - load and store
 // - reorgs
 
@@ -147,6 +156,7 @@ fn test_deposit() {
     let mut vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
         .expect("create vault");
 
+    // ============ Deposit 1 ============ 
     let mut total_deposit = Amount::ZERO;
     let deposit_amount_raw = VAULT_SCALE * 3;
     total_deposit += deposit_amount_raw;
@@ -207,6 +217,7 @@ fn test_deposit() {
 
     assert_eq!(vault.get_confirmed_balance(), total_deposit);
 
+    // ============ Deposit 2 ============ 
     let deposit_amount_raw = VAULT_SCALE * 2;
     total_deposit += deposit_amount_raw;
     let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw);
@@ -257,7 +268,66 @@ fn test_deposit() {
 
     assert_eq!(vault.get_confirmed_balance(), total_deposit);
 
-    let withdrawal_amount = VAULT_SCALE * 2;
+    // ============ Withdrawal 1 ============ 
+    match vault.create_withdrawal(&secp, VaultAmount::new(6)) {
+        Ok(_) => panic!("can't withdraw more than balance"),
+        Err(_) => {}
+    }
 
-    todo!("withdrawal test")
+    // ============ Withdrawal 2 ============ 
+    let withdrawal_amount_raw = VAULT_SCALE * 3;
+    total_deposit -= withdrawal_amount_raw;
+    let (withdrawal_amount, remainder) = vault.to_vault_amount(withdrawal_amount_raw);
+
+    let mut withdrawal_transaction = vault.create_withdrawal(&secp, withdrawal_amount)
+        .expect("can withdraw");
+
+    let mut withdrawal_cpfp_psbt = wallet.create_cpfp(&secp, &withdrawal_transaction, FeeRate::BROADCAST_MIN)
+        .expect("can cpfp");
+
+    dbg!(withdrawal_transaction.weight());
+    dbg!(withdrawal_cpfp_psbt.unsigned_tx.weight());
+
+    let sign_success = wallet.sign(&mut withdrawal_cpfp_psbt, SignOptions::default())
+        .expect("sign success");
+    //assert!(sign_success);
+    let withdrawal_cpfp = withdrawal_cpfp_psbt.extract_tx().unwrap();
+
+    dbg!(withdrawal_cpfp.weight());
+
+    let hot_keypair = withdrawal_transaction.hot_keypair(&secp, &hot_xpriv)
+        .expect("successful key derivation");
+
+    withdrawal_transaction.sign(&secp, &hot_keypair)
+        .expect("can sign withdrawal");
+
+    vault.add_withdrawal_transaction(&withdrawal_transaction)
+        .expect("can add withdrawal");
+
+    let transmittable_withdrawal_transaction = withdrawal_transaction.to_transaction()
+        .expect("signed tx");
+
+    client.send_raw_transaction(&transmittable_withdrawal_transaction)
+        .expect_err("can't broadcast withdrawal without a cpfp");
+
+    dbg!(withdrawal_transaction.weight());
+    dbg!(withdrawal_transaction.weight() + withdrawal_cpfp.weight());
+    let args: Vec<serde_json::Value> = vec![
+        mccv::vault::package_encodable(
+            vec![
+                &transmittable_withdrawal_transaction,
+                &withdrawal_cpfp,
+            ],
+        ),
+    ];
+
+    let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
+    assert_eq!(dbg!(result).get("package_msg"), Some(&"success".into()));
+
+    let unspendable_key = XOnlyPublicKey::from_slice(&[1; 32]).unwrap();
+    let unspendable_address = Address::p2tr(&secp, unspendable_key, None, Network::Regtest);
+
+    client.generate_to_address(1, &unspendable_address).unwrap();
+
+    assert_eq!(vault.get_confirmed_balance(), total_deposit);
 }
