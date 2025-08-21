@@ -1,7 +1,8 @@
 # More Complicated CTV Vaults
 
-I started this to prove (or disprove) the feasibility of things I've talked about CTV vaults being capable of.
+I started this quite a long time ago to prove (or disprove) the feasibility of things I've talked about CTV vaults being capable of.
 None of this should be theoretically exciting to anyone familiar with CTV, but I was not sure how feasible some of them were.
+Precomputing a large number of potential transactions takes a long time on commodity hardware, so there are practical limits to vaults like this.
 
 ## Goal Features
 
@@ -48,17 +49,12 @@ The following sequence of transactions would be made on-chain.
 
     V_0,2 -> V_1,1 -> V_2,3 -> V_3,2
 
-|-------------|-------|-------|---------------------------|----------|---------------|
 | Transaction | Depth | Value | Withdrawal/Deposit Amount | Timelock | Next Timelock |
 |-------------|-------|-------|---------------------------|----------|---------------|
 | V_0,2       | 0     | 2     | Deposit 2                 | 0        | 0             |
-|-------------|-------|-------|---------------------------|----------|---------------|
 | V_1,1       | 1     | 1     | Withdraw 1                | 0        | T             |
-|-------------|-------|-------|---------------------------|----------|---------------|
 | V_2,3       | 2     | 3     | Deposit 2                 | T        | 0             |
-|-------------|-------|-------|---------------------------|----------|---------------|
 | V_3,2       | 3     | 2     | Withdraw 1                | 0        | T             |
-|-------------|-------|-------|---------------------------|----------|---------------|
 
 # Transactions
 
@@ -82,8 +78,8 @@ Timelocked spendable by hot key (do we even want this? costs 32 wu to have this)
 ## Deposit Transaction
 
                      +------------+
-    Vault Deposit -> |            | -> Vault
-    [ Vault ]     -> |            | -> Anchor Output
+    [ Vault ]     -> |            | -> Vault
+    Vault Deposit -> |            | -> Anchor Output
                      +------------+
 
 ### Vault Input
@@ -98,8 +94,8 @@ CTV for either withdrawal or deposit
 ## Withdrawal Transaction
 
              +------------+
-    Vault -> |            | -> Unvault
-             |            | -> [ Vault ]
+    Vault -> |            | -> [ Vault ]
+             |            | -> Unvault
              |            | -> Anchor Output
              +------------+
 
@@ -120,29 +116,16 @@ Same as deposit output except it carries a timelock as well.
 
 # Testing Error
 
-If you see "Failed to get bitcoind path" or "Failed to get electrsd path" when
-running tests, you need to provide the tests a way to run bitcoind and electrsd.
+If you see "Failed to get bitcoind path" when running tests, or an RPC error, you need to provide
+the tests a way to run `bitcoind`. Note that you will want a bitcoind that supports CTV such as .
 
-## Trusting Electrsd
-
-The electrsd crate conveniently provides binaries for electrs and the bitcoind
-provides binaries for bitcoind.
-Using these binaries never sat well with me so it is turned off by default, but
-you can run tests with the `trust-electrsd` feature to very quickly and easily
-run tests.
-
-## Bring your own binaries
-
-If you have built electrs and bitcoind yourself you can use them by providing
-the environment variables `ELECTRS_EXE` and `BITCOIND_EXE` which must be the
-full paths to these binaries.
+If you have `bitcoind` in your path, but want to use a different one for tests, you can set the `BITCOIND_EXE` environment variable to override this.
 
 As of the time of writing, OP_CHECKTEMPLATEVERIFY has not been activated, so you
-will need a version of bitcoind that supports it, such as inquisition.
-Furthermore, TRUC transactions/v3 relay is necessary for vault transactions to
-be relayed.
-This requires a newer version of bitcoin inquisition (unknown version at the
-time of writing.
-The following versions have been successfully tested together:
+will need a version of bitcoind that supports it, as well as one that supports TRUC transactions and the `submitpackage` RPC such as [Inquisition v29 with CTV](https://github.com/ajtowns/bitcoin/tree/202507-inq29-ctv).
 
-bitcoin inquisition 0.25.2, electrsd 0.29.0, bitcoind 0.36.1 (transitively via electrsd), and electrs built from source 0.10.7
+# Future Work
+
+Getting this prototype into shape has renewed my interest in a binary vault system which is much more like existing "simple-ctv-vault" style implementations.
+With some caveats, I believe CSFS plus a much simpler vault construction can actually provide a similar, and very decent UX.
+I'll provide a writeup if not a PoC implementation of this after the UX goals have been achieved for this PoC.
