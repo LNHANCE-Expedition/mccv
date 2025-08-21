@@ -1350,6 +1350,7 @@ impl WithdrawalTransaction {
         psbt::Input {
             witness_utxo: Some(self.transaction.output[vout as usize].clone()),
             non_witness_utxo: Some(self.transaction.clone()),
+            final_script_witness: Some(Witness::new()),
             ..Default::default()
         }
     }
