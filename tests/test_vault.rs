@@ -286,8 +286,8 @@ fn test_deposit_withdraw() {
 
     let sign_success = wallet.sign(&mut withdrawal_cpfp_psbt, SignOptions::default())
         .expect("sign success");
-    //assert!(sign_success); // I think bdk isn't recognizing the signing as complete because of
-    //the anchor output
+    assert!(sign_success);
+
     let withdrawal_cpfp = withdrawal_cpfp_psbt.extract_tx().unwrap();
 
     let hot_keypair = withdrawal_transaction.hot_keypair(&secp, &hot_xpriv)
