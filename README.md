@@ -59,6 +59,9 @@ The following sequence of transactions would be made on-chain.
 # Transactions
 
 ## Vault Prepare Transaction
+
+Also known as the "shape transaction" in the code.
+
                               Randomized TxOut Order
             +------------+
     In 0 -> |            | -> Vault Deposit
