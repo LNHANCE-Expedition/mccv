@@ -1449,6 +1449,7 @@ pub enum KeypairDerivationError {
 }
 
 impl DepositTransaction {
+    // FIXME: this is a dumb as hell API, think about how we want to actually handle this
     pub fn hot_keypair<C: Signing>(&self, secp: &Secp256k1<C>, xpriv: &Xpriv) -> Result<Keypair, KeypairDerivationError> {
         if let Some((signing_info, _)) = &self.signing_info {
             let keypair = xpriv.derive_priv(secp, &[
