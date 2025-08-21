@@ -40,14 +40,15 @@ fn get_and_clear_migration_version(connection: &mut Connection) -> Result<(rusql
     Ok((transaction, version))
 }
 
-pub fn migrate(connection: &mut Connection) -> Result<(), MigrationError> {
+pub fn migrate(connection: &mut Connection) -> Result<(u32, u32), MigrationError> {
     let (transaction, mut version) = get_and_clear_migration_version(connection)
         .map_err(|e| MigrationError::InitializationFailed(e))?;
+
+    let initial_version = version;
 
     for (migration_version, script) in MIGRATIONS.iter() {
         let migration_version = *migration_version;
         if migration_version > version {
-            println!("Migrating {version} to {migration_version}");
             transaction.execute_batch(script)
             .map_err(|e| MigrationError::MigrationFailed(migration_version, e))?;
             version = migration_version;
@@ -60,5 +61,5 @@ pub fn migrate(connection: &mut Connection) -> Result<(), MigrationError> {
     transaction.commit()
         .map_err(|e| MigrationError::FinalizationFailed(e))?;
 
-    Ok(())
+    Ok((initial_version, version))
 }
