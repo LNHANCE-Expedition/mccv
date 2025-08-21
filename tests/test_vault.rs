@@ -108,8 +108,6 @@ fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) 
 }
 
 // Test cases to add:
-// - withdrawal
-// - withdrawal greater than available balance
 // - deposit greater than max
 // - clawback
 //   - clawback vault UTXO only
@@ -119,7 +117,7 @@ fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) 
 // - reorgs
 
 #[test]
-fn test_deposit() {
+fn test_deposit_withdraw() {
     let secp = Secp256k1::new();
 
     let (node, client) = get_test_node();
@@ -329,5 +327,6 @@ fn test_deposit() {
 
     client.generate_to_address(1, &unspendable_address).unwrap();
 
+    update_vault(&mut vault, &mut vault_block_emitter);
     assert_eq!(vault.get_confirmed_balance(), total_deposit);
 }
