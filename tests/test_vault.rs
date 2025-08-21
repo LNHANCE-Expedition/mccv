@@ -276,6 +276,7 @@ fn test_deposit_withdraw() {
     let withdrawal_amount_raw = VAULT_SCALE * 3;
     total_deposit -= withdrawal_amount_raw;
     let (withdrawal_amount, remainder) = vault.to_vault_amount(withdrawal_amount_raw);
+    assert_eq!(remainder, Amount::ZERO);
 
     let mut withdrawal_transaction = vault.create_withdrawal(&secp, withdrawal_amount)
         .expect("can withdraw");
@@ -283,15 +284,11 @@ fn test_deposit_withdraw() {
     let mut withdrawal_cpfp_psbt = wallet.create_cpfp(&secp, &withdrawal_transaction, FeeRate::BROADCAST_MIN)
         .expect("can cpfp");
 
-    dbg!(withdrawal_transaction.weight());
-    dbg!(withdrawal_cpfp_psbt.unsigned_tx.weight());
-
     let sign_success = wallet.sign(&mut withdrawal_cpfp_psbt, SignOptions::default())
         .expect("sign success");
-    //assert!(sign_success);
+    //assert!(sign_success); // I think bdk isn't recognizing the signing as complete because of
+    //the anchor output
     let withdrawal_cpfp = withdrawal_cpfp_psbt.extract_tx().unwrap();
-
-    dbg!(withdrawal_cpfp.weight());
 
     let hot_keypair = withdrawal_transaction.hot_keypair(&secp, &hot_xpriv)
         .expect("successful key derivation");
@@ -308,8 +305,6 @@ fn test_deposit_withdraw() {
     client.send_raw_transaction(&transmittable_withdrawal_transaction)
         .expect_err("can't broadcast withdrawal without a cpfp");
 
-    dbg!(withdrawal_transaction.weight());
-    dbg!(withdrawal_transaction.weight() + withdrawal_cpfp.weight());
     let args: Vec<serde_json::Value> = vec![
         mccv::vault::package_encodable(
             vec![
@@ -320,7 +315,7 @@ fn test_deposit_withdraw() {
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(dbg!(result).get("package_msg"), Some(&"success".into()));
+    assert_eq!(result.get("package_msg"), Some(&"success".into()));
 
     let unspendable_key = XOnlyPublicKey::from_slice(&[1; 32]).unwrap();
     let unspendable_address = Address::p2tr(&secp, unspendable_key, None, Network::Regtest);
@@ -329,4 +324,6 @@ fn test_deposit_withdraw() {
 
     update_vault(&mut vault, &mut vault_block_emitter);
     assert_eq!(vault.get_confirmed_balance(), total_deposit);
+
+    todo!("complete withdrawal by either spending it to the BDK wallet, or somehow informing BDK how to spend the timelocked withdrawal output")
 }

@@ -2139,6 +2139,15 @@ impl Vault {
     }
 }
 
+/// When calculating the weight of transactions that have no witness data (yet), rust-bitcoin
+/// assumes they are non-segwit transactions, and skips the segwit marker
+const SEGWIT_MARKER_WEIGHT: Weight = Weight::from_wu(2);
+
+/// When manually calculating the weight of an unsigned transaction, we need to include the weight
+/// of the witness-item-count in addition to max_weight_to_satisfy(). We hardcode this to 1 because
+/// we will never have a witness bigger than 0xFC items.
+const WITNESS_ITEM_COUNT_WEIGHT: Weight = Weight::from_wu(1);
+
 pub trait VaultDepositor {
     fn create_shape<C: Verification>(&mut self, secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError>;
 }
@@ -2186,7 +2195,7 @@ impl VaultDepositor for Wallet {
                                 .expect("this better work") // FIXME: no panics
                         })
                 })
-                .fold(shape_tx.weight() + Weight::from_wu(2), |x, y| x + y);
+                .fold(shape_tx.weight() + SEGWIT_MARKER_WEIGHT, |x, y| x + y);
 
             // FIXME: eliminate satisfaction_weight
             shape_weight = satisfaction_weight;
@@ -2230,6 +2239,7 @@ impl VaultDepositor for Wallet {
 }
 
 pub trait VaultWithdrawer {
+    /// Create a child-pays-for-parent transaction to bump a withdrawal transaciton
     fn create_cpfp<C: Verification>(&mut self, _secp: &Secp256k1<C>, withdrawal_transaction: &WithdrawalTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultWithdrawalError>;
 }
 
@@ -2280,21 +2290,20 @@ impl VaultWithdrawer for Wallet {
                             // TODO: we can do better than this, but this should be fine for now
                             derived.max_weight_to_satisfy()
                                 .expect("this better work") // FIXME: no panics
-                                + Weight::from_wu(1) // Account for lack of witness-item-count
+                                + WITNESS_ITEM_COUNT_WEIGHT
                         })
                 })
-                .fold(cpfp_psbt.unsigned_tx.weight() + Weight::from_wu(2), |x, y| x + y);
+                .fold(cpfp_psbt.unsigned_tx.weight() + SEGWIT_MARKER_WEIGHT, |x, y| x + y);
 
-            let total_weight = child_weight + parent_weight; // FIXME: added weight because our weight calc is subtly wrong, why?... maybe because of the witness marker but weight() doesn't know this is a segwit tx?
-                                                             // That may be the answer...
+            let total_weight = child_weight + parent_weight;
 
-            let minimum_fee = dbg!(fee_rate).checked_mul_by_weight(dbg!(total_weight))
+            let minimum_fee = fee_rate.checked_mul_by_weight(total_weight)
                 .ok_or(VaultWithdrawalError::FeeOverflow)?;
 
             if total_fee >= minimum_fee {
                 break Ok(cpfp_psbt)
             } else {
-                eprintln!("{total_fee} < {minimum_fee}");
+                //eprintln!("{total_fee} < {minimum_fee}");
             }
         }
     }
@@ -2873,6 +2882,7 @@ mod test {
         for (params, template) in &templates {
             assert_eq!(template.input.len(), 1);
             assert_eq!(params.previous_value, VaultAmount(0));
+            assert_eq!(params.parent_transition, None);
         }
 
         let next_templates = test_parameters.templates_at_depth(&secp, 1);
@@ -2919,7 +2929,6 @@ mod test {
                         .expect("template exists");
                     assert_eq!(template.input.len(), 2);
                     assert_eq!(template.output.len(), 1);
-                    //assert_eq!(params.previous_value, VaultAmount(0));
                 }
             }
         }
@@ -2938,7 +2947,10 @@ mod test {
                         .expect("template exists");
                     assert_eq!(template.input.len(), 1);
                     assert_eq!(template.output.len(), expected_output_count(&next));
-                    //assert_eq!(params.previous_value, VaultAmount(0));
+                    match params.parent_transition {
+                        Some(VaultTransition::Deposit(_)) => {}
+                        _ => panic!("first transition must be a deposit"),
+                    }
                 }
             }
 
@@ -2953,7 +2965,11 @@ mod test {
                         .expect("template exists");
                     assert_eq!(template.input.len(), 2);
                     assert_eq!(template.output.len(), 1);
-                    //assert_eq!(params.previous_value, VaultAmount(0));
+
+                    match params.parent_transition {
+                        Some(VaultTransition::Deposit(_)) => {}
+                        _ => panic!("first transition must be a deposit"),
+                    }
                 }
             }
         }
@@ -2973,7 +2989,6 @@ mod test {
                         .expect("template exists");
                     assert_eq!(template.input.len(), 1);
                     assert_eq!(template.output.len(), expected_output_count(&next));
-                    //assert_eq!(params.previous_value, VaultAmount(0));
                 }
             }
 
