@@ -181,6 +181,7 @@ mod test {
     #[serde(untagged)]
     enum CtvTestVectorEntry {
         TestVector(CtvTestVector),
+        #[allow(dead_code)]
         Documentation(String),
     }
 

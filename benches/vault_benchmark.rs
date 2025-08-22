@@ -1,18 +1,9 @@
 use std::str::FromStr;
-use bdk_electrum::{
-    electrum_client::ElectrumApi,
-};
-
-use bdk_wallet::KeychainKind;
-use bdk_wallet::Wallet;
 
 use bitcoin::bip32::{
     Xpub,
     Xpriv,
-    ChildNumber,
 };
-
-use std::time::Instant;
 
 use bitcoin::secp256k1::{
     Secp256k1,
@@ -20,7 +11,6 @@ use bitcoin::secp256k1::{
 
 use criterion::{
     black_box,
-    Bencher,
     criterion_group,
     criterion_main,
     Criterion

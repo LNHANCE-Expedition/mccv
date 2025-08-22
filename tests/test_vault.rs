@@ -2,7 +2,6 @@ use bdk_bitcoind_rpc::Emitter;
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
 
 use bdk_wallet::{
-    template::Bip86Public,
     template::Bip86,
     KeychainKind,
     SignOptions,
@@ -120,7 +119,7 @@ fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) 
 fn test_deposit_withdraw() {
     let secp = Secp256k1::new();
 
-    let (node, client) = get_test_node();
+    let (_node, client) = get_test_node();
 
     let (cold_xpriv, hot_xpriv) = test_xprivs(&secp, 0);
 
@@ -137,7 +136,7 @@ fn test_deposit_withdraw() {
         10,                                  // max depth
     );
 
-    let (xpriv, mut wallet) = get_test_wallet();
+    let (_xpriv, mut wallet) = get_test_wallet();
 
     let genesis_checkpoint = wallet.local_chain().get(0).expect("chain has genesis block");
 

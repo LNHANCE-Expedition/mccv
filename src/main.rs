@@ -48,8 +48,6 @@ use serde::{
 
 use std::path::PathBuf;
 
-use std::time::Instant;
-
 use mccv::{
     AccountId,
     VaultAmount,
@@ -132,6 +130,7 @@ fn read_config(path: &PathBuf) -> Configuration {
         .expect("Can't parse config")
 }
 
+#[allow(unused)]
 fn main() {
     let args = CommandLine::parse();
 

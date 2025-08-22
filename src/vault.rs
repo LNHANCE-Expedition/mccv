@@ -1,16 +1,18 @@
-use bdk_wallet::coin_selection::InsufficientFunds;
 use bdk_wallet::error::CreateTxError;
 use bdk_wallet::{Wallet, KeychainKind};
 
 use bitcoin::{TapSighashType, TapLeafHash};
-use bitcoin::psbt::raw::Key;
 use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch, TaprootSpendInfo};
+
+#[cfg(feature = "bitcoind")]
 use bitcoin::consensus::encode::serialize_hex;
+
 use bitcoin::hashes::{
     Hash,
     sha256,
 };
 
+#[cfg(feature = "bitcoind")]
 use bitcoin::consensus::Encodable;
 
 #[cfg(feature = "bitcoind")]
@@ -36,7 +38,6 @@ use bitcoin::secp256k1::{
     Message,
     PublicKey,
     Secp256k1,
-    SecretKey,
     Signing,
     Verification,
     XOnlyPublicKey,
@@ -69,15 +70,9 @@ use bitcoin::{
         LeafVersion,
         TaprootBuilder,
     },
-    TapTweakHash,
     VarInt,
     Weight,
     Witness,
-};
-
-use rand::{
-    RngCore,
-    thread_rng,
 };
 
 use rayon::iter::{
@@ -85,6 +80,7 @@ use rayon::iter::{
     ParallelIterator,
 };
 
+#[allow(unused_imports)]
 use rusqlite::{
     Connection,
     params,
@@ -324,22 +320,6 @@ pub struct VaultStateParameters {
 }
 
 impl VaultStateParameters {
-    fn get_vault_output_index(&self) -> Option<usize> {
-        if self.get_result_value() == VaultAmount::ZERO {
-            None
-        } else {
-            Some(0)
-        }
-    }
-
-    // XXX: Assumes we never construct an invalid parameter set! Must enforce this!
-    fn get_result_value(&self) -> VaultAmount {
-        match self.transition {
-            VaultTransition::Deposit(deposit_amount) => self.previous_value + deposit_amount,
-            VaultTransition::Withdrawal(withdrawal_amount) => self.previous_value - withdrawal_amount,
-        }
-    }
-
     fn get_result(&self) -> Option<(VaultAmount, VaultAmount)> {
         match self.transition {
             VaultTransition::Deposit(value) => Some((self.previous_value + value, VaultAmount(0))),
@@ -362,6 +342,7 @@ impl VaultStateParameters {
         }
     }
 
+    #[allow(dead_code)]
     fn next(&self, transition: VaultTransition, max: VaultAmount) -> Option<Self> {
         self.result_state_value()
             .and_then(|current_value| {
@@ -398,11 +379,11 @@ impl VaultStateParameters {
 
     fn assert_valid(&self) {
         match self.transition {
-            _ => {},
             VaultTransition::Withdrawal(amount) => {
                 assert!(self.previous_value.nonzero());
                 assert!(amount <= self.previous_value);
             }
+            _ => {},
         }
     }
 }
@@ -849,7 +830,7 @@ impl VaultParameters {
         }
     }
 
-    fn lock_time_for_deposit(&self, amount: &VaultAmount) -> RelativeLockTime {
+    fn lock_time_for_deposit(&self, _amount: &VaultAmount) -> RelativeLockTime {
         RelativeLockTime::ZERO
     }
 
@@ -920,6 +901,7 @@ impl VaultParameters {
         Some(parameters)
     }
 
+    #[allow(dead_code)]
     fn history_to_parameters(&self, tx: &VaultTransaction, parent_tx: Option<&VaultTransaction>, depth: Depth) -> Option<VaultStateParameters> {
         let previous_value = tx.result_value.apply_transition(
             tx.transition.invert(),
@@ -1009,7 +991,7 @@ impl VaultParameters {
     fn dummy_inputs(&self, depth: Depth, parameter: &VaultStateParameters) -> Vec<TxIn> {
         let lock_time = match parameter.parent_transition {
             Some(VaultTransition::Deposit(amount)) => self.lock_time_for_deposit(&amount),
-            Some(VaultTransition::Withdrawal(amount)) => self.lock_time_for_deposit(&amount),
+            Some(VaultTransition::Withdrawal(amount)) => self.lock_time_for_withdrawal(&amount),
             None => RelativeLockTime::ZERO,
         };
 
@@ -1061,22 +1043,10 @@ impl VaultParameters {
     }
 }
 
-// Struct members are the outpoints
-enum VaultOutpoints {
-    Deposit(VaultAmount),
-    /// Any withdrawal that does not completely drain the vault
-    /// .0 is the vault outpoint
-    /// .1 is the withdrawal outpoint
-    Withdrawal(VaultAmount, VaultAmount),
-    /// A sweep of a withdrawal to recovery
-    Recovery(VaultAmount),
-    /// A sweep of the vault to recovery location
-    Close(VaultAmount),
-}
-
 pub struct VaultTransaction {
     txid: Txid,
     vout: Option<u32>,
+    #[allow(dead_code)]
     depth: Depth,
     transition: VaultTransition,
     result_value: VaultAmount,
@@ -1203,20 +1173,6 @@ impl DerefMut for SqliteVaultStorage {
     }
 }
 
-#[derive(Clone)]
-pub struct DepositTransactions {
-    pub shape_transaction: Psbt,
-    pub deposit_transaction: Transaction,
-}
-
-impl DepositTransactions {
-    pub fn extract(self) -> Result<(Transaction, Transaction), psbt::ExtractTxError> {
-        self.shape_transaction
-            .extract_tx()
-            .map(|shape_transaction| (shape_transaction, self.deposit_transaction))
-    }
-}
-
 #[cfg(feature = "bitcoind")]
 pub fn package_encodable<E, I>(iter: I) -> serde_json::Value
 where
@@ -1227,15 +1183,6 @@ where
         .into_iter()
         .map(|e| serialize_hex(&e))
         .collect()
-}
-
-impl std::fmt::Debug for DepositTransactions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "shape txid = {}", self.shape_transaction.unsigned_tx.compute_txid())?;
-        writeln!(f, "shape tx = {:?}", self.shape_transaction.unsigned_tx)?;
-        writeln!(f, "deposit txid = {}", self.deposit_transaction.compute_txid())?;
-        writeln!(f, "deposit tx = {:?}", self.deposit_transaction)
-    }
 }
 
 #[derive(Clone,Hash,Eq,PartialEq)]
@@ -1254,10 +1201,6 @@ impl SignedNextStateTemplate {
             .push_x_only_key(&self.pubkey)
             .push_opcode(OP_CHECKSIG)
             .into_script()
-    }
-
-    fn into_scriptbuf(self) -> ScriptBuf {
-        self.to_scriptbuf()
     }
 }
 
@@ -1320,6 +1263,7 @@ pub enum WithdrawalSignError {
 pub struct WithdrawalTransaction {
     transaction: Transaction,
     depth: Depth,
+    #[allow(dead_code)]
     amount: Amount,
     vault_total: VaultAmount,
     vault_withdrawal: VaultAmount,
@@ -1572,6 +1516,7 @@ impl DepositTransaction {
 }
 
 pub struct Vault {
+    #[allow(dead_code)]
     id: VaultId,
     parameters: VaultParameters,
     history: Vec<(VaultTransaction, Option<(u32, BlockHash)>)>,
@@ -1611,6 +1556,7 @@ impl Vault {
         })
     }
 
+    #[allow(unused)]
     pub fn load(id: VaultId, storage: &mut SqliteVaultStorage) -> Result<Self, rusqlite::Error> {
         let _vault_id = storage.query_row("select (id) from mccv_vault", params![id], |row: &Row| -> rusqlite::Result<i64> { row.get(0) })?;
 
@@ -2043,10 +1989,8 @@ impl Vault {
         let result_vault_total = current_vault_amount.apply_transition(transition, None)
             .ok_or(VaultWithdrawalError::InsufficientFunds)?;
 
-        let (spend_info, mut withdrawal_template) = self.withdrawal_transaction_template(secp, withdrawal_amount)
+        let (spend_info, withdrawal_template) = self.withdrawal_transaction_template(secp, withdrawal_amount)
             .ok_or(VaultWithdrawalError::VaultClosed)?;
-
-        let vault_input_template_hash = get_default_template(&withdrawal_template, 0);
 
         let branch = spend_info.branches.get(&VaultOutputSpendCondition::Withdrawal(withdrawal_amount))
             .ok_or(VaultWithdrawalError::InvalidWithdrawalAmount)?;
