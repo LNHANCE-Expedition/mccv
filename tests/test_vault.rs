@@ -157,7 +157,7 @@ fn test_deposit_withdraw() {
     let mut total_deposit = Amount::ZERO;
     let deposit_amount_raw = VAULT_SCALE * 3;
     total_deposit += deposit_amount_raw;
-    let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw);
+    let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw).expect("valid vault amount");
     assert_eq!(remainder, Amount::ZERO);
 
     let mut deposit_transaction = vault.create_deposit(&secp, deposit_amount).unwrap();
@@ -167,7 +167,8 @@ fn test_deposit_withdraw() {
     let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
         .expect("create shape success");
 
-    let transmittable_deposit_transaction = deposit_transaction.to_transaction().expect("initial deposit doesn't require signing");
+    let transmittable_deposit_transaction = deposit_transaction.to_signed_transaction()
+        .expect("initial deposit doesn't require signing");
 
     let sign_success = wallet.sign(&mut shape_psbt, SignOptions::default())
         .expect("sign success");
@@ -187,7 +188,7 @@ fn test_deposit_withdraw() {
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(result.get("package_msg"), Some(&"success".into()));
+    assert_eq!(result.get("package_msg"), Some(&"success".into()), "{:?}", result);
 
     let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
         .expect("shape tx in mempool");
@@ -207,7 +208,7 @@ fn test_deposit_withdraw() {
 
     assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
 
-    vault.add_deposit_transaction(&deposit_transaction)
+    vault.add_transaction(deposit_transaction.into())
         .expect("deposit transaction should add cleanly");
 
     update_vault(&mut vault, &mut vault_block_emitter);
@@ -217,7 +218,7 @@ fn test_deposit_withdraw() {
     // ============ Deposit 2 ============ 
     let deposit_amount_raw = VAULT_SCALE * 2;
     total_deposit += deposit_amount_raw;
-    let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw);
+    let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw).expect("valid vault amount");
     assert_eq!(remainder, Amount::ZERO);
 
     let mut deposit_transaction = vault.create_deposit(&secp, deposit_amount).unwrap();
@@ -236,10 +237,10 @@ fn test_deposit_withdraw() {
     let hot_keypair = deposit_transaction.hot_keypair(&secp, &hot_xpriv)
         .expect("successful key derivation");
 
-    let _ = deposit_transaction.sign(&secp, &hot_keypair)
+    let _ = deposit_transaction.sign_vault_input(&secp, &hot_keypair)
         .expect("sign success");
 
-    let transmittable_deposit_transaction = deposit_transaction.to_transaction().expect("deposit transaction signed");
+    let transmittable_deposit_transaction = deposit_transaction.to_signed_transaction().expect("deposit transaction signed");
 
     //eprintln!("tx {} = {shape_transaction:?}", shape_transaction.compute_txid());
     //eprintln!("tx {} = {:?}", transmittable_deposit_transaction.compute_txid(), &transmittable_deposit_transaction);
@@ -256,7 +257,7 @@ fn test_deposit_withdraw() {
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
     assert_eq!(result.get("package_msg"), Some(&"success".into()));
 
-    vault.add_deposit_transaction(&deposit_transaction)
+    vault.add_transaction(deposit_transaction.into())
         .expect("deposit transaction should add cleanly");
 
     generate_to_wallet(&mut wallet, &client, 6);
@@ -274,7 +275,7 @@ fn test_deposit_withdraw() {
     // ============ Withdrawal 2 ============ 
     let withdrawal_amount_raw = VAULT_SCALE * 3;
     total_deposit -= withdrawal_amount_raw;
-    let (withdrawal_amount, remainder) = vault.to_vault_amount(withdrawal_amount_raw);
+    let (withdrawal_amount, remainder) = vault.to_vault_amount(withdrawal_amount_raw).expect("valid vault amount");
     assert_eq!(remainder, Amount::ZERO);
 
     let mut withdrawal_transaction = vault.create_withdrawal(&secp, withdrawal_amount)
@@ -292,14 +293,14 @@ fn test_deposit_withdraw() {
     let hot_keypair = withdrawal_transaction.hot_keypair(&secp, &hot_xpriv)
         .expect("successful key derivation");
 
-    withdrawal_transaction.sign(&secp, &hot_keypair)
+    withdrawal_transaction.sign_vault_input(&secp, &hot_keypair)
         .expect("can sign withdrawal");
 
-    vault.add_withdrawal_transaction(&withdrawal_transaction)
-        .expect("can add withdrawal");
-
-    let transmittable_withdrawal_transaction = withdrawal_transaction.to_transaction()
+    let transmittable_withdrawal_transaction = withdrawal_transaction.to_signed_transaction()
         .expect("signed tx");
+
+    vault.add_transaction(withdrawal_transaction.into())
+        .expect("can add withdrawal");
 
     client.send_raw_transaction(&transmittable_withdrawal_transaction)
         .expect_err("can't broadcast withdrawal without a cpfp");
@@ -314,7 +315,7 @@ fn test_deposit_withdraw() {
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(result.get("package_msg"), Some(&"success".into()));
+    assert_eq!(result.get("package_msg"), Some(&"success".into()), "{:?}", result);
 
     let unspendable_key = XOnlyPublicKey::from_slice(&[1; 32]).unwrap();
     let unspendable_address = Address::p2tr(&secp, unspendable_key, None, Network::Regtest);
@@ -323,6 +324,8 @@ fn test_deposit_withdraw() {
 
     update_vault(&mut vault, &mut vault_block_emitter);
     assert_eq!(vault.get_confirmed_balance(), total_deposit);
+
+
 
     todo!("complete withdrawal by either spending it to the BDK wallet, or somehow informing BDK how to spend the timelocked withdrawal output")
 }
