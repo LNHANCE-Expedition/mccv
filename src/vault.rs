@@ -1,28 +1,7 @@
-use bdk_wallet::error::CreateTxError;
-use bdk_wallet::{Wallet, KeychainKind};
-
-use bitcoin::{TapSighashType, TapLeafHash};
-use bitcoin::taproot::{ControlBlock, TaprootMerkleBranch, TaprootSpendInfo};
-
-#[cfg(feature = "bitcoind")]
-use bitcoin::consensus::encode::serialize_hex;
-
-use bitcoin::hashes::{
-    Hash,
-    sha256,
-};
-
-#[cfg(feature = "bitcoind")]
-use bitcoin::consensus::Encodable;
-
-#[cfg(feature = "bitcoind")]
-use bitcoin::Block;
-
-use bitcoin::opcodes::all::{
-    OP_CSV,
-    OP_CHECKSIG,
-    OP_NOP4 as OP_CHECKTEMPLATEVERIFY,
-    OP_DROP,
+use bdk_wallet::{
+    error::CreateTxError,
+    Wallet,
+    KeychainKind
 };
 
 use bitcoin::bip32::{
@@ -30,6 +9,24 @@ use bitcoin::bip32::{
     Xpub,
     ChildNumber,
     DerivationPath,
+};
+
+#[cfg(feature = "bitcoind")]
+use bitcoin::Block;
+
+#[cfg(feature = "bitcoind")]
+use bitcoin::consensus::{Encodable, encode::serialize_hex};
+
+use bitcoin::hashes::{
+    Hash,
+    sha256,
+};
+
+use bitcoin::opcodes::all::{
+    OP_CSV,
+    OP_CHECKSIG,
+    OP_NOP4 as OP_CHECKTEMPLATEVERIFY,
+    OP_DROP,
 };
 
 use bitcoin::secp256k1::{
@@ -41,6 +38,14 @@ use bitcoin::secp256k1::{
     Signing,
     Verification,
     XOnlyPublicKey,
+};
+
+use bitcoin::taproot::{
+    ControlBlock,
+    LeafVersion,
+    TaprootBuilder,
+    TaprootMerkleBranch,
+    TaprootSpendInfo,
 };
 
 use bitcoin::{
@@ -57,19 +62,18 @@ use bitcoin::{
     relative::LockTime as RelativeLockTime,
     ScriptBuf,
     Script,
+    TapLeafHash,
     TapNodeHash,
+    taproot,
+    TapSighashType,
     Transaction,
     Txid,
-    transaction::TxIn,
-    transaction::TxOut,
+    TxIn,
+    TxOut,
     script::Builder,
     sighash::Prevouts,
     sighash::SighashCache,
     sighash,
-    taproot::{
-        LeafVersion,
-        TaprootBuilder,
-    },
     VarInt,
     Weight,
     Witness,
@@ -96,6 +100,7 @@ use serde::{
     Serialize,
 };
 
+use std::borrow::Borrow;
 use std::iter;
 
 use std::collections::HashMap;
@@ -346,34 +351,12 @@ impl VaultStateParameters {
     fn next(&self, transition: VaultTransition, max: VaultAmount) -> Option<Self> {
         self.result_state_value()
             .and_then(|current_value| {
-                match transition {
-                    VaultTransition::Deposit(deposit_value) => {
-                        if current_value + deposit_value <= max {
-                            Some(
-                                Self {
-                                    transition,
-                                    previous_value: current_value,
-                                    parent_transition: Some(self.transition),
-                                }
-                            )
-                        } else {
-                            None
-                        }
-                    }
-                    VaultTransition::Withdrawal(withdrawal_value) => {
-                        if current_value >= withdrawal_value {
-                            Some(
-                                Self {
-                                    transition,
-                                    previous_value: current_value,
-                                    parent_transition: Some(self.transition),
-                                }
-                            )
-                        } else {
-                            None
-                        }
-                    }
-                }
+                current_value.apply_transition(transition, Some(max))
+                    .map(|_| Self {
+                        transition,
+                        previous_value: current_value,
+                        parent_transition: Some(self.transition),
+                    })
             })
     }
 
@@ -483,6 +466,13 @@ impl VaultKeyDerivationPathTemplate {
         ]
         .into()
     }
+}
+
+#[derive(Debug)]
+enum HistoryToParametersError {
+    InvalidParentDepth,
+    InvalidParameters,
+    InconsistentParameters,
 }
 
 impl VaultParameters {
@@ -756,11 +746,10 @@ impl VaultParameters {
         }
     }
 
-    // FIXME: should have a starting amount to calculate this
     fn spend_condition_weight(&self, condition: &VaultOutputSpendCondition) -> u32 {
         (match condition {
-            VaultOutputSpendCondition::Deposit(amount) => amount.to_unscaled_amount(),
-            VaultOutputSpendCondition::Withdrawal(amount) => amount.to_unscaled_amount(),
+            VaultOutputSpendCondition::Deposit(amount) => (self.max_deposit_per_step - *amount).to_unscaled_amount(),
+            VaultOutputSpendCondition::Withdrawal(amount) => (self.max_withdrawal_per_step - *amount).to_unscaled_amount(),
             VaultOutputSpendCondition::Recovery {..} => 0,
         }) + 1
     }
@@ -859,6 +848,10 @@ impl VaultParameters {
             return None;
         }
 
+        if depth == 0 && parameters.parent_transition.is_some() {
+            return None;
+        }
+
         match parameters.parent_transition {
             Some(VaultTransition::Deposit(amount)) => {
                 if depth == 0 {
@@ -892,6 +885,10 @@ impl VaultParameters {
                 }
             }
             VaultTransition::Withdrawal(withdrawal_amount) => {
+                if depth == 0 {
+                    return None;
+                }
+
                 if parameters.previous_value < withdrawal_amount {
                     return None;
                 }
@@ -899,27 +896,6 @@ impl VaultParameters {
         }
 
         Some(parameters)
-    }
-
-    #[allow(dead_code)]
-    fn history_to_parameters(&self, tx: &VaultTransaction, parent_tx: Option<&VaultTransaction>, depth: Depth) -> Option<VaultStateParameters> {
-        let previous_value = tx.result_value.apply_transition(
-            tx.transition.invert(),
-            Some(self.max),
-        );
-
-        if let Some(previous_value) = previous_value {
-            self.validate_parameters(
-                VaultStateParameters {
-                    transition: tx.transition,
-                    previous_value,
-                    parent_transition: parent_tx.map(|tx| tx.transition),
-                },
-                depth,
-            )
-        } else {
-            None
-        }
     }
 
     // FIXME: don't like that we generate *more* transitions than we need then filter, but oh
@@ -962,9 +938,6 @@ impl VaultParameters {
                 )
                 .collect()
         } else {
-            // FIXME: I'd love to avoid the collect...
-            // Since I gave up on returning an iterator maybe I can?...
-            // FIXME: might actually have a chance now...
             self.iter_tail_transitions()
                 .flat_map(|transition| {
                     self.iter_tail_transitions()
@@ -1078,6 +1051,16 @@ impl VaultTransaction {
                 }
             })
     }
+
+    /// Create parameters representing the child transaction with the given transition
+    /// Does not validate the resulting parameters against the Vault's constraints
+    pub fn to_child_parameters(&self, transition: VaultTransition) -> VaultStateParameters {
+        VaultStateParameters {
+            transition,
+            previous_value: self.result_value,
+            parent_transition: Some(self.transition),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1088,11 +1071,13 @@ pub enum VaultInitializationError {
 
 #[derive(Debug)]
 pub enum VaultDepositError {
-    // FIXME: don't use bdk_wallet in your interface?
     InsufficientFunds,
     InvalidDepositAmount,
+    // FIXME: don't use bdk_wallet in your interface?
     TransactionBuildError(CreateTxError),
     VaultClosed,
+    /// Vault has used all of its available operations, use the cold key to move to a new vault
+    VaultExpired,
     VaultOverflow(VaultAmount),
 }
 
@@ -1228,6 +1213,32 @@ struct VaultOutputSigningInfo {
     script: ScriptBuf,
 }
 
+impl VaultOutputSigningInfo {
+    fn sign<C: Signing, T: Borrow<TxOut>>(&self, secp: &Secp256k1<C>, keypair: &Keypair, transaction: &Transaction, prevouts: &Prevouts<T>) -> Result<taproot::Signature, sighash::TaprootError> {
+        let tap_leaf_hash = TapLeafHash::from_script(self.script.as_ref(), LeafVersion::TapScript);
+        let sighash = SighashCache::new(transaction)
+            .taproot_signature_hash(0, prevouts, None, Some((tap_leaf_hash, 0xFFFFFFFF)), TapSighashType::Default)?;
+
+        // FIXME: seems like there should be shortcuts for a couple of these things?
+        let message: Message = sighash.into();
+        let signature = secp.sign_schnorr(&message, keypair);
+
+        Ok(taproot::Signature {
+            signature,
+            sighash_type: TapSighashType::Default,
+        })
+    }
+
+    pub fn build_witness(&self, signature: taproot::Signature) -> Witness {
+        let mut witness = Witness::new();
+        witness.push(signature.to_vec());
+        witness.push(&self.script);
+        witness.push(self.control_block.serialize());
+
+        witness
+    }
+}
+
 pub struct VaultOutputSpendInfo {
     spend_info: TaprootSpendInfo,
     output: TxOut,
@@ -1354,31 +1365,15 @@ impl WithdrawalTransaction {
             &self.signing_info.0.vault_prevout,
         ];
 
-        // TODO: factor out
         // TODO: also check that we actually satisfy the script, probably facilitated by hanging
         // onto the script template instead of the serialized ScriptBuf
         let prevouts = Prevouts::All(&prevout_txouts);
 
-        let tap_leaf_hash = TapLeafHash::from_script(self.signing_info.0.script.as_ref(), LeafVersion::TapScript);
-        let sighash = SighashCache::new(&self.transaction)
-            .taproot_signature_hash(0, &prevouts, None, Some((tap_leaf_hash, 0xFFFFFFFF)), TapSighashType::Default)
+        let signature = self.signing_info.0.sign(secp, keypair, &self.transaction, &prevouts)
             .map_err(|e| WithdrawalSignError::SighashError(e))?;
 
-        // FIXME: seems like there should be shortcuts for a couple of these things?
-        let message: Message = sighash.into();
-        let signature = secp.sign_schnorr(&message, keypair);
+        self.transaction.input[0].witness = self.signing_info.0.build_witness(signature);
 
-        let signature = bitcoin::taproot::Signature {
-            signature,
-            sighash_type: TapSighashType::Default,
-        };
-
-        let mut witness = Witness::new();
-        witness.push(signature.to_vec());
-        witness.push(&self.signing_info.0.script);
-        witness.push(self.signing_info.0.control_block.serialize());
-
-        self.transaction.input[0].witness = witness;
         self.signing_info.1 = true;
 
         Ok(())
@@ -1441,6 +1436,8 @@ impl DepositTransaction {
     pub fn sign<C: Signing>(&mut self, secp: &Secp256k1<C>, keys: &Keypair) -> Result<(), DepositSignError> {
         match &mut self.signing_info {
             Some((signing_info, signed)) => {
+                assert!(self.transaction.input.len() == 2);
+
                 let prevout_txouts = vec![
                     &signing_info.vault_prevout,
                     self.txout
@@ -1450,28 +1447,11 @@ impl DepositTransaction {
 
                 let prevouts = Prevouts::All(&prevout_txouts);
 
-                // TODO: factor out
-                let tap_leaf_hash = TapLeafHash::from_script(signing_info.script.as_ref(), LeafVersion::TapScript);
-                let sighash = SighashCache::new(&self.transaction)
-                    .taproot_signature_hash(0, &prevouts, None, Some((tap_leaf_hash, 0xFFFFFFFF)), TapSighashType::Default)
+                let signature = signing_info.sign(secp, keys, &self.transaction, &prevouts)
                     .map_err(|e| DepositSignError::SighashError(e))?;
 
-                // FIXME: seems like there should be shortcuts for a couple of these things?
-                let message: Message = sighash.into();
-                let signature = secp.sign_schnorr(&message, keys);
 
-                let signature = bitcoin::taproot::Signature {
-                    signature,
-                    sighash_type: TapSighashType::Default,
-                };
-
-                let mut witness = Witness::new();
-                witness.push(signature.to_vec());
-                witness.push(&signing_info.script);
-                witness.push(signing_info.control_block.serialize());
-
-                assert!(self.transaction.input.len() == 2);
-                self.transaction.input[0].witness = witness;
+                self.transaction.input[0].witness = signing_info.build_witness(signature);
 
                 *signed = true;
 
@@ -1591,7 +1571,6 @@ impl Vault {
         todo!()
     }
 
-    // FIXME: and parent utxo scripts
     pub fn deposit_transaction_template<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Option<(Option<VaultOutputSpendInfo>, Transaction)> {
         let depth = self.get_current_depth();
 
@@ -1640,43 +1619,8 @@ impl Vault {
             }
         });
 
-        let second_to_last_history_tx = if self.history.len() >= 2 {
-            Some(&self.history[self.history.len() - 2].0)
-        } else {
-            None
-        };
-
-        let parent_parameters = match (self.history.last(), second_to_last_history_tx) {
-            (Some((parent_tx, _confirmations)), Some(grandparent_tx)) => {
-                debug_assert!(
-                    grandparent_tx.result_value == parent_tx
-                        .result_value
-                        .apply_transition(
-                            parent_tx.transition.invert(),
-                            Some(self.parameters.max),
-                        ).unwrap()
-                );
-
-                let parent_parameters = parent_tx.into_parameters(
-                    Some(grandparent_tx.transition),
-                    Some(self.parameters.max)
-                );
-                debug_assert!(parent_parameters.is_some());
-                parent_parameters
-            }
-            (Some((parent_tx, _confirmations)), None) => {
-                let parent_parameters = parent_tx.into_parameters(
-                    None,
-                    Some(self.parameters.max)
-                );
-                debug_assert!(parent_parameters.is_some());
-                parent_parameters
-            }
-            (None, None) => None,
-            (None, Some(_)) => unreachable!("can't have a grandparent without a parent"),
-        };
-
-        let spend_info = parent_parameters
+        let spend_info = self.last_state_parameters()
+            .expect("transaction history must always be valid")
             .map(|parent_parameters| {
                 debug_assert!(depth > 0, "Depth 0 has no ancestors");
 
@@ -1767,6 +1711,24 @@ impl Vault {
     //  FIXME: return value should probably also have some kind of token for keeping track of
     //  replacements, preventing invalid deposit transactions from being tracked
     pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Result<DepositTransaction, VaultDepositError> {
+        let current_vault_amount = self.history.last()
+            .map(|(tx, _)| tx.result_value)
+            .unwrap_or(VaultAmount::ZERO);
+
+        // Ensure vault_total <= self.parameters.max
+        let vault_total = current_vault_amount + deposit_amount;
+        let overflow_amount = vault_total
+            .checked_sub(self.parameters.max);
+
+        if deposit_amount > self.parameters.max_deposit_per_step {
+            return Err(VaultDepositError::InvalidDepositAmount);
+        }
+
+        if let Some(overflow_amount) = overflow_amount {
+            if overflow_amount > VaultAmount::ZERO {
+                return Err(VaultDepositError::VaultOverflow(overflow_amount));
+            }
+        }
         let (spend_info, mut deposit_template) = self.deposit_transaction_template(secp, deposit_amount)
             .ok_or(VaultDepositError::VaultClosed)?;
 
@@ -1825,7 +1787,6 @@ impl Vault {
                 .branches
                 .get(&VaultOutputSpendCondition::Deposit(deposit_amount))
                 .expect("spend condition should exist");
-            // FIXME: I think this is an invalid assumption, caller could give bad deposit amount, return error instead
 
             let control_block = spend_info.spend_info.control_block(&(
                     branch.to_scriptbuf(),
@@ -1854,20 +1815,6 @@ impl Vault {
             None
         };
 
-        let current_vault_amount = self.history.last()
-            .map(|(tx, _)| tx.result_value)
-            .unwrap_or(VaultAmount::ZERO);
-
-        // Ensure vault_total <= self.parameters.max
-        let vault_total = current_vault_amount + deposit_amount;
-        let overflow_amount = vault_total
-            .checked_sub(self.parameters.max);
-        if let Some(overflow_amount) = overflow_amount {
-            if overflow_amount > VaultAmount::ZERO {
-                return Err(VaultDepositError::VaultOverflow(overflow_amount));
-            }
-        }
-
         Ok(
             DepositTransaction {
                 depth: self.get_current_depth(),
@@ -1882,6 +1829,55 @@ impl Vault {
         )
     }
 
+    // FIXME: consider how much validation we want to do here. Maybe we should just ensure
+    // self.history is always valid
+    fn history_to_parameters(&self, tx: &VaultTransaction, parent_tx: Option<&VaultTransaction>) -> Result<VaultStateParameters, HistoryToParametersError> {
+        let parameters = tx.into_parameters(
+            parent_tx.map(|tx| tx.transition),
+            Some(self.parameters.max)
+        )
+        .and_then(|parameters| self.parameters.validate_parameters(parameters, tx.depth))
+        .ok_or(HistoryToParametersError::InvalidParameters)?;
+
+        if let Some(parent_tx) = parent_tx {
+            if parent_tx.depth + 1 != tx.depth {
+                return Err(HistoryToParametersError::InvalidParentDepth);
+            }
+
+            let expected_parent_result_value = tx
+                .result_value
+                .apply_transition(
+                    tx.transition.invert(),
+                    Some(self.parameters.max),
+                );
+
+            if let Some(expected_value) = expected_parent_result_value {
+                if expected_value != parent_tx.result_value {
+                    return Err(HistoryToParametersError::InconsistentParameters);
+                }
+            } else {
+                return Err(HistoryToParametersError::InvalidParameters);
+            }
+        }
+
+        Ok(parameters)
+    }
+
+    fn last_state_parameters(&self) -> Result<Option<VaultStateParameters>, HistoryToParametersError> {
+        let parent_tx = if self.history.len() >= 2 {
+            Some(&self.history[self.history.len() - 2].0)
+        } else {
+            None
+        };
+
+        if let Some((ref tx, _)) = self.history.last() {
+            self.history_to_parameters(tx, parent_tx)
+                .map(|parameters| Some(parameters))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn withdrawal_transaction_template<C: Verification>(&self, secp: &Secp256k1<C>, withdrawal_amount: VaultAmount) -> Option<(VaultOutputSpendInfo, Transaction)> {
         let depth = self.get_current_depth();
 
@@ -1889,12 +1885,7 @@ impl Vault {
 
         let outpoint = last_vault_transaction.outpoint()?;
 
-        // TODO: factor out
-        let parameters = VaultStateParameters {
-            transition: VaultTransition::Withdrawal(withdrawal_amount),
-            previous_value: last_vault_transaction.result_value,
-            parent_transition: Some(last_vault_transaction.transition),
-        };
+        let parameters = last_vault_transaction.to_child_parameters(VaultTransition::Withdrawal(withdrawal_amount));
 
         let transactions = self.parameters.templates_at_depth(secp, depth);
 
@@ -1902,44 +1893,8 @@ impl Vault {
 
         withdrawal.input[0].previous_output = outpoint;
 
-        // TODO: factor out
-        let second_to_last_history_tx = if self.history.len() >= 2 {
-            Some(&self.history[self.history.len() - 2].0)
-        } else {
-            None
-        };
-
-        let parent_parameters = match (self.history.last(), second_to_last_history_tx) {
-            (Some((parent_tx, _confirmations)), Some(grandparent_tx)) => {
-                debug_assert!(
-                    grandparent_tx.result_value == parent_tx
-                        .result_value
-                        .apply_transition(
-                            parent_tx.transition.invert(),
-                            Some(self.parameters.max),
-                        ).unwrap()
-                );
-
-                let parent_parameters = parent_tx.into_parameters(
-                    Some(grandparent_tx.transition),
-                    Some(self.parameters.max)
-                );
-                debug_assert!(parent_parameters.is_some());
-                parent_parameters
-            }
-            (Some((parent_tx, _confirmations)), None) => {
-                let parent_parameters = parent_tx.into_parameters(
-                    None,
-                    Some(self.parameters.max)
-                );
-                debug_assert!(parent_parameters.is_some());
-                parent_parameters
-            }
-            (None, None) => None,
-            (None, Some(_)) => unreachable!("can't have a grandparent without a parent"),
-        };
-
-        let spend_info = parent_parameters
+        let spend_info = self.last_state_parameters()
+            .expect("transaction history must always be valid")
             .map(|parent_parameters| {
                 debug_assert!(depth > 0, "Depth 0 has no ancestors");
 
@@ -2123,7 +2078,7 @@ impl VaultDepositor for Wallet {
             let shape_tx = &shape_psbt.unsigned_tx;
 
             let index = self.spk_index();
-            let satisfaction_weight = shape_tx
+            shape_weight = shape_tx
                 .input
                 .iter()
                 .flat_map(|txin| {
@@ -2142,22 +2097,19 @@ impl VaultDepositor for Wallet {
                 })
                 .fold(shape_tx.weight() + SEGWIT_MARKER_WEIGHT, |x, y| x + y);
 
-            // FIXME: eliminate satisfaction_weight
-            shape_weight = satisfaction_weight;
-
-            let total_weight = shape_weight + deposit_weight;// + Weight::from_wu(4); // FIXME: trying to fix weight
-            let min_fee = fee_rate.checked_mul_by_weight(total_weight)
+            let total_weight = shape_weight + deposit_weight;
+            let minimum_fee = fee_rate.checked_mul_by_weight(total_weight)
                 .expect("fee shouldn't overflow"); // FIXME: eliminate panic potential
 
-            if fee_amount >= min_fee {
+            if fee_amount >= minimum_fee {
                 break shape_psbt;
             }
 
             // Update the absolute fee we must supply
-            fee_amount = if fee_amount >= min_fee {
+            fee_amount = if fee_amount >= minimum_fee {
                 fee_amount
             } else {
-                min_fee
+                minimum_fee
             };
         };
 
@@ -2373,6 +2325,165 @@ mod test {
                 ),
             None,
         );
+    }
+
+    #[test]
+    fn test_history_to_parameters() {
+        let secp = Secp256k1::new();
+        let (cold_xpriv, hot_xpriv) = test_xprivs(&secp, 0);
+
+        let parameters = VaultParameters {
+            scale: VaultScale::from_sat(100_000_000),
+            max: VaultAmount::new(10),
+            cold_xpub: Xpub::from_priv(&secp, &cold_xpriv), //
+            hot_xpub: Xpub::from_priv(&secp, &hot_xpriv),  //
+            delay_per_increment: 36,
+            max_withdrawal_per_step: VaultAmount::new(3),
+            max_deposit_per_step: VaultAmount::new(3),
+            max_depth: 10,
+        };
+
+        let dummy_txid = Txid::from_byte_array([0; 32]);
+
+        let vault = Vault {
+            id: 0,
+            parameters,
+            history: Vec::new(),
+        };
+
+        let result_parameters = vault.history_to_parameters(
+            &VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 0,
+                transition: VaultTransition::Withdrawal(VaultAmount(1)),
+                result_value: VaultAmount(0),
+            },
+            Some(&VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 0,
+                transition: VaultTransition::Deposit(VaultAmount(1)),
+                result_value: VaultAmount(1),
+            }),
+        );
+
+        result_parameters.expect_err("Gen 0 has no parents");
+
+        let result_parameters = vault.history_to_parameters(
+            &VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 0,
+                transition: VaultTransition::Withdrawal(VaultAmount(1)),
+                result_value: VaultAmount(0),
+            },
+            None,
+        );
+
+        result_parameters.expect_err("Gen 0 can't be a withdrawal");
+
+        let result_parameters = vault.history_to_parameters(
+            &VaultTransaction {
+                txid: dummy_txid,
+                vout: None,
+                depth: 1,
+                transition: VaultTransition::Withdrawal(VaultAmount(1)),
+                result_value: VaultAmount(0),
+            },
+            Some(&VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 0,
+                transition: VaultTransition::Deposit(VaultAmount(1)),
+                result_value: VaultAmount(1),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result_parameters,
+            VaultStateParameters {
+                transition: VaultTransition::Withdrawal(VaultAmount(1)),
+                previous_value: VaultAmount(1),
+                parent_transition: Some(VaultTransition::Deposit(VaultAmount(1))),
+            },
+        );
+
+        let result_parameters = vault.history_to_parameters(
+            &VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 1,
+                transition: VaultTransition::Withdrawal(VaultAmount(2)),
+                result_value: VaultAmount(0),
+            },
+            Some(&VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 0,
+                transition: VaultTransition::Deposit(VaultAmount(1)),
+                result_value: VaultAmount(1),
+            }),
+        );
+
+        result_parameters.expect_err("Can't withdraw more than vault total");
+
+        let result_parameters = vault.history_to_parameters(
+            &VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 1,
+                transition: VaultTransition::Withdrawal(VaultAmount(1)),
+                result_value: VaultAmount(1),
+            },
+            Some(&VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 0,
+                transition: VaultTransition::Deposit(VaultAmount(2)),
+                result_value: VaultAmount(2),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result_parameters,
+            VaultStateParameters {
+                transition: VaultTransition::Withdrawal(VaultAmount(1)),
+                previous_value: VaultAmount(2),
+                parent_transition: Some(VaultTransition::Deposit(VaultAmount(2))),
+            },
+        );
+
+        let result_parameters = vault.history_to_parameters(
+            &VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 1,
+                transition: VaultTransition::Deposit(VaultAmount(1)),
+                result_value: VaultAmount(3),
+            },
+            Some(&VaultTransaction {
+                txid: dummy_txid,
+                vout: Some(0),
+                depth: 0,
+                transition: VaultTransition::Deposit(VaultAmount(2)),
+                result_value: VaultAmount(2),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result_parameters,
+            VaultStateParameters {
+                transition: VaultTransition::Deposit(VaultAmount(1)),
+                previous_value: VaultAmount(2),
+                parent_transition: Some(VaultTransition::Deposit(VaultAmount(2))),
+            },
+        );
+
+        // TODO: more tests
     }
 
     #[test]
