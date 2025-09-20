@@ -488,6 +488,7 @@ impl TailDepositTransactionTemplate {
         let common = CommonDepositTransaction::from_template(self.common, deposit_input_internal_key);
 
         TailDepositTransaction {
+            common,
             depth: self.depth,
             deposit_input: None,
             deposit_input_internal_key,
@@ -524,14 +525,9 @@ impl From<TailDepositTransactionTemplate> for Transaction {
 
 #[derive(Clone,Debug)]
 struct TailDepositTransaction {
-    depth: Depth,
-    deposit_input: Option<TxIn>,
-    deposit_input_internal_key: XOnlyPublicKey,
+    common: CommonDepositTransaction,
 
     vault_input: TxIn,
-    vault_output: TxOut,
-    vault_total: VaultAmount,
-    vault_deposit: VaultAmount,
     signing_info: VaultOutputSigningInfo,
 }
 
