@@ -6,7 +6,6 @@ pub use vault::{
     AccountId,
     VaultAmount,
     VaultId,
-    VaultKeyDerivationPathTemplate,
     VaultParameters,
     VaultScale,
     Vault,
