@@ -30,11 +30,11 @@ use bitcoin::opcodes::all::{
     OP_DROP,
 };
 
-use bitcoin::secp256k1::Parity;
 use bitcoin::secp256k1::{
     constants::SCHNORR_SIGNATURE_SIZE,
     Keypair,
     Message,
+    Parity,
     PublicKey,
     Secp256k1,
     Signing,
@@ -47,7 +47,7 @@ use bitcoin::taproot::{
     LeafVersion,
     TaprootBuilder,
     TaprootMerkleBranch,
-    TaprootSpendInfo, merkle_branch,
+    TaprootSpendInfo,
 };
 
 use bitcoin::{
@@ -57,7 +57,6 @@ use bitcoin::{
     blockdata::transaction::Version,
     BlockHash,
     FeeRate,
-    key::TapTweak,
     OutPoint,
     psbt,
     Psbt,
@@ -124,6 +123,25 @@ pub type Depth = u32;
 
 fn builder_with_capacity(size: usize) -> Builder {
     Builder::from(Vec::with_capacity(size))
+}
+
+/// Store XOnlyPublicKey in 32 bytes instead of 64
+///
+/// Since it is only constructed from a valid [`XOnlyPublicKey`] it should always be valid
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+struct CompactXOnlyPublicKey([u8; 32]);
+
+impl From<XOnlyPublicKey> for CompactXOnlyPublicKey {
+    fn from(value: XOnlyPublicKey) -> Self {
+        Self(value.serialize())
+    }
+}
+
+impl From<CompactXOnlyPublicKey> for XOnlyPublicKey {
+    fn from(value: CompactXOnlyPublicKey) -> Self {
+        XOnlyPublicKey::from_slice(value.0.as_ref())
+            .expect("always valid")
+    }
 }
 
 #[derive(Clone,Copy,Serialize,Deserialize)]
@@ -389,7 +407,7 @@ impl PartialOrd for VaultStateParameters {
 }
 
 #[derive(Clone,Debug)]
-struct CommonDepositTransactionTemplate {
+struct DepositTransactionTemplateCommon {
     depth: Depth,
     vault_output: TxOut,
     vault_deposit: VaultAmount,
@@ -398,16 +416,22 @@ struct CommonDepositTransactionTemplate {
 
 #[derive(Clone,Debug)]
 struct InitialDepositTransactionTemplate {
-    common: CommonDepositTransactionTemplate,
+    common: DepositTransactionTemplateCommon,
 }
 
 #[derive(Clone,Debug)]
 struct TailDepositTransactionTemplate {
-    common: CommonDepositTransactionTemplate,
+    common: DepositTransactionTemplateCommon,
     vault_input_lock_time: relative::LockTime,
 }
 
-impl CommonDepositTransactionTemplate {
+#[derive(Clone,Debug)]
+enum DepositTransactionTemplate {
+    InitialDeposit(InitialDepositTransactionTemplate),
+    Deposit(TailDepositTransactionTemplate),
+}
+
+impl DepositTransactionTemplateCommon {
     fn into_transaction(self, vault_input: Option<TxIn>) -> Transaction {
         let input = iter::empty()
             .chain(Some(dummy_input(relative::LockTime::ZERO)))
@@ -418,7 +442,7 @@ impl CommonDepositTransactionTemplate {
             version: transaction::Version::non_standard(3),
             lock_time: LockTime::ZERO,
             input,
-            output: vec![value.vault_output],
+            output: vec![self.vault_output],
         }
     }
 }
@@ -426,10 +450,7 @@ impl CommonDepositTransactionTemplate {
 impl InitialDepositTransactionTemplate {
     fn instantiate(self, deposit_input_internal_key: XOnlyPublicKey) -> InitialDepositTransaction {
         InitialDepositTransaction {
-            deposit_input: None,
-            deposit_input_internal_key,
-            vault_output: self.common.vault_output.clone(),
-            vault_deposit: self.common.vault_deposit,
+            common: DepositTransactionCommon::from_template(self.common, deposit_input_internal_key)
         }
     }
 
@@ -441,66 +462,20 @@ impl From<InitialDepositTransactionTemplate> for Transaction {
     }
 }
 
-impl From<InitialDepositTransaction> for InitialDepositTransactionTemplate {
-    fn from(value: InitialDepositTransaction) -> Self {
-        Self {
-            vault_output: value.vault_output,
-            vault_deposit: value.vault_deposit,
-        }
-    }
-}
-
-#[derive(Clone,Debug)]
-struct CommonDepositTransaction {
-    depth: Depth,
-    deposit_input: Option<TxIn>,
-    deposit_input_internal_key: XOnlyPublicKey,
-
-    vault_output: TxOut,
-    vault_deposit: VaultAmount,
-    vault_total: VaultAmount,
-}
-
-#[derive(Clone,Debug)]
-struct InitialDepositTransaction {
-    common: CommonDepositTransaction,
-    // The scriptPubkey a deposit prep transaction must use as an output
-    //deposit_script_pubkey: ScriptBuf,
-}
-
-impl CommonDepositTransaction {
-    fn from_template(common: CommonDepositTransactionTemplate, deposit_input_internal_key: XOnlyPublicKey) -> Self {
-        Self {
-            depth: common.depth,
-            deposit_input: None,
-            deposit_input_internal_key,
-            vault_output: common.vault_output,
-            vault_deposit: common.vault_deposit,
-            vault_total: common.vault_total,
-        }
-    }
-}
-
 // FIXME: actually we might just want a vault_input sequence, and we
 // lazily construct the witness? This probably works fine for now
 impl TailDepositTransactionTemplate {
-    fn intantiate(&self, vault_prevout: OutPoint, deposit_input_internal_key: XOnlyPublicKey, signing_info: VaultOutputSigningInfo) -> TailDepositTransaction {
-        let common = CommonDepositTransaction::from_template(self.common, deposit_input_internal_key);
+    fn intantiate(self, vault_prevout: OutPoint, deposit_input_internal_key: XOnlyPublicKey, signing_info: VaultOutputSigningInfo) -> TailDepositTransaction {
+        let common = DepositTransactionCommon::from_template(self.common, deposit_input_internal_key);
 
         TailDepositTransaction {
             common,
-            depth: self.depth,
-            deposit_input: None,
-            deposit_input_internal_key,
             vault_input: TxIn {
                 previous_output: vault_prevout,
                 script_sig: ScriptBuf::new(),
                 sequence: self.vault_input_lock_time.into(),
                 witness: Witness::new(),
             },
-            vault_output: self.vault_output.clone(),
-            vault_total: self.vault_total,
-            vault_deposit: self.vault_deposit,
             signing_info,
         }
     }
@@ -524,24 +499,111 @@ impl From<TailDepositTransactionTemplate> for Transaction {
 }
 
 #[derive(Clone,Debug)]
+struct DepositTransactionCommon {
+    depth: Depth,
+    vault_deposit: VaultAmount,
+    vault_total: VaultAmount,
+
+    deposit_input_internal_key: XOnlyPublicKey,
+    deposit_input: Option<TxIn>,
+
+    vault_output: TxOut,
+}
+
+#[derive(Clone,Debug)]
+struct InitialDepositTransaction {
+    common: DepositTransactionCommon,
+}
+
+#[derive(Clone,Debug)]
 struct TailDepositTransaction {
-    common: CommonDepositTransaction,
+    common: DepositTransactionCommon,
 
     vault_input: TxIn,
     signing_info: VaultOutputSigningInfo,
 }
 
-impl TailDepositTransaction {
-    fn vault_template_hash(&self) -> sha256::Hash {
-        let template: TailDepositTransactionTemplate = self.clone().into();
+#[derive(Clone,Debug)]
+enum DepositTransaction {
+    InitialDeposit(InitialDepositTransaction),
+    Deposit(TailDepositTransaction),
+}
 
-        template.vault_template_hash()
+impl DepositTransactionCommon {
+    fn from_template(common: DepositTransactionTemplateCommon, deposit_input_internal_key: XOnlyPublicKey) -> Self {
+        Self {
+            depth: common.depth,
+            deposit_input: None,
+            deposit_input_internal_key,
+            vault_output: common.vault_output,
+            vault_deposit: common.vault_deposit,
+            vault_total: common.vault_total,
+        }
+    }
+
+    fn into_transaction(self, vault_input: Option<TxIn>) -> Result<Transaction, VaultTransactionBuildError> {
+        let input = iter::empty()
+            .chain(vault_input)
+            .chain(
+                Some(
+                    self.deposit_input.ok_or(VaultTransactionBuildError::MissingInput)?
+                )
+            )
+            .collect();
+
+        Ok(
+            Transaction {
+                version: transaction::Version::non_standard(3),
+                lock_time: LockTime::ZERO,
+                input,
+                output: vec![self.vault_output],
+            }
+        )
+    }
+
+    fn template_hash(&self, vault_input: Option<TxIn>, input_index: u32) -> sha256::Hash {
+        let input = iter::empty()
+            .chain(vault_input)
+            .chain(Some(dummy_input(relative::LockTime::ZERO)))
+            .collect();
+
+        get_default_template(
+            &Transaction {
+                version: transaction::Version::non_standard(3),
+                lock_time: LockTime::ZERO,
+                input,
+                output: vec![self.vault_output.clone()],
+            },
+            input_index
+        )
     }
 }
 
+impl TailDepositTransaction {
+    fn vault_template_hash(&self) -> sha256::Hash {
+        get_default_template(
+            &Transaction {
+                version: transaction::Version::non_standard(3),
+                lock_time: LockTime::ZERO,
+                input: vec![
+                    self.vault_input.clone(),
+                    dummy_input(relative::LockTime::ZERO),
+                ],
+                output: vec![self.common.vault_output.clone()],
+            },
+            0,
+        )
+    }
+}
+
+#[derive(Clone,Debug)]
+enum VaultTransactionBuildError {
+    // This will always be a deposit input, rename?
+    MissingInput,
+}
+
 impl TryFrom<InitialDepositTransaction> for Transaction {
-    // FIXME: Error variant
-    type Error = ();
+    type Error = VaultTransactionBuildError;
 
     fn try_from(value: InitialDepositTransaction) -> Result<Self, Self::Error> {
         Ok(
@@ -549,10 +611,10 @@ impl TryFrom<InitialDepositTransaction> for Transaction {
                 version: transaction::Version::non_standard(3),
                 lock_time: LockTime::ZERO,
                 input: vec![
-                    value.deposit_input.ok_or(())?,
+                    value.common.deposit_input.ok_or(VaultTransactionBuildError::MissingInput)?,
                 ],
                 output: vec![
-                    value.vault_output
+                    value.common.vault_output
                 ],
             }
         )
@@ -560,45 +622,11 @@ impl TryFrom<InitialDepositTransaction> for Transaction {
 }
 
 impl TryFrom<TailDepositTransaction> for Transaction {
-    // FIXME: Error variant
-    type Error = ();
+    type Error = VaultTransactionBuildError;
 
     fn try_from(value: TailDepositTransaction) -> Result<Self, Self::Error> {
-        Ok(
-            Self {
-                version: transaction::Version::non_standard(3),
-                lock_time: LockTime::ZERO,
-                input: vec![
-                    value.vault_input,
-                    value.deposit_input.ok_or(())?,
-                ],
-                output: vec![
-                    value.vault_output
-                ],
-            }
-        )
+        value.common.into_transaction(Some(value.vault_input))
     }
-}
-
-impl From<TailDepositTransaction> for TailDepositTransactionTemplate {
-    fn from(value: TailDepositTransaction) -> Self {
-        Self {
-            depth: value.depth,
-            vault_input_lock_time: value.vault_input
-                .sequence
-                .to_relative_lock_time()
-                .expect("valid input will have valid relative lock time"),
-            vault_output: value.vault_output,
-            vault_total: value.vault_total,
-            vault_deposit: value.vault_deposit,
-        }
-    }
-}
-
-#[derive(Clone,Debug)]
-enum DepositTransactionTemplate {
-    InitialDeposit(InitialDepositTransactionTemplate),
-    Deposit(TailDepositTransactionTemplate),
 }
 
 /// Calculate the serialized length of the witness
@@ -626,53 +654,18 @@ fn witness_weight(merkle_branches: Option<usize>, stack_item_sizes: &[u64]) -> W
         .sum()
 }
 
-impl DepositTransactionTemplate {
-}
-
-impl From<DepositTransactionTemplate> for Transaction {
-    fn from(value: DepositTransactionTemplate) -> Transaction {
-        match value {
-            DepositTransactionTemplate::InitialDeposit(deposit) => deposit.into(),
-            DepositTransactionTemplate::Deposit(deposit) => deposit.into(),
-        }
-    }
-}
-
-#[derive(Clone,Debug)]
-enum DepositTransaction {
-    InitialDeposit(InitialDepositTransaction),
-    Deposit(TailDepositTransaction),
-}
-
-impl From<DepositTransaction> for DepositTransactionTemplate {
-    fn from(value: DepositTransaction) -> Self {
-        match value {
-            DepositTransaction::InitialDeposit(deposit) => 
-                DepositTransactionTemplate::InitialDeposit(deposit.into()),
-            DepositTransaction::Deposit(deposit) =>
-                DepositTransactionTemplate::Deposit(deposit.into()),
-        }
-    }
-}
-
 impl DepositTransaction {
     const DEPOSIT_INPUT_INDEX_INITIAL: usize = 0;
     const DEPOSIT_INPUT_INDEX_TAIL: usize = 1;
 
-
-    fn depth(&self) -> Depth {
+    fn common(&self) -> &DepositTransactionCommon {
         match self {
-            DepositTransaction::InitialDeposit(_deposit) => 0,
-            DepositTransaction::Deposit(deposit) => deposit.depth,
+            DepositTransaction::InitialDeposit(deposit) => &deposit.common,
+            DepositTransaction::Deposit(deposit) => &deposit.common,
         }
     }
 
-    fn vault_total(&self) -> VaultAmount {
-        match self {
-            DepositTransaction::InitialDeposit(deposit) => deposit.vault_deposit,
-            DepositTransaction::Deposit(deposit) => deposit.vault_total,
-        }
-    }
+    fn vault_total(&self) -> VaultAmount { self.common().vault_total }
 
     fn deposit_input_index(&self) -> usize {
         match self {
@@ -713,24 +706,48 @@ impl DepositTransaction {
         witness
     }
 
+    fn vault_input(&self) -> Option<&TxIn> {
+        match self {
+            DepositTransaction::InitialDeposit(deposit) => None,
+            DepositTransaction::Deposit(deposit) => Some(&deposit.vault_input),
+        }
+    }
+
+    fn into_transaction(self) -> Result<Transaction, VaultTransactionBuildError> {
+        match self {
+            DepositTransaction::InitialDeposit(deposit) => {
+                deposit.common.into_transaction(None)
+            }
+            DepositTransaction::Deposit(deposit) => {
+                deposit.common.into_transaction(Some(deposit.vault_input))
+            }
+        }
+    }
+
+    // FIXME: make this more efficient and flexible (don't actually build the tx)
+    // FIXME: also this shouldn't explode if we don't know the weight of the deposit input
+    // satisfaction is
     fn weight(&self) -> Weight {
-        let tx: Transaction = self.clone().into().into();
+        let mut tx: Transaction = self
+            .clone()
+            .into_transaction()
+            .expect("must already have a deposit input");
 
         let dummy_key = XOnlyPublicKey::from_slice(&[1u8; 32])
             .expect("dummy key is valid");
 
-        tx.input[self.deposit_input_index()].witness = self.witness(dummy_key, Parity::Even);
+        //tx.input[self.deposit_input_index()].witness = self.witness(dummy_key, Parity::Even);
 
-        tx.weight()
+        //tx.weight()
+        todo!()
     }
 
-    // TODO: implement optimized version
     /// Generates the template hash for the deposit (shape/prepare) transaction input
     fn deposit_template_hash(&self) -> sha256::Hash {
-        let template: DepositTransactionTemplate = self.clone().into();
-        let tx: Transaction = template.into();
-
-        get_default_template(&tx, self.deposit_input_index() as u32)
+        self.common().template_hash(
+            self.vault_input().cloned(),
+            self.deposit_input_index() as u32,
+        )
     }
 
     fn deposit_script(&self) -> ScriptBuf {
@@ -742,8 +759,9 @@ impl DepositTransaction {
             .into_script()
     }
 
-    fn compute_txid(&self) -> Result<Txid, ()> {
-        let tx: Transaction = self.clone().try_into()?;
+    // TODO: optimize without constructing Transaction
+    fn compute_txid(&self) -> Result<Txid, VaultTransactionBuildError> {
+        let tx: Transaction = self.clone().into_transaction()?;
 
         Ok(tx.compute_txid())
     }
@@ -760,27 +778,19 @@ impl DepositTransaction {
     }
 }
 
-impl TryFrom<DepositTransaction> for Transaction {
-    // FIXME
-    type Error = ();
+impl TryFrom<DepositTransaction> for VaultHistoryTransaction {
+    type Error = VaultTransactionBuildError;
 
-    fn try_from(value: DepositTransaction) -> Result<Self, Self::Error> {
-        match value {
-            DepositTransaction::InitialDeposit(deposit) => deposit.try_into(),
-            DepositTransaction::Deposit(deposit) => deposit.try_into(),
-        }
-    }
-}
-
-impl From<DepositTransaction> for VaultHistoryTransaction {
-    fn from(tx: DepositTransaction) -> Self {
-        Self {
-            txid: tx.compute_txid(),
-            vout: Some(0),
-            depth: tx.depth(),
-            transition: VaultTransition::Deposit(tx.vault_total()),
-            result_value: tx.vault_total(),
-        }
+    fn try_from(tx: DepositTransaction) -> Result<Self, Self::Error> {
+        Ok(
+            Self {
+                txid: tx.compute_txid()?,
+                vout: Some(0),
+                depth: tx.common().depth,
+                transition: VaultTransition::Deposit(tx.common().vault_deposit),
+                result_value: tx.common().vault_total,
+            }
+        )
     }
 }
 
@@ -793,6 +803,15 @@ struct WithdrawalTransactionTemplate {
 
     vault_total: VaultAmount,
     vault_withdrawal: VaultAmount,
+}
+
+impl WithdrawalTransactionTemplate {
+    // TODO: implement optimized version without constructing the Transaction
+    fn vault_template_hash(&self) -> sha256::Hash {
+        let tx: Transaction = self.clone().into();
+
+        get_default_template(&tx, 0)
+    }
 }
 
 impl Into<Transaction> for WithdrawalTransactionTemplate {
@@ -824,16 +843,55 @@ struct WithdrawalTransaction {
     signing_info: VaultOutputSigningInfo,
 }
 
+impl WithdrawalTransaction {
+    fn into_transaction(self) -> Transaction {
+        let output = iter::empty()
+            .chain(self.vault_output)
+            .chain(Some(self.withdrawal_output))
+            .chain(Some(ephemeral_anchor()))
+            .collect();
+
+        Transaction {
+            version: transaction::Version::non_standard(3),
+            lock_time: LockTime::ZERO,
+            input: vec![self.vault_input],
+            output,
+        }
+    }
+
+    // TODO: eliminate need to construct transaction
+    fn compute_txid(&self) -> Txid {
+        let tx: Transaction = self.clone().into_transaction();
+
+        tx.compute_txid()
+    }
+}
+
 #[derive(Clone,Debug)]
 enum VaultTransactionTemplate {
     Deposit(DepositTransactionTemplate),
     Withdrawal(WithdrawalTransactionTemplate),
 }
 
+impl VaultTransactionTemplate {
+    fn vault_template_hash(&self) -> sha256::Hash {
+        match self {
+            VaultTransactionTemplate::Deposit(DepositTransactionTemplate::InitialDeposit(_deposit)) => unreachable!("initial deposit can't be the destination of a vault output"),
+            VaultTransactionTemplate::Deposit(DepositTransactionTemplate::Deposit(deposit)) => deposit.vault_template_hash(),
+            VaultTransactionTemplate::Withdrawal(withdrawal) => withdrawal.vault_template_hash(),
+        }
+    }
+}
+
 impl Into<Transaction> for VaultTransactionTemplate {
     fn into(self) -> Transaction {
         match self {
-            VaultTransactionTemplate::Deposit(deposit) => deposit.into(),
+            VaultTransactionTemplate::Deposit(
+                DepositTransactionTemplate::InitialDeposit(deposit)
+            ) => deposit.into(),
+            VaultTransactionTemplate::Deposit(
+                DepositTransactionTemplate::Deposit(deposit)
+            ) => deposit.into(),
             VaultTransactionTemplate::Withdrawal(withdrawal) => withdrawal.into(),
         }
     }
@@ -841,7 +899,7 @@ impl Into<Transaction> for VaultTransactionTemplate {
 
 #[derive(Clone,Debug)]
 enum VaultTransaction {
-    Deposit(DepositTransaction),
+    Deposit(DepositTransactionCommon),
     Withdrawal(WithdrawalTransaction),
 }
 
@@ -1068,7 +1126,7 @@ impl VaultParameters {
 
                 if let Some(next_state) = next_states.get(&params) {
                     // Vault UTXO will always be input 0
-                    let next_state_template_hash = get_default_template(&next_state, 0);
+                    let next_state_template_hash = next_state.vault_template_hash();
 
                     let transition_script_template = SignedNextStateTemplate {
                         pubkey: self.hot_key(secp, depth),
@@ -1200,26 +1258,24 @@ impl VaultParameters {
 
         let vault_output = self.vault_output(secp, depth, parameter, next_states);
 
+        let common = DepositTransactionTemplateCommon {
+            depth,
+            vault_output,
+            vault_deposit: deposit_amount,
+            vault_total,
+        };
+
         match parameter.parent_transition {
             None => {
                 DepositTransactionTemplate::InitialDeposit(
-                    InitialDepositTransactionTemplate {
-                        vault_output,
-                        vault_deposit: deposit_amount,
-                    }
+                    InitialDepositTransactionTemplate { common }
                 )
             }
             Some(parent_transition) => {
                 let vault_input_lock_time = self.vault_input_lock_time(parent_transition);
 
                 DepositTransactionTemplate::Deposit(
-                    TailDepositTransactionTemplate {
-                        depth,
-                        vault_input_lock_time,
-                        vault_output,
-                        vault_total,
-                        vault_deposit: deposit_amount,
-                    }
+                    TailDepositTransactionTemplate { common, vault_input_lock_time }
                 )
             }
         }
@@ -1763,7 +1819,7 @@ impl WithdrawalTransaction {
 
     pub fn anchor_outpoint(&self) -> OutPoint {
         OutPoint {
-            txid: self.transaction.compute_txid(),
+            txid: self.compute_txid(),
             vout: self.anchor_output_index(),
         }
     }
@@ -1772,8 +1828,8 @@ impl WithdrawalTransaction {
         let vout = self.anchor_output_index();
 
         psbt::Input {
-            witness_utxo: Some(self.transaction.output[vout as usize].clone()),
-            non_witness_utxo: Some(self.transaction.clone()),
+            witness_utxo: Some(ephemeral_anchor()),
+            non_witness_utxo: Some(self.clone().into_transaction()),
             final_script_witness: Some(Witness::new()),
             ..Default::default()
         }
@@ -1857,7 +1913,7 @@ pub enum KeypairDerivationError {
     PlaceholderError,
 }
 
-impl DepositTransaction {
+impl DepositTransactionCommon {
     // FIXME: this is a dumb as hell API, think about how we want to actually handle this
     pub fn hot_keypair<C: Signing>(&self, secp: &Secp256k1<C>, xpriv: &Xpriv) -> Result<Keypair, KeypairDerivationError> {
         if let Some((signing_info, _)) = &self.signing_info {
@@ -1934,10 +1990,10 @@ impl DepositTransaction {
 
     pub fn payment_info(&self) -> (ScriptBuf, Amount) {
         match self {
-            DepositTransaction::InitialDeposit(deposit) => {
+            DepositTransactionCommon::InitialDeposit(deposit) => {
                 (todo!("We need to generate the script pubkey"), todo!("we need to carry the vault total"))
             }
-            DepositTransaction::Deposit(deposit) => {
+            DepositTransactionCommon::Deposit(deposit) => {
                 (todo!(), todo!())
             }
         }
@@ -1954,10 +2010,10 @@ impl DepositTransaction {
         );
 
         match self {
-            DepositTransaction::InitialDeposit(deposit) => {
+            DepositTransactionCommon::InitialDeposit(deposit) => {
                 deposit.deposit_input = deposit_input;
             }
-            DepositTransaction::Deposit(deposit) => {
+            DepositTransactionCommon::Deposit(deposit) => {
                 deposit.deposit_input = deposit_input;
             }
         }
@@ -2123,7 +2179,7 @@ impl Vault {
                     DepositTransaction::InitialDeposit(
                         deposit.instantiate(master)
                     )
-                )
+                ),
             VaultTransactionTemplate::Deposit(DepositTransactionTemplate::Deposit(deposit)) => {
                 let spend_info = self.last_state_parameters()
                     .expect("transaction history must always be valid")
@@ -2252,7 +2308,7 @@ impl Vault {
     // FIXME: I think this should be refactored into a stateless version on VaultParameters
     //  FIXME: return value should probably also have some kind of token for keeping track of
     //  replacements, preventing invalid deposit transactions from being tracked
-    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Result<DepositTransaction, VaultDepositError> {
+    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Result<DepositTransactionCommon, VaultDepositError> {
         if let Some((tx, _)) = self.history.last() {
             if deposit_amount > self.parameters.max_deposit_per_step {
                 return Err(VaultDepositError::InvalidDepositAmount);
@@ -2431,7 +2487,7 @@ impl Vault {
 
     // FIXME: return types
     // FIXME: part of me wants to have one add_*_transaction for deposit and withdrawal
-    pub fn add_deposit_transaction(&mut self, tx: &DepositTransaction) -> Result<(), ()> {
+    pub fn add_deposit_transaction(&mut self, tx: &DepositTransactionCommon) -> Result<(), ()> {
         if (tx.depth() as usize) != self.history.len() {
             return Err(());
         }
@@ -2494,11 +2550,11 @@ const SEGWIT_MARKER_WEIGHT: Weight = Weight::from_wu(2);
 const WITNESS_ITEM_COUNT_WEIGHT: Weight = Weight::from_wu(1);
 
 pub trait VaultDepositor {
-    fn create_shape<C: Verification>(&mut self, secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError>;
+    fn create_shape<C: Verification>(&mut self, secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransactionCommon, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError>;
 }
 
 impl VaultDepositor for Wallet {
-    fn create_shape<C: Verification>(&mut self, _secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError> {
+    fn create_shape<C: Verification>(&mut self, _secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransactionCommon, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError> {
         let script_pubkey = deposit_transaction.script_pubkey();
         let mut shape_weight = Weight::ZERO;
         // This weight should be correct already 
