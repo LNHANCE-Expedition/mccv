@@ -167,7 +167,10 @@ fn test_deposit_withdraw() {
     let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
         .expect("create shape success");
 
-    let transmittable_deposit_transaction = deposit_transaction.to_transaction().expect("initial deposit doesn't require signing");
+    /// FIXME: same deal, replace into_signed_transaction() with something that fits the usage
+    /// pattern
+    let transmittable_deposit_transaction = deposit_transaction.clone().into_signed_transaction()
+        .expect("initial deposit doesn't require signing");
 
     let sign_success = wallet.sign(&mut shape_psbt, SignOptions::default())
         .expect("sign success");
@@ -180,14 +183,14 @@ fn test_deposit_withdraw() {
     let args: Vec<serde_json::Value> = vec![
         mccv::vault::package_encodable(
             vec![
-                &shape_transaction,
-                &transmittable_deposit_transaction,
+                dbg!(&shape_transaction),
+                dbg!(&transmittable_deposit_transaction),
             ],
         ),
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(result.get("package_msg"), Some(&"success".into()));
+    assert_eq!(result.get("package_msg"), Some(&"success".into()), "{:?}", result);
 
     let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
         .expect("shape tx in mempool");
@@ -236,10 +239,13 @@ fn test_deposit_withdraw() {
     let hot_keypair = deposit_transaction.hot_keypair(&secp, &hot_xpriv)
         .expect("successful key derivation");
 
-    let _ = deposit_transaction.sign(&secp, &hot_keypair)
+    let _ = deposit_transaction.sign_vault_input(&secp, &hot_keypair)
         .expect("sign success");
 
-    let transmittable_deposit_transaction = deposit_transaction.to_transaction().expect("deposit transaction signed");
+    // FIXME: maybe into_signed_transaction() should be `to_signed_transaction()` and take a
+    // reference, since we need to keep `deposit_transaction` around afterwards anyway to feed to
+    // the vault history. Same goes for [`WithdrawalTransaction`]
+    let transmittable_deposit_transaction = deposit_transaction.clone().into_signed_transaction().expect("deposit transaction signed");
 
     //eprintln!("tx {} = {shape_transaction:?}", shape_transaction.compute_txid());
     //eprintln!("tx {} = {:?}", transmittable_deposit_transaction.compute_txid(), &transmittable_deposit_transaction);
@@ -292,13 +298,13 @@ fn test_deposit_withdraw() {
     let hot_keypair = withdrawal_transaction.hot_keypair(&secp, &hot_xpriv)
         .expect("successful key derivation");
 
-    withdrawal_transaction.sign(&secp, &hot_keypair)
+    withdrawal_transaction.sign_vault_input(&secp, &hot_keypair)
         .expect("can sign withdrawal");
 
     vault.add_withdrawal_transaction(&withdrawal_transaction)
         .expect("can add withdrawal");
 
-    let transmittable_withdrawal_transaction = withdrawal_transaction.to_transaction()
+    let transmittable_withdrawal_transaction = withdrawal_transaction.into_signed_transaction()
         .expect("signed tx");
 
     client.send_raw_transaction(&transmittable_withdrawal_transaction)
