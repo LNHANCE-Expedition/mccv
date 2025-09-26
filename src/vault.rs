@@ -4,7 +4,6 @@ use bdk_wallet::{
     KeychainKind
 };
 
-use bitcoin::Sequence;
 use bitcoin::bip32::{
     Xpriv,
     Xpub,
@@ -23,7 +22,6 @@ use bitcoin::hashes::{
     sha256,
 };
 
-use bitcoin::key::TapTweak;
 use bitcoin::opcodes::all::{
     OP_CSV,
     OP_CHECKSIG,
@@ -35,7 +33,6 @@ use bitcoin::secp256k1::{
     constants::SCHNORR_SIGNATURE_SIZE,
     Keypair,
     Message,
-    Parity,
     PublicKey,
     Secp256k1,
     Signing,
@@ -58,12 +55,14 @@ use bitcoin::{
     blockdata::transaction::Version,
     BlockHash,
     FeeRate,
+    key::TapTweak,
     OutPoint,
     psbt,
     Psbt,
     relative::LockTime as RelativeLockTime,
     ScriptBuf,
     Script,
+    Sequence,
     TapLeafHash,
     TapNodeHash,
     taproot,
@@ -484,19 +483,11 @@ impl TailDepositTransactionTemplate {
     
     // FIXME: optimize to eliminate the clone
     fn vault_template_hash(&self) -> sha256::Hash {
-        let tx: Transaction = self.clone().into();
+        let tx: Transaction = self.clone().common.into_transaction(
+            Some(dummy_input(self.vault_input_lock_time))
+        );
 
         get_default_template(&tx, 0)
-    }
-}
-
-impl From<TailDepositTransactionTemplate> for Transaction {
-    // FIXME: really consider making the deposit input the first input, I think it actually
-    // simplifies a number of things
-    fn from(value: TailDepositTransactionTemplate) -> Transaction {
-        value.common.into_transaction(
-            Some(dummy_input(value.vault_input_lock_time))
-        )
     }
 }
 
@@ -514,15 +505,16 @@ struct DepositTransactionCommon {
 }
 
 #[derive(Clone,Debug)]
-struct InitialDepositTransaction {
+pub struct InitialDepositTransaction {
     common: DepositTransactionCommon,
 }
 
 #[derive(Clone,Debug)]
-struct TailDepositTransaction {
+pub struct TailDepositTransaction {
     common: DepositTransactionCommon,
 
     vault_input: TxIn,
+    /// Information required to sign the vault output that this transaction spends
     signing_info: VaultOutputSigningInfo,
     signature: Option<taproot::Signature>,
 }
@@ -728,9 +720,10 @@ impl DepositTransaction {
         }
     }
 
-    pub fn into_signed_transaction(mut self) -> Result<Transaction, VaultTransactionBuildError> {
+    // FIXME: No sense in consuming self
+    pub fn into_signed_transaction(self) -> Result<Transaction, VaultTransactionBuildError> {
         match self {
-            DepositTransaction::InitialDeposit(mut deposit) => {
+            DepositTransaction::InitialDeposit(deposit) => {
                 deposit.common.into_transaction(None)
             }
             DepositTransaction::Deposit(mut deposit) => {
@@ -819,8 +812,9 @@ impl DepositTransaction {
         match self {
             DepositTransaction::InitialDeposit(_) => Err(KeypairDerivationError::NoSigningInfo),
             DepositTransaction::Deposit(deposit) => {
+                let parent_depth = deposit.common.depth - 1;
                 let keypair = xpriv.derive_priv(secp, &[
-                    ChildNumber::from_normal_idx(deposit.common.depth as u32)
+                    ChildNumber::from_normal_idx(parent_depth as u32)
                         .expect("assume sane child number")
                 ])
                 .map(|xpriv| xpriv.to_keypair(secp))
@@ -832,9 +826,6 @@ impl DepositTransaction {
                 })?;
 
                 if deposit.signing_info.pubkey != keypair.x_only_public_key().0 {
-                    dbg!(self.common().depth);
-                    dbg!(&deposit.signing_info.pubkey);
-                    dbg!(&keypair.x_only_public_key().0);
                     Err(KeypairDerivationError::WrongKey)
                 } else {
                     Ok(keypair)
@@ -987,26 +978,21 @@ impl WithdrawalTransactionTemplate {
 
     // TODO: implement optimized version without constructing the Transaction
     fn vault_template_hash(&self) -> sha256::Hash {
-        let tx: Transaction = self.clone().into();
-
-        get_default_template(&tx, 0)
-    }
-}
-
-impl Into<Transaction> for WithdrawalTransactionTemplate {
-    fn into(self) -> Transaction {
         let output = iter::empty()
             // Vault output
-            .chain(self.vault_output)
-            .chain(Some(self.withdrawal_output))
+            .chain(self.vault_output.clone())
+            .chain(Some(self.withdrawal_output.clone()))
+            .chain(Some(ephemeral_anchor()))
             .collect();
 
-        Transaction {
+        let tx = Transaction {
             version: transaction::Version::non_standard(3),
             lock_time: LockTime::ZERO,
             input: vec![dummy_input(self.vault_input_lock_time)],
             output,
-        }
+        };
+
+        get_default_template(&tx, 0)
     }
 }
 
@@ -1020,6 +1006,8 @@ pub struct WithdrawalTransaction {
 
     vault_total: VaultAmount,
     vault_withdrawal: VaultAmount,
+
+    /// Information required to sign the vault output that this transaction spends
     signing_info: VaultOutputSigningInfo,
 }
 
@@ -1045,6 +1033,114 @@ impl WithdrawalTransaction {
 
         tx.compute_txid()
     }
+
+    pub fn anchor_outpoint(&self) -> OutPoint {
+        OutPoint {
+            txid: self.compute_txid(),
+            vout: if self.vault_output.is_some() {
+                2
+            } else {
+                1
+            },
+        }
+    }
+
+    pub fn anchor_output_psbt_input(&self) -> psbt::Input {
+        psbt::Input {
+            witness_utxo: Some(ephemeral_anchor()),
+            non_witness_utxo: Some(self.clone().into_transaction()),
+            final_script_witness: Some(Witness::new()),
+            ..Default::default()
+        }
+    }
+
+    pub fn hot_keypair<C: Signing>(&self, secp: &Secp256k1<C>, xpriv: &Xpriv) -> Result<Keypair, KeypairDerivationError> {
+        let parent_depth = self.depth - 1;
+        let keypair = xpriv.derive_priv(secp, &[
+            ChildNumber::from_normal_idx(parent_depth as u32)
+                .expect("sane child number")
+        ])
+        .map(|xpriv| xpriv.to_keypair(secp))
+        .map_err(|e| {
+            match e {
+                bitcoin::bip32::Error::MaximumDepthExceeded => KeypairDerivationError::DerivationDepthExceeded,
+                _ => unreachable!("Xpriv derivation can only fail with maximum depth"),
+            }
+        })?;
+
+        if self.signing_info.pubkey != keypair.x_only_public_key().0 {
+            Err(KeypairDerivationError::WrongKey)
+        } else {
+            Ok(keypair)
+        }
+    }
+
+    pub fn to_signed_transaction(&self) -> Option<Transaction> {
+        self.clone().into_signed_transaction()
+    }
+
+    // FIXME: Result instead of Option?
+    pub fn into_signed_transaction(self) -> Option<Transaction> {
+        let mut vault_input = self.vault_input;
+        vault_input.witness = self.signing_info.build_witness(self.vault_signature?);
+
+        let output = iter::empty()
+            .chain(self.vault_output.clone())
+            .chain(Some(self.withdrawal_output.clone()))
+            .chain(Some(ephemeral_anchor()))
+            .collect();
+
+        Some(
+            Transaction {
+                version: transaction::Version::non_standard(3),
+                lock_time: LockTime::ZERO,
+                input: vec![vault_input],
+                output,
+            }
+        )
+    }
+
+
+    pub fn weight(&self) -> Weight {
+        let serialized_schnorr_sig_len = VarInt(SCHNORR_SIGNATURE_SIZE as u64).size() as u64 + SCHNORR_SIGNATURE_SIZE as u64;
+        let script_len = self.signing_info.script.len() as u64;
+        let serialized_script_len = VarInt(script_len).size() as u64 + script_len;
+        let control_block_len = self.signing_info.control_block.size() as u64;
+        let serialized_control_block_len = VarInt(control_block_len).size() as u64 + control_block_len;
+
+        self.clone().into_transaction().weight() +
+            if self.vault_signature.is_some() {
+                // We've already been signed, rust-bitcoin will
+                // calculate the correct weight
+                Weight::ZERO
+            } else {
+                Weight::from_wu(
+                    2 + 1 + // Segwit marker + witness item count
+                    serialized_schnorr_sig_len +
+                    serialized_script_len +
+                    serialized_control_block_len
+                )
+            }
+    }
+
+    pub fn sign_vault_input<C: Signing>(&mut self, secp: &Secp256k1<C>, keypair: &Keypair) -> Result<(), WithdrawalSignError> {
+        let prevout_txouts = vec![
+            &self.signing_info.vault_prevout,
+        ];
+
+        // TODO: also check that we actually satisfy the script, probably facilitated by hanging
+        // onto the script template instead of the serialized ScriptBuf
+        let prevouts = Prevouts::All(&prevout_txouts);
+
+        let transaction = self.clone().into_transaction();
+
+        let signature = self.signing_info.sign(secp, keypair, &transaction, &prevouts)
+            .map_err(|e| WithdrawalSignError::SighashError(e))?;
+
+        self.vault_signature = Some(signature);
+
+        Ok(())
+    }
 }
 
 #[derive(Clone,Debug)]
@@ -1063,27 +1159,13 @@ impl VaultTransactionTemplate {
     }
 }
 
-impl Into<Transaction> for VaultTransactionTemplate {
-    fn into(self) -> Transaction {
-        match self {
-            VaultTransactionTemplate::Deposit(
-                DepositTransactionTemplate::InitialDeposit(deposit)
-            ) => deposit.into(),
-            VaultTransactionTemplate::Deposit(
-                DepositTransactionTemplate::Deposit(deposit)
-            ) => deposit.into(),
-            VaultTransactionTemplate::Withdrawal(withdrawal) => withdrawal.into(),
-        }
-    }
-}
-
 #[derive(Clone,Debug)]
-enum VaultTransaction {
-    Deposit(DepositTransactionCommon),
+pub enum VaultTransaction {
+    Deposit(DepositTransaction),
     Withdrawal(WithdrawalTransaction),
 }
 
-pub type VaultGeneration = HashMap<VaultStateParameters, VaultTransactionTemplate>;
+type VaultGeneration = HashMap<VaultStateParameters, VaultTransactionTemplate>;
 
 pub struct VaultGenerationIterator<'p, 's, C: Verification> {
     parameters: &'p VaultParameters,
@@ -1095,7 +1177,7 @@ pub struct VaultGenerationIterator<'p, 's, C: Verification> {
 
 impl<'a, 's, C: Verification> VaultGenerationIterator<'a, 's, C> {
     // Can't be a std::iter::Iterator unless we copy the vault generation out, blech
-    pub fn next(&mut self) -> Option<&VaultGeneration> {
+     fn next(&mut self) -> Option<&VaultGeneration> {
         if self.done {
             return None;
         }
@@ -1112,7 +1194,7 @@ impl<'a, 's, C: Verification> VaultGenerationIterator<'a, 's, C> {
         self.generation.as_ref()
     }
 
-    pub fn next_with_depth(&mut self) -> Option<(Depth, &VaultGeneration)> {
+    fn next_with_depth(&mut self) -> Option<(Depth, &VaultGeneration)> {
         let current_depth = self.depth;
 
         self.next().map(|generation| (current_depth, generation))
@@ -1697,7 +1779,7 @@ impl VaultParameters {
     }
 
     // FIXME: Probably should create some sort of cache structure to pass around
-    pub fn templates_at_depth<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> VaultGeneration {
+    fn templates_at_depth<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> VaultGeneration {
         let mut iter = self.iter_templates(secp);
 
         loop {
@@ -1977,132 +2059,6 @@ pub enum WithdrawalSignError {
     PlaceholderError,
 }
 
-impl WithdrawalTransaction {
-    fn anchor_output_index(&self) -> u32 {
-        assert!(self.vault_withdrawal != VaultAmount::ZERO);
-
-        if self.vault_total > VaultAmount::ZERO {
-            2
-        } else {
-            1
-        }
-    }
-
-    pub fn anchor_outpoint(&self) -> OutPoint {
-        OutPoint {
-            txid: self.compute_txid(),
-            vout: self.anchor_output_index(),
-        }
-    }
-
-    pub fn anchor_output_psbt_input(&self) -> psbt::Input {
-        psbt::Input {
-            witness_utxo: Some(ephemeral_anchor()),
-            non_witness_utxo: Some(self.clone().into_transaction()),
-            final_script_witness: Some(Witness::new()),
-            ..Default::default()
-        }
-    }
-
-    pub fn hot_keypair<C: Signing>(&self, secp: &Secp256k1<C>, xpriv: &Xpriv) -> Result<Keypair, KeypairDerivationError> {
-        let keypair = xpriv.derive_priv(secp, &[
-            ChildNumber::from_normal_idx(self.depth as u32)
-                .expect("sane child number")
-        ])
-        .map(|xpriv| xpriv.to_keypair(secp))
-        .map_err(|e| {
-            match e {
-                bitcoin::bip32::Error::MaximumDepthExceeded => KeypairDerivationError::DerivationDepthExceeded,
-                _ => unreachable!("Xpriv derivation can only fail with maximum depth"),
-            }
-        })?;
-
-        if self.signing_info.pubkey != keypair.x_only_public_key().0 {
-            Err(KeypairDerivationError::WrongKey)
-        } else {
-            Ok(keypair)
-        }
-    }
-
-    fn to_transaction(&self) -> Transaction {
-        let output = iter::empty()
-            .chain(self.vault_output.clone())
-            .chain(Some(self.withdrawal_output.clone()))
-            .chain(Some(ephemeral_anchor()))
-            .collect();
-
-        Transaction {
-            version: transaction::Version::non_standard(3),
-            lock_time: LockTime::ZERO,
-            input: vec![self.vault_input.clone()],
-            output,
-        }
-    }
-
-    // FIXME: Result instead of Option?
-    pub fn into_signed_transaction(self) -> Option<Transaction> {
-        let mut vault_input = self.vault_input;
-        vault_input.witness = self.signing_info.build_witness(self.vault_signature?);
-
-        let output = iter::empty()
-            .chain(self.vault_output.clone())
-            .chain(Some(self.withdrawal_output.clone()))
-            .chain(Some(ephemeral_anchor()))
-            .collect();
-
-        Some(
-            Transaction {
-                version: transaction::Version::non_standard(3),
-                lock_time: LockTime::ZERO,
-                input: vec![vault_input],
-                output,
-            }
-        )
-    }
-
-
-    pub fn weight(&self) -> Weight {
-        let serialized_schnorr_sig_len = VarInt(SCHNORR_SIGNATURE_SIZE as u64).size() as u64 + SCHNORR_SIGNATURE_SIZE as u64;
-        let script_len = self.signing_info.script.len() as u64;
-        let serialized_script_len = VarInt(script_len).size() as u64 + script_len;
-        let control_block_len = self.signing_info.control_block.size() as u64;
-        let serialized_control_block_len = VarInt(control_block_len).size() as u64 + control_block_len;
-
-        self.clone().into_transaction().weight() +
-            if self.vault_signature.is_some() {
-                // We've already been signed, rust-bitcoin will
-                // calculate the correct weight
-                Weight::ZERO
-            } else {
-                Weight::from_wu(
-                    2 + 1 + // Segwit marker + witness item count
-                    serialized_schnorr_sig_len +
-                    serialized_script_len +
-                    serialized_control_block_len
-                )
-            }
-    }
-
-    pub fn sign_vault_input<C: Signing>(&mut self, secp: &Secp256k1<C>, keypair: &Keypair) -> Result<(), WithdrawalSignError> {
-        let prevout_txouts = vec![
-            &self.signing_info.vault_prevout,
-        ];
-
-        // TODO: also check that we actually satisfy the script, probably facilitated by hanging
-        // onto the script template instead of the serialized ScriptBuf
-        let prevouts = Prevouts::All(&prevout_txouts);
-
-        let transaction = self.clone().into_transaction();
-
-        let signature = self.signing_info.sign(secp, keypair, &transaction, &prevouts)
-            .map_err(|e| WithdrawalSignError::SighashError(e))?;
-
-        self.vault_signature = Some(signature);
-
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 pub enum KeypairDerivationError {
     WrongKey,
@@ -2296,7 +2252,7 @@ impl Vault {
                 .expect("if the branch exists so should the control block");
 
                 let signing_info = VaultOutputSigningInfo {
-                    pubkey: self.parameters.hot_key(&secp, dbg(spend_info.depth)),
+                    pubkey: self.parameters.hot_key(&secp, spend_info.depth),
                     control_block,
                     vault_prevout: spend_info.output,
                     //depth: spend_info.depth,
@@ -2530,7 +2486,6 @@ impl Vault {
                 pubkey: self.parameters.hot_key(&secp, spend_info.depth),
                 control_block,
                 vault_prevout: spend_info.output,
-                //depth: spend_info.depth,
                 script: branch.to_scriptbuf(),
             };
 
@@ -2553,7 +2508,7 @@ impl Vault {
                     txid: tx.compute_txid().map_err(|_| ())?,
                     vout: Some(0),
                     depth: tx.common().depth,
-                    transition: VaultTransition::Deposit(tx.vault_total()),
+                    transition: VaultTransition::Deposit(tx.common().vault_deposit),
                     result_value: tx.vault_total(),
                 },
                 None,

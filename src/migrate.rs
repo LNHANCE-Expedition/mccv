@@ -18,7 +18,7 @@ pub enum MigrationError {
     FinalizationFailed(rusqlite::Error),
 }
 
-fn get_and_clear_migration_version(connection: &mut Connection) -> Result<(rusqlite::Transaction, u32), rusqlite::Error> {
+fn get_and_clear_migration_version(connection: &mut Connection) -> Result<(rusqlite::Transaction<'_>, u32), rusqlite::Error> {
     connection.execute(r#"
         create table
             if not exists

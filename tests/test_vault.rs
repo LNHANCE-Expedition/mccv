@@ -167,8 +167,8 @@ fn test_deposit_withdraw() {
     let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
         .expect("create shape success");
 
-    /// FIXME: same deal, replace into_signed_transaction() with something that fits the usage
-    /// pattern
+    // FIXME: same deal, replace into_signed_transaction() with something that fits the usage
+    // pattern
     let transmittable_deposit_transaction = deposit_transaction.clone().into_signed_transaction()
         .expect("initial deposit doesn't require signing");
 
@@ -183,8 +183,8 @@ fn test_deposit_withdraw() {
     let args: Vec<serde_json::Value> = vec![
         mccv::vault::package_encodable(
             vec![
-                dbg!(&shape_transaction),
-                dbg!(&transmittable_deposit_transaction),
+                &shape_transaction,
+                &transmittable_deposit_transaction,
             ],
         ),
     ];
@@ -320,7 +320,7 @@ fn test_deposit_withdraw() {
     ];
 
     let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(result.get("package_msg"), Some(&"success".into()));
+    assert_eq!(result.get("package_msg"), Some(&"success".into()), "{:?}", result);
 
     let unspendable_key = XOnlyPublicKey::from_slice(&[1; 32]).unwrap();
     let unspendable_address = Address::p2tr(&secp, unspendable_key, None, Network::Regtest);
