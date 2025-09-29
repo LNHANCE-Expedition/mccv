@@ -1,9 +1,3 @@
-use bdk_wallet::{
-    error::CreateTxError,
-    Wallet,
-    KeychainKind
-};
-
 use bitcoin::bip32::{
     Xpriv,
     Xpub,
@@ -54,11 +48,9 @@ use bitcoin::{
     blockdata::locktime::relative,
     blockdata::transaction::Version,
     BlockHash,
-    FeeRate,
     key::TapTweak,
     OutPoint,
     psbt,
-    Psbt,
     ScriptBuf,
     Script,
     Sequence,
@@ -476,7 +468,7 @@ impl TailDepositTransactionTemplate {
             signature: None,
         }
     }
-    
+
     // TODO: optimize to eliminate the clone
     fn vault_template_hash(&self) -> sha256::Hash {
         let tx: Transaction = self.clone().common.into_transaction(
@@ -625,7 +617,7 @@ fn witness_weight(merkle_branches: Option<usize>, stack_item_sizes: &[u64]) -> W
     let control_block_weight = if let Some(merkle_branches) = merkle_branches {
         let cb_length = 33 + 32 * (merkle_branches as u64);
         let len = VarInt(cb_length);
-        
+
         Weight::from_wu(cb_length + len.size() as u64)
     } else {
         Weight::ZERO
@@ -718,7 +710,7 @@ impl DepositTransaction {
     }
 
     // TODO: Estimate weight without constructing the whole transaction
-    fn weight<C: Verification>(&self, secp: &Secp256k1<C>) -> Weight {
+    pub fn weight<C: Verification>(&self, secp: &Secp256k1<C>) -> Weight {
         let dummy_deposit = {
             let mut dummy = dummy_input(relative::LockTime::ZERO);
 
@@ -782,7 +774,7 @@ impl DepositTransaction {
     // This will be used directly once I defer generation of the deposit input witness
     fn deposit_script_hash(&self) -> TapLeafHash {
         let script = self.deposit_script();
-        
+
         TapLeafHash::from_script(
             script.as_script(),
             LeafVersion::TapScript,
@@ -1523,7 +1515,7 @@ impl VaultParameters {
                 let single_recovery_template = self.recovery_template(secp, depth + 1, VaultAmount::ZERO, withdrawal_amount);
                 let recovery_script = self.recovery_script(secp, depth, &single_recovery_template, 0);
                 let single_recovery_leaf = TapNodeHash::from_script(recovery_script.as_script(), LeafVersion::TapScript);
-                    
+
                 let recovery_node = if vault_total > VaultAmount::ZERO {
                     debug_assert!(withdrawal_amount.nonzero());
 
@@ -1760,7 +1752,7 @@ impl VaultHistoryTransaction {
     }
 
     pub fn into_parameters(&self,
-        parent_transition: Option<VaultTransition>, 
+        parent_transition: Option<VaultTransition>,
         max: Option<VaultAmount>
     ) -> Option<VaultStateParameters> {
         self.result_value
@@ -1794,26 +1786,20 @@ pub enum VaultInitializationError {
     ConfigurationError(rusqlite::Error),
 }
 
-#[derive(Debug)]
-pub enum VaultDepositError {
+#[derive(Clone,Copy,Debug)]
+pub enum DepositCreationError {
     InsufficientFunds,
     InvalidDepositAmount,
-    // FIXME: don't use bdk_wallet in your interface?
-    TransactionBuildError(CreateTxError),
     VaultClosed,
     /// Vault has used all of its available operations, use the cold key to move to a new vault
     VaultExpired,
     VaultOverflow(VaultAmount),
 }
 
-#[derive(Debug)]
-pub enum VaultWithdrawalError {
-    // FIXME: don't use bdk_wallet in your interface? maybe break this into two error enums with
-    // one handling the vault issues and the other handling "hot wallet" integration errors (bdk
-    // specific in this case). Not worth the effort ATM though IMHO
+#[derive(Clone,Copy,Debug)]
+pub enum WithdrawalCreationError {
     InsufficientFunds,
     InvalidWithdrawalAmount,
-    TransactionBuildError(CreateTxError),
     MissingTransactionTemplate,
     VaultClosed,
     FeeOverflow,
@@ -2085,7 +2071,7 @@ impl Vault {
         self.history.iter().rev()
             .skip_while(|(_tx, confirmation)| confirmation.is_none())
             .next()
-            .map(|(tx, _confirmation)| 
+            .map(|(tx, _confirmation)|
                  self.parameters.scale.scale_amount(tx.result_value)
              )
             .unwrap_or(Amount::ZERO)
@@ -2126,10 +2112,10 @@ impl Vault {
     // FIXME: I think this should be refactored into a stateless version on VaultParameters
     //  FIXME: return value should probably also have some kind of token for keeping track of
     //  replacements, preventing invalid deposit transactions from being tracked
-    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Result<DepositTransaction, VaultDepositError> {
+    pub fn create_deposit<C: Verification>(&self, secp: &Secp256k1<C>, deposit_amount: VaultAmount) -> Result<DepositTransaction, DepositCreationError> {
         if let Some((tx, _)) = self.history.last() {
             if deposit_amount > self.parameters.max_deposit_per_step {
-                return Err(VaultDepositError::InvalidDepositAmount);
+                return Err(DepositCreationError::InvalidDepositAmount);
             }
 
             // Ensure vault_total <= self.parameters.max
@@ -2139,7 +2125,7 @@ impl Vault {
 
             if let Some(overflow_amount) = overflow_amount {
                 if overflow_amount > VaultAmount::ZERO {
-                    return Err(VaultDepositError::VaultOverflow(overflow_amount));
+                    return Err(DepositCreationError::VaultOverflow(overflow_amount));
                 }
             }
         }
@@ -2156,7 +2142,7 @@ impl Vault {
                         txid: transaction.txid,
                         vout,
                     })
-                    .ok_or(VaultDepositError::VaultClosed)?;
+                    .ok_or(DepositCreationError::VaultClosed)?;
 
                 (
                     VaultStateParameters {
@@ -2317,7 +2303,7 @@ impl Vault {
         }
     }
 
-    pub fn create_withdrawal<C: Verification>(&self, secp: &Secp256k1<C>, withdrawal_amount: VaultAmount) -> Result<WithdrawalTransaction, VaultWithdrawalError> {
+    pub fn create_withdrawal<C: Verification>(&self, secp: &Secp256k1<C>, withdrawal_amount: VaultAmount) -> Result<WithdrawalTransaction, WithdrawalCreationError> {
         let depth = self.get_current_depth();
 
         let transition = VaultTransition::Withdrawal(withdrawal_amount);
@@ -2326,24 +2312,24 @@ impl Vault {
             .unwrap_or(VaultAmount::ZERO);
 
         let (last_vault_transaction, _) = self.history.last()
-            .ok_or(VaultWithdrawalError::VaultClosed)?;
+            .ok_or(WithdrawalCreationError::VaultClosed)?;
 
         let previous_output = last_vault_transaction.outpoint()
-            .ok_or(VaultWithdrawalError::VaultClosed)?;
+            .ok_or(WithdrawalCreationError::VaultClosed)?;
 
         let _ = current_vault_amount.apply_transition(transition, None)
-            .ok_or(VaultWithdrawalError::InsufficientFunds)?;
+            .ok_or(WithdrawalCreationError::InsufficientFunds)?;
 
         let parameters = last_vault_transaction.to_child_parameters(VaultTransition::Withdrawal(withdrawal_amount));
 
         // FIXME: maybe this should return a Result<> instead so I can disambiguate cases
         self.parameters.validate_parameters(parameters, depth)
-            .ok_or(VaultWithdrawalError::InsufficientFunds)?;
+            .ok_or(WithdrawalCreationError::InsufficientFunds)?;
 
         let templates = self.parameters.templates_at_depth(secp, depth);
 
         let vault_tx_template = templates.get(&parameters)
-            .ok_or(VaultWithdrawalError::MissingTransactionTemplate)?;
+            .ok_or(WithdrawalCreationError::MissingTransactionTemplate)?;
 
         let withdrawal_template = match vault_tx_template {
             VaultTransactionTemplate::Deposit(_) => unreachable!("withdrawal transition must produce a withdrawal transaction template"),
@@ -2385,10 +2371,10 @@ impl Vault {
                     output: parent_txout,
                 }
             })
-            .ok_or(VaultWithdrawalError::MissingSpendInfo)?;
+            .ok_or(WithdrawalCreationError::MissingSpendInfo)?;
 
         let branch = spend_info.branches.get(&VaultOutputSpendCondition::Withdrawal(withdrawal_amount))
-            .ok_or(VaultWithdrawalError::InvalidWithdrawalAmount)?;
+            .ok_or(WithdrawalCreationError::InvalidWithdrawalAmount)?;
 
         let control_block = spend_info.spend_info.control_block(&(
                 branch.to_scriptbuf(),
@@ -2459,174 +2445,6 @@ impl Vault {
     }
 }
 
-/// When calculating the weight of transactions that have no witness data (yet), rust-bitcoin
-/// assumes they are non-segwit transactions, and skips the segwit marker
-const SEGWIT_MARKER_WEIGHT: Weight = Weight::from_wu(2);
-
-/// When manually calculating the weight of an unsigned transaction, we need to include the weight
-/// of the witness-item-count in addition to max_weight_to_satisfy(). We hardcode this to 1 because
-/// we will never have a witness bigger than 0xFC items.
-const WITNESS_ITEM_COUNT_WEIGHT: Weight = Weight::from_wu(1);
-
-pub trait VaultDepositor {
-    fn create_shape<C: Verification>(&mut self, secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError>;
-}
-
-impl VaultDepositor for Wallet {
-    fn create_shape<C: Verification>(&mut self, secp: &Secp256k1<C>, deposit_transaction: &mut DepositTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultDepositError> {
-        let (script_pubkey, deposit_amount) = deposit_transaction.payment_info(secp);
-        let mut shape_weight = Weight::ZERO;
-        // This weight should be correct already 
-        let deposit_weight = deposit_transaction.weight(secp);
-        let mut fee_amount = fee_rate * (shape_weight + deposit_weight);
-
-        let shape_psbt = loop {
-            let mut builder = self.build_tx();
-            builder
-                .version(3)
-                .fee_absolute(Amount::ZERO)
-                .add_recipient(script_pubkey.as_script(), deposit_amount + fee_amount);
-
-            let shape_psbt = builder.finish()
-                .map_err(|e| {
-                    match e {
-                        CreateTxError::CoinSelection(_cs) => VaultDepositError::InsufficientFunds,
-                        _ => VaultDepositError::TransactionBuildError(e),
-                    }
-                })?;
-
-            let shape_tx = &shape_psbt.unsigned_tx;
-
-            let index = self.spk_index();
-            shape_weight = shape_tx
-                .input
-                .iter()
-                .flat_map(|txin| {
-                    index
-                        .txout(txin.previous_output)
-                        .map(|((keychain, derivation_index), _txout)| {
-                            let descriptor = self.public_descriptor(keychain);
-
-                            let derived = descriptor.at_derivation_index(derivation_index)
-                                .expect("this better work"); // TODO: Replace with error variant
-                            
-                            // TODO: we can do better than this, but this should be fine for now
-                            derived.max_weight_to_satisfy()
-                                .expect("this better work") // TODO: replace with error variant
-                        })
-                })
-                .fold(shape_tx.weight() + SEGWIT_MARKER_WEIGHT, |x, y| x + y);
-
-            let total_weight = shape_weight + deposit_weight;
-            let minimum_fee = fee_rate.checked_mul_by_weight(total_weight)
-                .expect("fee shouldn't overflow"); // TODO: replace with error variant
-
-            if fee_amount >= minimum_fee {
-                break shape_psbt;
-            }
-
-            // Update the absolute fee we must supply
-            fee_amount = if fee_amount >= minimum_fee {
-                fee_amount
-            } else {
-                minimum_fee
-            };
-        };
-
-        let shape_txid = shape_psbt.unsigned_tx.compute_txid();
-
-        let (shape_output_index, _shape_txout) = shape_psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .enumerate()
-            .find(|(_i, txout)| txout.script_pubkey == *script_pubkey)
-            .expect("shape psbt must have output we just added to it");
-
-        deposit_transaction.connect_input(
-            secp,
-            OutPoint {
-                txid: shape_txid,
-                vout: shape_output_index as u32,
-            },
-            shape_psbt.unsigned_tx.output[shape_output_index].clone(),
-        );
-
-        Ok(shape_psbt)
-    }
-}
-
-pub trait VaultWithdrawer {
-    /// Create a child-pays-for-parent transaction to bump a withdrawal transaciton
-    fn create_cpfp<C: Verification>(&mut self, _secp: &Secp256k1<C>, withdrawal_transaction: &WithdrawalTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultWithdrawalError>;
-}
-
-impl VaultWithdrawer for Wallet {
-    fn create_cpfp<C: Verification>(&mut self, _secp: &Secp256k1<C>, withdrawal_transaction: &WithdrawalTransaction, fee_rate: FeeRate) -> Result<Psbt, VaultWithdrawalError> {
-        let parent_weight = withdrawal_transaction.weight();
-        let mut child_weight = Weight::ZERO;
-
-        let anchor_outpoint = withdrawal_transaction.anchor_outpoint();
-        let psbt_input = withdrawal_transaction.anchor_output_psbt_input();
-        let change_address = self.reveal_next_address(KeychainKind::Internal);
-
-        loop {
-            let total_fee = fee_rate.checked_mul_by_weight(parent_weight + child_weight)
-                .ok_or(VaultWithdrawalError::FeeOverflow)?;
-
-            let mut builder = self.build_tx();
-            builder
-                .version(3)
-                .fee_absolute(total_fee)
-                .drain_to(change_address.script_pubkey())
-                .add_foreign_utxo(anchor_outpoint, psbt_input.clone(), Weight::ZERO)
-                .expect("we provide correct foreign utxo metadata");
-
-            let cpfp_psbt = builder.finish()
-                .map_err(|e| {
-                    match e {
-                        CreateTxError::CoinSelection(_cs) => VaultWithdrawalError::InsufficientFunds,
-                        _ => VaultWithdrawalError::TransactionBuildError(e),
-                    }
-                })?;
-
-            let index = self.spk_index();
-            child_weight = cpfp_psbt
-                .unsigned_tx
-                .input
-                .iter()
-                .filter(|txin| txin.previous_output != anchor_outpoint)
-                .flat_map(|txin| {
-                    index
-                        .txout(txin.previous_output)
-                        .map(|((keychain, derivation_index), _txout)| {
-                            let descriptor = self.public_descriptor(keychain);
-
-                            let derived = descriptor.at_derivation_index(derivation_index)
-                                .expect("this better work"); // TODO: replace with error variant
-                            
-                            // TODO: we can do better than this, but this should be fine for now
-                            derived.max_weight_to_satisfy()
-                                .expect("this better work") // TODO: replace with error variant
-                                + WITNESS_ITEM_COUNT_WEIGHT
-                        })
-                })
-                .fold(cpfp_psbt.unsigned_tx.weight() + SEGWIT_MARKER_WEIGHT, |x, y| x + y);
-
-            let total_weight = child_weight + parent_weight;
-
-            let minimum_fee = fee_rate.checked_mul_by_weight(total_weight)
-                .ok_or(VaultWithdrawalError::FeeOverflow)?;
-
-            if total_fee >= minimum_fee {
-                break Ok(cpfp_psbt)
-            } else {
-                //eprintln!("{total_fee} < {minimum_fee}");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -2649,7 +2467,7 @@ mod test {
         VaultAmount(amount)
     }
 
-    // master xpriv derived from milk sad key, 
+    // master xpriv derived from milk sad key,
     // XXX: copied in two places
     fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) {
         let milk_sad_master = Xpriv::from_str("tprv8ZgxMBicQKsPd1EzCPZcQSPhsotX5HvRDCivA7ASNQFmjWuTsW3WWEwUNKFAZrnD9qpz55rtyLdphqkwRZUqNWYXwSEzd6P4pYvXGByRim3").unwrap();
@@ -2927,7 +2745,7 @@ mod test {
         initial_deposits.sort();
 
         assert_eq!(
-            initial_deposits, 
+            initial_deposits,
             vec![
                 VaultStateParameters {
                     transition: deposit(1),
@@ -2956,7 +2774,7 @@ mod test {
         generation.sort();
 
         assert_eq!(
-            generation, 
+            generation,
             vec![
                 VaultStateParameters {
                     transition: withdrawal(1),
@@ -3044,7 +2862,7 @@ mod test {
         generation.sort();
 
         assert_eq!(
-            generation, 
+            generation,
             vec![
                 VaultStateParameters {
                     transition: withdrawal(1),

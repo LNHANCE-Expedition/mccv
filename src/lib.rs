@@ -1,6 +1,7 @@
+pub mod bip119;
 mod migrate;
 pub mod vault;
-pub mod bip119;
+pub mod wallet;
 
 pub use vault::{
     AccountId,
@@ -9,5 +10,9 @@ pub use vault::{
     VaultParameters,
     VaultScale,
     Vault,
+};
+
+pub use wallet::{
     VaultDepositor,
+    VaultWithdrawer,
 };
