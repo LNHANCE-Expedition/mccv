@@ -468,7 +468,7 @@ impl TailDepositTransactionTemplate {
             signature: None,
         }
     }
-    
+
     // TODO: optimize to eliminate the clone
     fn vault_template_hash(&self) -> sha256::Hash {
         let tx: Transaction = self.clone().common.into_transaction(
@@ -617,7 +617,7 @@ fn witness_weight(merkle_branches: Option<usize>, stack_item_sizes: &[u64]) -> W
     let control_block_weight = if let Some(merkle_branches) = merkle_branches {
         let cb_length = 33 + 32 * (merkle_branches as u64);
         let len = VarInt(cb_length);
-        
+
         Weight::from_wu(cb_length + len.size() as u64)
     } else {
         Weight::ZERO
@@ -774,7 +774,7 @@ impl DepositTransaction {
     // This will be used directly once I defer generation of the deposit input witness
     fn deposit_script_hash(&self) -> TapLeafHash {
         let script = self.deposit_script();
-        
+
         TapLeafHash::from_script(
             script.as_script(),
             LeafVersion::TapScript,
@@ -1515,7 +1515,7 @@ impl VaultParameters {
                 let single_recovery_template = self.recovery_template(secp, depth + 1, VaultAmount::ZERO, withdrawal_amount);
                 let recovery_script = self.recovery_script(secp, depth, &single_recovery_template, 0);
                 let single_recovery_leaf = TapNodeHash::from_script(recovery_script.as_script(), LeafVersion::TapScript);
-                    
+
                 let recovery_node = if vault_total > VaultAmount::ZERO {
                     debug_assert!(withdrawal_amount.nonzero());
 
@@ -1752,7 +1752,7 @@ impl VaultHistoryTransaction {
     }
 
     pub fn into_parameters(&self,
-        parent_transition: Option<VaultTransition>, 
+        parent_transition: Option<VaultTransition>,
         max: Option<VaultAmount>
     ) -> Option<VaultStateParameters> {
         self.result_value
@@ -2071,7 +2071,7 @@ impl Vault {
         self.history.iter().rev()
             .skip_while(|(_tx, confirmation)| confirmation.is_none())
             .next()
-            .map(|(tx, _confirmation)| 
+            .map(|(tx, _confirmation)|
                  self.parameters.scale.scale_amount(tx.result_value)
              )
             .unwrap_or(Amount::ZERO)
@@ -2467,7 +2467,7 @@ mod test {
         VaultAmount(amount)
     }
 
-    // master xpriv derived from milk sad key, 
+    // master xpriv derived from milk sad key,
     // XXX: copied in two places
     fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) {
         let milk_sad_master = Xpriv::from_str("tprv8ZgxMBicQKsPd1EzCPZcQSPhsotX5HvRDCivA7ASNQFmjWuTsW3WWEwUNKFAZrnD9qpz55rtyLdphqkwRZUqNWYXwSEzd6P4pYvXGByRim3").unwrap();
@@ -2745,7 +2745,7 @@ mod test {
         initial_deposits.sort();
 
         assert_eq!(
-            initial_deposits, 
+            initial_deposits,
             vec![
                 VaultStateParameters {
                     transition: deposit(1),
@@ -2774,7 +2774,7 @@ mod test {
         generation.sort();
 
         assert_eq!(
-            generation, 
+            generation,
             vec![
                 VaultStateParameters {
                     transition: withdrawal(1),
@@ -2862,7 +2862,7 @@ mod test {
         generation.sort();
 
         assert_eq!(
-            generation, 
+            generation,
             vec![
                 VaultStateParameters {
                     transition: withdrawal(1),
