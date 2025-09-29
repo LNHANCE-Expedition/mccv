@@ -35,7 +35,7 @@ use mccv::{
     VaultScale,
     Vault,
     VaultDepositor,
-    vault::VaultWithdrawer,
+    VaultWithdrawer,
     vault::SqliteVaultStorage,
 };
 
