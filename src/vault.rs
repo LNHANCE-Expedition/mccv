@@ -210,10 +210,6 @@ impl VaultAmount {
         self.0
     }
 
-    fn nonzero(&self) -> bool {
-        self.0 > 0
-    }
-
     pub fn apply_transition(&self, transition: VaultTransition, max: Option<VaultAmount>) -> Option<VaultAmount> {
         match transition {
             VaultTransition::Deposit(deposit_amount) => {
@@ -368,7 +364,7 @@ impl VaultStateParameters {
     fn assert_valid(&self) {
         match self.transition {
             VaultTransition::Withdrawal(amount) => {
-                assert!(self.previous_value.nonzero());
+                assert!(self.previous_value > VaultAmount::ZERO);
                 assert!(amount <= self.previous_value);
             }
             _ => {},
@@ -1383,7 +1379,7 @@ impl VaultParameters {
         // Spending path for vault-output-only recovery
         // Only create if there is actually value left in the vault after the withdrawal, and
         // if this is a withdrawal (otherwise this template is redundant)
-        if vault_value.nonzero() && withdrawal_amount.nonzero() {
+        if vault_value > VaultAmount::ZERO && withdrawal_amount > VaultAmount::ZERO {
             let recovery_tx = self.recovery_template(secp, depth + 1, vault_value, withdrawal_amount);
 
             transitions.push(
@@ -1492,7 +1488,7 @@ impl VaultParameters {
                 )
             }
             VaultTransition::Withdrawal(withdrawal_amount) => {
-                assert!(VaultAmount::ZERO <= withdrawal_amount && withdrawal_amount <= self.max);
+                assert!(VaultAmount::ZERO < withdrawal_amount && withdrawal_amount <= self.max);
 
                 let parent_transition = parameters.parent_transition.expect("withdrawal must have parent transaction");
 
@@ -1517,8 +1513,6 @@ impl VaultParameters {
                 let single_recovery_leaf = TapNodeHash::from_script(recovery_script.as_script(), LeafVersion::TapScript);
 
                 let recovery_node = if vault_total > VaultAmount::ZERO {
-                    debug_assert!(withdrawal_amount.nonzero());
-
                     let double_recovery_tx = self.recovery_template(secp, depth + 1, vault_total, withdrawal_amount);
 
                     let double_recovery_script = self.recovery_script(secp, depth, &double_recovery_tx, 1);
