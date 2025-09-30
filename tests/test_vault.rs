@@ -37,6 +37,7 @@ use mccv::{
     VaultDepositor,
     VaultWithdrawer,
     vault::SqliteVaultStorage,
+    vault::SubmitPackage,
 };
 
 pub fn get_test_node() -> (corepc_node::Node, Client) {
@@ -178,17 +179,9 @@ fn test_deposit_withdraw() {
 
     assert!(sign_success);
 
-    let args: Vec<serde_json::Value> = vec![
-        mccv::vault::package_encodable(
-            vec![
-                &shape_transaction,
-                &transmittable_deposit_transaction,
-            ],
-        ),
-    ];
-
-    let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(result.get("package_msg"), Some(&"success".into()), "{:?}", result);
+    client
+        .submit_package(&[&shape_transaction, &transmittable_deposit_transaction])
+        .expect("package submit success");
 
     let _ = client.get_mempool_entry(&shape_transaction.compute_txid())
         .expect("shape tx in mempool");
@@ -245,17 +238,9 @@ fn test_deposit_withdraw() {
     //eprintln!("tx {} = {shape_transaction:?}", shape_transaction.compute_txid());
     //eprintln!("tx {} = {:?}", transmittable_deposit_transaction.compute_txid(), &transmittable_deposit_transaction);
 
-    let args: Vec<serde_json::Value> = vec![
-        mccv::vault::package_encodable(
-            vec![
-                &shape_transaction,
-                &transmittable_deposit_transaction,
-            ],
-        ),
-    ];
-
-    let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(result.get("package_msg"), Some(&"success".into()));
+    client
+        .submit_package(&[&shape_transaction, &transmittable_deposit_transaction])
+        .expect("package submission success");
 
     vault.add_transaction(deposit_transaction.into())
         .expect("deposit transaction should add cleanly");
@@ -305,17 +290,9 @@ fn test_deposit_withdraw() {
     client.send_raw_transaction(&transmittable_withdrawal_transaction)
         .expect_err("can't broadcast withdrawal without a cpfp");
 
-    let args: Vec<serde_json::Value> = vec![
-        mccv::vault::package_encodable(
-            vec![
-                &transmittable_withdrawal_transaction,
-                &withdrawal_cpfp,
-            ],
-        ),
-    ];
-
-    let result: serde_json::Value = client.call("submitpackage", args.as_ref()).unwrap();
-    assert_eq!(result.get("package_msg"), Some(&"success".into()), "{:?}", result);
+    client
+        .submit_package(&[&transmittable_withdrawal_transaction, &withdrawal_cpfp])
+        .expect("package submission success");
 
     let unspendable_key = XOnlyPublicKey::from_slice(&[1; 32]).unwrap();
     let unspendable_address = Address::p2tr(&secp, unspendable_key, None, Network::Regtest);

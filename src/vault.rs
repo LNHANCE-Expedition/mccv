@@ -1,3 +1,6 @@
+#[cfg(feature = "bitcoind")]
+use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi, self};
+
 use bitcoin::bip32::{
     Xpriv,
     Xpub,
@@ -9,7 +12,7 @@ use bitcoin::bip32::{
 use bitcoin::Block;
 
 #[cfg(feature = "bitcoind")]
-use bitcoin::consensus::{Encodable, encode::serialize_hex};
+use bitcoin::consensus::encode::serialize_hex;
 
 use bitcoin::hashes::{
     Hash,
@@ -1866,15 +1869,37 @@ impl DerefMut for SqliteVaultStorage {
 }
 
 #[cfg(feature = "bitcoind")]
-pub fn package_encodable<E, I>(iter: I) -> serde_json::Value
-where
-    I: IntoIterator<Item = E>,
-    E: Encodable,
-{
-    iter
-        .into_iter()
-        .map(|e| serialize_hex(&e))
-        .collect()
+#[derive(Debug)]
+pub enum SubmitPackageError {
+    RpcError(bitcoincore_rpc::Error),
+    Error(serde_json::Value),
+}
+
+#[cfg(feature = "bitcoind")]
+pub trait SubmitPackage {
+    fn submit_package(&self, transactions: &[&Transaction]) -> Result<(), SubmitPackageError>;
+}
+
+#[cfg(feature = "bitcoind")]
+impl SubmitPackage for Client {
+    fn submit_package(&self, transactions: &[&Transaction]) -> Result<(), SubmitPackageError> {
+        let transactions: serde_json::Value = transactions
+            .into_iter()
+            .map(|e| serialize_hex(e))
+            .collect();
+
+        let result: serde_json::Value = self.call(
+            "submitpackage",
+            vec![transactions].as_ref(),
+        )
+        .map_err(|e| SubmitPackageError::RpcError(e))?;
+
+        if result.get("package_msg") == Some(&"success".into()) {
+            Ok(())
+        } else {
+            Err(SubmitPackageError::Error(result))
+        }
+    }
 }
 
 #[derive(Clone,Hash,Eq,PartialEq)]
