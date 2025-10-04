@@ -15,12 +15,14 @@ use bitcoin::{
     bip32::Xpub,
     FeeRate,
     Network,
+    relative,
     Txid,
 };
 
 use bitcoin::secp256k1::{
     Secp256k1,
     Signing,
+    Verification,
     XOnlyPublicKey,
 };
 
@@ -107,6 +109,17 @@ fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) 
     )
 }
 
+fn advance_chain<C: Verification>(secp: &Secp256k1<C>, wallet: &mut Wallet, client: &Client, num_blocks: u64) {
+    let unspendable_address = {
+        let unspendable_key = XOnlyPublicKey::from_slice(&[1; 32]).unwrap();
+        Address::p2tr(secp, unspendable_key, None, Network::Regtest)
+    };
+
+    client.generate_to_address(num_blocks, &unspendable_address).unwrap();
+
+    update_wallet(wallet, client);
+}
+
 // Test cases to add:
 // - deposit greater than max
 // - clawback
@@ -141,7 +154,8 @@ fn test_deposit_withdraw() {
 
     let genesis_checkpoint = wallet.local_chain().get(0).expect("chain has genesis block");
 
-    generate_to_wallet(&mut wallet, &client, 100);
+    generate_to_wallet(&mut wallet, &client, 1);
+    advance_chain(&secp, &mut wallet, &client, 100);
 
     let balance = wallet.balance();
 
@@ -284,25 +298,54 @@ fn test_deposit_withdraw() {
     let transmittable_withdrawal_transaction = withdrawal_transaction.to_signed_transaction()
         .expect("signed tx");
 
-    vault.add_transaction(withdrawal_transaction.into())
+    vault.add_transaction(withdrawal_transaction.clone().into())
         .expect("can add withdrawal");
 
     client.send_raw_transaction(&transmittable_withdrawal_transaction)
         .expect_err("can't broadcast withdrawal without a cpfp");
 
+    // Just make sure all wallet coins are spendable now
+    advance_chain(&secp, &mut wallet, &client, 100);
+
     client
         .submit_package(&[&transmittable_withdrawal_transaction, &withdrawal_cpfp])
         .expect("package submission success");
 
-    let unspendable_key = XOnlyPublicKey::from_slice(&[1; 32]).unwrap();
-    let unspendable_address = Address::p2tr(&secp, unspendable_key, None, Network::Regtest);
-
-    client.generate_to_address(1, &unspendable_address).unwrap();
-
+    advance_chain(&secp, &mut wallet, &client, 1);
     update_vault(&mut vault, &mut vault_block_emitter);
     assert_eq!(vault.get_confirmed_balance(), total_deposit);
 
+    let withdrawal_spend = withdrawal_transaction.spend_withdrawal();
+
+    let keypair = withdrawal_spend.hot_keypair(&secp, &hot_xpriv).expect("derive withdrawal hot keypair");
+
+    let dest = wallet.reveal_next_address(KeychainKind::External);
+
+    let withdrawal_spend_tx = withdrawal_spend.spend(&secp, &keypair, dest.script_pubkey(), Amount::ZERO, FeeRate::BROADCAST_MIN)
+        .expect("generate spend tx success");
 
 
-    todo!("complete withdrawal by either spending it to the BDK wallet, or somehow informing BDK how to spend the timelocked withdrawal output")
+    client.send_raw_transaction(&withdrawal_spend_tx)
+        .expect_err("can't broadcast yet");
+
+    let wait_blocks = match withdrawal_spend.timelock() {
+        relative::LockTime::Blocks(blocks) => blocks.value(),
+        relative::LockTime::Time(_) => unreachable!("must be relative blocks"),
+    };
+
+    advance_chain(&secp, &mut wallet, &client, wait_blocks.into());
+    client.send_raw_transaction(&withdrawal_spend_tx)
+        .expect("valid now");
+
+    let balance_before_update = wallet.balance();
+    let withdrawal_value = withdrawal_spend_tx.output[0].value;
+
+    advance_chain(&secp, &mut wallet, &client, 1);
+
+    let balance_after_update = wallet.balance();
+
+    assert_eq!(
+        balance_before_update.confirmed + withdrawal_value,
+        balance_after_update.confirmed,
+    );
 }

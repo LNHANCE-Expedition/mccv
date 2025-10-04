@@ -24,12 +24,12 @@ use crate::vault::{
 
 /// When calculating the weight of transactions that have no witness data (yet), rust-bitcoin
 /// assumes they are non-segwit transactions, and skips the segwit marker
-const SEGWIT_MARKER_WEIGHT: Weight = Weight::from_wu(2);
+pub(crate) const SEGWIT_MARKER_WEIGHT: Weight = Weight::from_wu(2);
 
 /// When manually calculating the weight of an unsigned transaction, we need to include the weight
 /// of the witness-item-count in addition to max_weight_to_satisfy(). We hardcode this to 1 because
 /// we will never have a witness bigger than 0xFC items.
-const WITNESS_ITEM_COUNT_WEIGHT: Weight = Weight::from_wu(1);
+pub(crate) const WITNESS_ITEM_COUNT_WEIGHT: Weight = Weight::from_wu(1);
 
 pub trait VaultDepositor {
     type Error;

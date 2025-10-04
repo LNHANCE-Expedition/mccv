@@ -51,6 +51,7 @@ use bitcoin::{
     blockdata::locktime::relative,
     blockdata::transaction::Version,
     BlockHash,
+    FeeRate,
     key::TapTweak,
     OutPoint,
     psbt,
@@ -102,13 +103,15 @@ use std::iter;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
+use crate::bip119::get_default_template;
+
 use crate::migrate::{
     configure,
     migrate,
     MigrationError,
 };
 
-use crate::bip119::get_default_template;
+use crate::wallet::SEGWIT_MARKER_WEIGHT;
 
 // struct.unpack(">I", hashlib.sha256(b'mccv').digest()[:4])[0] & 0x7FFFFFFF
 const PURPOSE: u32 = 360843587;
@@ -885,7 +888,7 @@ struct WithdrawalTransactionTemplate {
 }
 
 impl WithdrawalTransactionTemplate {
-    fn instantiate(&self, vault_prevout: OutPoint, signing_info: VaultOutputSigningInfo) -> WithdrawalTransaction {
+    fn instantiate(&self, vault_prevout: OutPoint, signing_info: VaultOutputSigningInfo, withdrawal_output_info: WithdrawalOutputInfo) -> WithdrawalTransaction {
         let vault_input = TxIn {
             previous_output: vault_prevout,
             script_sig: ScriptBuf::new(),
@@ -902,6 +905,7 @@ impl WithdrawalTransactionTemplate {
             vault_signature: None,
             vault_output: self.vault_output.clone(),
             withdrawal_output: self.withdrawal_output.clone(),
+            withdrawal_output_info,
         }
     }
 
@@ -926,6 +930,47 @@ impl WithdrawalTransactionTemplate {
 }
 
 #[derive(Clone,Debug)]
+struct WithdrawalOutputInfo {
+    timelock: relative::LockTime,
+    single_recovery_script: ScriptBuf,
+    double_recovery_script: Option<ScriptBuf>,
+    timelocked_withdrawal_script: ScriptBuf,
+    hot_pubkey: XOnlyPublicKey,
+    master_pubkey: XOnlyPublicKey,
+}
+
+impl WithdrawalOutputInfo {
+    fn recovery_node_hash(&self) -> TapNodeHash {
+        let single = TapNodeHash::from_script(self.single_recovery_script.as_script(), LeafVersion::TapScript);
+
+        if let Some(ref double) = self.double_recovery_script {
+            let double = TapNodeHash::from_script(double.as_script(), LeafVersion::TapScript);
+            TapNodeHash::from_node_hashes(single, double)
+        } else {
+            single
+        }
+    }
+
+    fn root_node_hash(&self) -> TapNodeHash {
+        let recovery = self.recovery_node_hash();
+
+        let timelocked_withdrawal = TapNodeHash::from_script(self.timelocked_withdrawal_script.as_script(), LeafVersion::TapScript);
+
+        TapNodeHash::from_node_hashes(recovery, timelocked_withdrawal)
+    }
+
+    fn script_pubkey<C: Verification>(&self, secp: &Secp256k1<C>) -> ScriptBuf {
+        let root_node_hash = self.root_node_hash();
+        ScriptBuf::new_p2tr(secp, self.master_pubkey, Some(root_node_hash))
+    }
+
+    fn timelocked_withdrawal_merkle_branch(&self) -> TaprootMerkleBranch {
+        [self.recovery_node_hash()].try_into()
+            .expect("single branch cannot overflow max depth")
+    }
+}
+
+#[derive(Clone,Debug)]
 pub struct WithdrawalTransaction {
     depth: Depth,
     vault_input: TxIn,
@@ -935,6 +980,8 @@ pub struct WithdrawalTransaction {
 
     vault_total: VaultAmount,
     vault_withdrawal: VaultAmount,
+
+    withdrawal_output_info: WithdrawalOutputInfo,
 
     /// Information required to sign the vault output that this transaction spends
     signing_info: VaultOutputSigningInfo,
@@ -1025,6 +1072,21 @@ impl WithdrawalTransaction {
         )
     }
 
+    pub fn spend_withdrawal(self) -> WithdrawalSpendTransaction {
+        WithdrawalSpendTransaction {
+            depth: self.depth,
+            prevout: OutPoint {
+                txid: self.compute_txid(),
+                vout: if self.vault_output.is_some() {
+                    1
+                } else {
+                    0
+                },
+            },
+            withdrawal_output: self.withdrawal_output,
+            withdrawal_output_info: self.withdrawal_output_info,
+        }
+    }
 
     pub fn weight(&self) -> Weight {
         let serialized_schnorr_sig_len = VarInt(SCHNORR_SIGNATURE_SIZE as u64).size() as u64 + SCHNORR_SIGNATURE_SIZE as u64;
@@ -1065,6 +1127,141 @@ impl WithdrawalTransaction {
         self.vault_signature = Some(signature);
 
         Ok(())
+    }
+}
+
+#[derive(Clone,Debug)]
+pub enum WithdrawalSpendError {
+    FeeTooLarge,
+    SighashError(sighash::TaprootError),
+    FeeOverflow,
+}
+
+#[derive(Clone,Debug)]
+pub struct WithdrawalSpendTransaction {
+    depth: Depth,
+    prevout: OutPoint,
+    withdrawal_output: TxOut,
+    withdrawal_output_info: WithdrawalOutputInfo,
+}
+
+impl WithdrawalSpendTransaction {
+    pub fn timelock(&self) -> relative::LockTime {
+        self.withdrawal_output_info.timelock
+    }
+
+    pub fn hot_keypair<C: Signing>(&self, secp: &Secp256k1<C>, xpriv: &Xpriv) -> Result<Keypair, KeypairDerivationError> {
+        let keypair = xpriv.derive_priv(secp, &[
+            ChildNumber::from_normal_idx(self.depth as u32)
+                .expect("sane child number")
+        ])
+        .map(|xpriv| xpriv.to_keypair(secp))
+        .map_err(|e| {
+            match e {
+                bitcoin::bip32::Error::MaximumDepthExceeded => KeypairDerivationError::DerivationDepthExceeded,
+                _ => unreachable!("Xpriv derivation can only fail with maximum depth"),
+            }
+        })?;
+
+        if self.withdrawal_output_info.hot_pubkey != keypair.x_only_public_key().0 {
+            Err(KeypairDerivationError::WrongKey)
+        } else {
+            Ok(keypair)
+        }
+    }
+
+    pub fn spend<C: Signing + Verification>(&self, secp: &Secp256k1<C>, keypair: &Keypair, script_pubkey: ScriptBuf, min_fee: Amount, min_fee_rate: FeeRate) -> Result<Transaction, WithdrawalSpendError> {
+        let mut transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: self.prevout,
+                    script_sig: ScriptBuf::new(),
+                    sequence: self.withdrawal_output_info.timelock.into(),
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![
+                TxOut {
+                    value: self.withdrawal_output.value - min_fee,
+                    script_pubkey,
+                }
+            ],
+        };
+
+        if min_fee > self.withdrawal_output.value {
+            return Err(WithdrawalSpendError::FeeTooLarge);
+        }
+
+        let tap_leaf_hash = TapLeafHash::from_script(
+            self
+                .withdrawal_output_info
+                .timelocked_withdrawal_script
+                .as_script(),
+            LeafVersion::TapScript,
+        );
+
+        let tap_node_hash = self.withdrawal_output_info.root_node_hash();
+
+        let (_output_key, output_key_parity) = self.withdrawal_output_info.master_pubkey.tap_tweak(secp, Some(tap_node_hash));
+
+        let control_block = ControlBlock {
+            leaf_version: LeafVersion::TapScript,
+            output_key_parity,
+            internal_key: self.withdrawal_output_info.master_pubkey,
+            merkle_branch: self.withdrawal_output_info.timelocked_withdrawal_merkle_branch(),
+        };
+
+        let script_len = self.withdrawal_output_info.timelocked_withdrawal_script.len();
+        let control_block_len = control_block.size();
+
+        let weight = transaction.weight()
+            + SEGWIT_MARKER_WEIGHT
+            + Weight::from_wu(VarInt(3).size() as u64) // 1 witness item
+            + Weight::from_wu(VarInt(SCHNORR_SIGNATURE_SIZE as u64).size() as u64)
+            + Weight::from_wu(SCHNORR_SIGNATURE_SIZE as u64)
+            + Weight::from_wu(VarInt(script_len as u64).size() as u64)
+            + Weight::from_wu(script_len as u64)
+            + Weight::from_wu(VarInt(control_block_len as u64).size() as u64)
+            + Weight::from_wu(control_block_len as u64);
+
+        let fee = min_fee_rate.checked_mul_by_weight(weight)
+            .ok_or(WithdrawalSpendError::FeeOverflow)?;
+
+        let fee = std::cmp::max(min_fee, fee);
+
+        transaction.output[0].value = self.withdrawal_output.value - fee;
+
+        let prevout_txouts = vec![
+            &self.withdrawal_output,
+        ];
+
+        let prevouts = Prevouts::All(&prevout_txouts);
+
+        let sighash = SighashCache::new(&transaction)
+            .taproot_signature_hash(0, &prevouts, None, Some((tap_leaf_hash, 0xFFFFFFFF)), TapSighashType::Default)
+            .map_err(|e| WithdrawalSpendError::SighashError(e))?;
+
+        // FIXME: seems like there should be shortcuts for a couple of these things?
+        let message: Message = sighash.into();
+        let signature = secp.sign_schnorr(&message, keypair);
+
+        let signature = taproot::Signature {
+            signature,
+            sighash_type: TapSighashType::Default,
+        };
+
+        transaction.input[0].witness.push(signature.serialize());
+        transaction.input[0].witness.push(
+            self
+                .withdrawal_output_info
+                .timelocked_withdrawal_script
+                .as_bytes()
+        );
+        transaction.input[0].witness.push(control_block.serialize());
+
+        Ok(transaction)
     }
 }
 
@@ -1477,6 +1674,36 @@ impl VaultParameters {
         }
     }
 
+    fn withdrawal_output_info<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, withdrawal_amount: VaultAmount, vault_total: VaultAmount) -> WithdrawalOutputInfo {
+        let timelock = self.vault_input_lock_time(VaultTransition::Withdrawal(withdrawal_amount));
+
+        // NOTE: The templates are at `depth + 1`, but the scripts are at `depth`
+        let master_pubkey = self.master_key(secp, depth);
+        let hot_pubkey = self.hot_key(secp, depth);
+
+        let timelocked_withdrawal_script = self.withdrawal_script(secp, depth, timelock);
+
+        let single_recovery_template = self.recovery_template(secp, depth + 1, VaultAmount::ZERO, withdrawal_amount);
+        let single_recovery_script = self.recovery_script(secp, depth, &single_recovery_template, 0);
+
+        let double_recovery_script = if vault_total > VaultAmount::ZERO {
+            let double_recovery_tx = self.recovery_template(secp, depth + 1, vault_total, withdrawal_amount);
+
+            Some(self.recovery_script(secp, depth, &double_recovery_tx, 1))
+        } else {
+            None
+        };
+
+        WithdrawalOutputInfo {
+            single_recovery_script,
+            double_recovery_script,
+            timelocked_withdrawal_script,
+            timelock,
+            hot_pubkey,
+            master_pubkey,
+        }
+    }
+
     /// Generate a single transaction template.
     /// NOTE: assumes that the parameters are valid
     fn transaction_template<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth, parameters: &VaultStateParameters, next_states: Option<&VaultGeneration>) -> VaultTransactionTemplate {
@@ -1503,36 +1730,11 @@ impl VaultParameters {
                     None
                 };
 
-                let timelock = self.vault_input_lock_time(parameters.transition);
-
-                let master_key = self.master_key(secp, depth);
-
-                let withdrawal_script = self.withdrawal_script(secp, depth, timelock);
-
-                let timelocked_withdrawal = TapNodeHash::from_script(&withdrawal_script, LeafVersion::TapScript);
-
-                let single_recovery_template = self.recovery_template(secp, depth + 1, VaultAmount::ZERO, withdrawal_amount);
-                let recovery_script = self.recovery_script(secp, depth, &single_recovery_template, 0);
-                let single_recovery_leaf = TapNodeHash::from_script(recovery_script.as_script(), LeafVersion::TapScript);
-
-                let recovery_node = if vault_total > VaultAmount::ZERO {
-                    let double_recovery_tx = self.recovery_template(secp, depth + 1, vault_total, withdrawal_amount);
-
-                    let double_recovery_script = self.recovery_script(secp, depth, &double_recovery_tx, 1);
-                    let double_recovery_leaf = TapNodeHash::from_script(double_recovery_script.as_script(), LeafVersion::TapScript);
-
-                    TapNodeHash::from_node_hashes(single_recovery_leaf, double_recovery_leaf)
-                } else {
-                    single_recovery_leaf
-                };
-
-                let root_node_hash = TapNodeHash::from_node_hashes(recovery_node, timelocked_withdrawal);
-
-                let script_pubkey = ScriptBuf::new_p2tr(secp, master_key, Some(root_node_hash));
+                let withdrawal_output_info = self.withdrawal_output_info(secp, depth, withdrawal_amount, vault_total);
 
                 let withdrawal_output = TxOut {
                     value: self.scale.scale_amount(withdrawal_amount),
-                    script_pubkey,
+                    script_pubkey: withdrawal_output_info.script_pubkey(secp),
                 };
 
                 VaultTransactionTemplate::Withdrawal(
@@ -2336,7 +2538,7 @@ impl Vault {
         let previous_output = last_vault_transaction.outpoint()
             .ok_or(WithdrawalCreationError::VaultClosed)?;
 
-        let _ = current_vault_amount.apply_transition(transition, None)
+        let vault_total = current_vault_amount.apply_transition(transition, None)
             .ok_or(WithdrawalCreationError::InsufficientFunds)?;
 
         let parameters = last_vault_transaction.to_child_parameters(VaultTransition::Withdrawal(withdrawal_amount));
@@ -2413,7 +2615,9 @@ impl Vault {
                 script: branch.to_scriptbuf(),
             };
 
-        let withdrawal = withdrawal_template.instantiate(previous_output, signing_info);
+        let withdrawal_output_info = self.parameters.withdrawal_output_info(secp, depth, withdrawal_amount, vault_total);
+
+        let withdrawal = withdrawal_template.instantiate(previous_output, signing_info, withdrawal_output_info);
         // Need to generate taproot spend info
         Ok(withdrawal)
     }
