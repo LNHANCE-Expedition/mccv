@@ -641,6 +641,9 @@ fn witness_weight(merkle_branches: Option<usize>, stack_item_sizes: &[u64]) -> W
 impl DepositTransaction {
     const DEPOSIT_INPUT_INDEX_INITIAL: usize = 0;
     const DEPOSIT_INPUT_INDEX_TAIL: usize = 1;
+    const VAULT_OUTPUT_INDEX: u32 = 0;
+
+    fn vout(&self) -> u32 { Self::VAULT_OUTPUT_INDEX }
 
     fn common(&self) -> &DepositTransactionCommon {
         match self {
@@ -988,6 +991,14 @@ pub struct WithdrawalTransaction {
 }
 
 impl WithdrawalTransaction {
+    fn vout(&self) -> Option<u32> {
+        if self.vault_total > VaultAmount::ZERO {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
     fn into_transaction(self) -> Transaction {
         let output = iter::empty()
             .chain(self.vault_output)
@@ -1277,6 +1288,46 @@ impl VaultTransactionTemplate {
             VaultTransactionTemplate::Deposit(DepositTransactionTemplate::InitialDeposit(_deposit)) => unreachable!("initial deposit can't be the destination of a vault output"),
             VaultTransactionTemplate::Deposit(DepositTransactionTemplate::Deposit(deposit)) => deposit.vault_template_hash(),
             VaultTransactionTemplate::Withdrawal(withdrawal) => withdrawal.vault_template_hash(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn into_transition(&self) -> VaultTransition {
+        match self {
+            VaultTransactionTemplate::Deposit(DepositTransactionTemplate::InitialDeposit(deposit)) =>
+                VaultTransition::Deposit(deposit.common.vault_deposit),
+            VaultTransactionTemplate::Deposit(DepositTransactionTemplate::Deposit(deposit)) =>
+                VaultTransition::Deposit(deposit.common.vault_deposit),
+            VaultTransactionTemplate::Withdrawal(withdrawal) => VaultTransition::Withdrawal(withdrawal.vault_withdrawal),
+        }
+    }
+
+    // FIXME: What to do with invalid transitions? For now, just assume input is valid, beats
+    // shoving the validation context down into here
+    fn vault_transition_vout(previous_amount: VaultAmount, transition: VaultTransition) -> Option<u32> {
+        match transition {
+            VaultTransition::Deposit(_) => Some(0),
+            VaultTransition::Withdrawal(withdrawal_amount) => {
+                if withdrawal_amount < previous_amount {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn vault_vout(&self) -> Option<u32> {
+        match self {
+            VaultTransactionTemplate::Deposit(_deposit) => Some(0),
+            VaultTransactionTemplate::Withdrawal(withdrawal) => {
+                if withdrawal.vault_total > VaultAmount::ZERO {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -1911,9 +1962,11 @@ impl VaultParameters {
 
         loop {
             match iter.next_with_depth() {
-                Some((this_depth, generation)) => {
+                Some((this_depth, _generation)) => {
                     if this_depth == depth {
-                        return generation.clone();
+                        return iter.generation
+                            // FIXME: maybe eliminate panic, but this *is* safe
+                            .expect("iterator must have a valid generation already here");
                     }
                 }
                 None => unreachable!(),
@@ -1932,36 +1985,118 @@ impl VaultParameters {
     }
 }
 
+#[derive(Clone, Debug)]
+enum VaultHistoryTransactionDetails {
+    VaultDeposit {
+        deposit_amount: VaultAmount,
+        vout: u32,
+    },
+    VaultWithdrawal {
+        withdrawal_amount: VaultAmount,
+        vout: Option<u32>,
+    },
+    #[allow(dead_code)]
+    KeySpend {
+        // TODO: Is there anything we need to track here? That's kind of final, the vault is closed
+    },
+    #[allow(dead_code)]
+    Recovery {
+        /// The TXID of the transaction that recovered the withdrawal output, if relevant
+        withdrawal_txid: Option<Txid>,
+        /// The TXID of the transaction that recovered the withdrawal output, if relevant
+        // FIXME: redundant with VaultHistoryTransaction::txid but it's ok for now
+        // I don't want to overcomplicate VaultHistoryTransaction right now.
+        // Actually, maybe store this externally, in some other data structure
+        vault_txid: Option<Txid>,
+    },
+}
+
+impl VaultHistoryTransactionDetails {
+    fn try_into_transition(&self) -> Option<VaultTransition> {
+        match self {
+            VaultHistoryTransactionDetails::VaultDeposit { deposit_amount, .. } =>
+                Some(VaultTransition::Deposit(*deposit_amount)),
+            VaultHistoryTransactionDetails::VaultWithdrawal { withdrawal_amount, .. } =>
+                Some(VaultTransition::Withdrawal(*withdrawal_amount)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone,Copy,Debug)]
+/// Indicates what kind of vault transaction was found that cannot be
+/// represented as a [`VaultTransition`].
+pub enum InvalidTransitionError {
+    KeySpend,
+    Recovery,
+}
+
+#[derive(Clone,Debug)]
 pub struct VaultHistoryTransaction {
     txid: Txid,
-    vout: Option<u32>,
     #[allow(dead_code)]
     depth: Depth,
-    transition: VaultTransition,
+    transition: VaultHistoryTransactionDetails,
     result_value: VaultAmount,
 }
 
 impl VaultHistoryTransaction {
+    // XXX: I wonder if this awkward abstraction is indicating a design issue
+    fn from_transition(previous_value: VaultAmount, transition: VaultTransition, depth: Depth, txid: Txid) -> Self {
+        let details = match transition {
+            VaultTransition::Deposit(amount) => VaultHistoryTransactionDetails::VaultDeposit {
+                deposit_amount: amount,
+                vout: 0,
+            },
+            VaultTransition::Withdrawal(amount) => VaultHistoryTransactionDetails::VaultWithdrawal {
+                withdrawal_amount: amount,
+                vout: VaultTransactionTemplate::vault_transition_vout(
+                    previous_value,
+                    transition,
+                ),
+            },
+        };
+
+        let result_value = previous_value
+            // FIXME: Should we enforce max?
+            .apply_transition(transition, None)
+            //FIXME: undesirable panic potential
+            .expect("transition should be valid already");
+
+        Self {
+            txid,
+            depth,
+            transition: details,
+            result_value,
+        }
+    }
+
+    /// Get the vault outpoint if it exists
     pub fn outpoint(&self) -> Option<OutPoint> {
-        self.vout
-            .map(|vout| OutPoint {
-                txid: self.txid,
-                vout,
-            })
+        match self.transition {
+            VaultHistoryTransactionDetails::VaultDeposit { vout, .. } =>
+                Some(OutPoint {txid: self.txid, vout}),
+            VaultHistoryTransactionDetails::VaultWithdrawal { vout, .. } =>
+                vout.map(|vout| OutPoint{ txid: self.txid, vout}),
+            _ => None,
+        }
     }
 
     pub fn into_parameters(&self,
         parent_transition: Option<VaultTransition>,
         max: Option<VaultAmount>
     ) -> Option<VaultStateParameters> {
+        let transition = self.transition
+            .try_into_transition()?;
+
         self.result_value
             .apply_transition(
-                self.transition.invert(),
+                transition.invert(),
                 max,
             )
             .map(|previous_value| {
                 VaultStateParameters {
-                    transition: self.transition,
+                    transition,
                     previous_value,
                     parent_transition,
                 }
@@ -1970,12 +2105,21 @@ impl VaultHistoryTransaction {
 
     /// Create parameters representing the child transaction with the given transition
     /// Does not validate the resulting parameters against the Vault's constraints
-    pub fn to_child_parameters(&self, transition: VaultTransition) -> VaultStateParameters {
-        VaultStateParameters {
-            transition,
-            previous_value: self.result_value,
-            parent_transition: Some(self.transition),
-        }
+    pub fn to_child_parameters(&self, transition: VaultTransition) -> Result<VaultStateParameters, InvalidTransitionError> {
+        let parent_transition = match self.transition {
+            VaultHistoryTransactionDetails::VaultDeposit { deposit_amount, .. } => VaultTransition::Deposit(deposit_amount),
+            VaultHistoryTransactionDetails::VaultWithdrawal { withdrawal_amount, .. } => VaultTransition::Withdrawal(withdrawal_amount),
+            VaultHistoryTransactionDetails::KeySpend {  } => { return Err(InvalidTransitionError::KeySpend) }
+            VaultHistoryTransactionDetails::Recovery { .. } => { return Err(InvalidTransitionError::Recovery) }
+        };
+
+        Ok(
+            VaultStateParameters {
+                transition,
+                previous_value: self.result_value,
+                parent_transition: Some(parent_transition),
+            }
+        )
     }
 }
 
@@ -2219,6 +2363,11 @@ pub enum CreateVaultError {
     SqliteError(rusqlite::Error),
 }
 
+#[derive(Debug)]
+enum ConnectForeignTransactionError {
+    InvalidWitness,
+}
+
 impl Vault {
     pub fn create_new(storage: &mut SqliteVaultStorage, name: &str, parameters: VaultParameters) -> Result<Self, CreateVaultError> {
         let mut statement = storage.prepare(r#"
@@ -2298,32 +2447,145 @@ impl Vault {
             .unwrap_or(Amount::ZERO)
     }
 
-    #[cfg(feature = "bitcoind")]
-    pub fn apply_block(&mut self, block: &Block, block_height: u32) -> usize {
-        // Pretty naive attempt at handling reorgs, will need testing
-        let history_iter = self.history.iter_mut()
-            // Skip any vault history that already has a confirmation recorded, unless it could be
-            // replaced or invalidated by this block
-            .skip_while(|history_tx| {
-                history_tx.1.map(|(tx_height, _block)| tx_height <= block_height).unwrap_or(false)
-            });
+    // Had to make static to satisfy borrow checker
+    // TODO: Handle key spend (master key)
+    #[allow(dead_code)]
+    fn try_connect_foreign_tx<C: Verification>(secp: &Secp256k1<C>, parameters: &VaultParameters, previous_tx: &VaultHistoryTransaction, transaction: &Transaction, input_index: u32) -> Result<VaultHistoryTransaction, ConnectForeignTransactionError> {
+        let depth = previous_tx.depth + 1;
 
+        let template_hash = get_default_template(&transaction, input_index);
+
+        let transitions: Vec<(VaultStateParameters, VaultTransactionTemplate)> = parameters
+            .templates_at_depth(secp, depth)
+            .into_iter()
+            .filter(|(_state, vtt)| vtt.vault_template_hash() == template_hash)
+            .collect();
+
+        if transitions.is_empty() {
+            let input = &transaction.input[input_index as usize];
+            if input.witness.len() > 2 {
+                return Err(ConnectForeignTransactionError::InvalidWitness);
+            } else if input.witness.len() > 1 {
+                if input.witness[1][0] != 0x50 {
+                    return Err(ConnectForeignTransactionError::InvalidWitness);
+                }
+            }
+
+            // Empty witness
+            if input.witness.len() < 1 {
+                return Err(ConnectForeignTransactionError::InvalidWitness);
+            }
+
+            if input.witness[0].len() != 64 && input.witness[0].len() != 65 {
+                return Err(ConnectForeignTransactionError::InvalidWitness);
+            }
+
+            // Probably should identify if it's a key spend
+            todo!("what to do if there is an unknown transition")
+        } else {
+            let (state, _vault_transaction_template) = transitions
+                .into_iter()
+                .filter(|(state, _vtt)| state.previous_value == previous_tx.result_value)
+                .next()
+                .expect("there must be a matching transition");
+
+            Ok(
+                // FIXME: should this be from state
+                VaultHistoryTransaction::from_transition(
+                    state.previous_value,
+                    state.transition,
+                    depth,
+                    transaction.compute_txid()
+                )
+            )
+        }
+    }
+
+    #[cfg(feature = "bitcoind")]
+    pub fn apply_block<C: Verification>(&mut self, secp: &Secp256k1<C>, block: &Block, block_height: u32) -> usize {
         let mut block_txes = block.txdata.iter();
 
-        for (history_tx, ref mut confirmation) in history_iter {
-            // clear the previously seen block inclusion
-            *confirmation = None;
+        let mut previous_tx: Option<&VaultHistoryTransaction> = None;
+        let mut iter = self.history.iter_mut();
+        while let Some((ref mut history_tx, ref mut confirmation)) = iter.next() {
+            if confirmation.map(|(tx_height, _block)| tx_height >= block_height).unwrap_or(true) {
+                if confirmation.is_some() {
+                    //eprintln!("reorg at height {block_height}!");
+                }
 
-            while confirmation.is_none() {
-                if let Some(block_tx) = block_txes.next() {
-                    if block_tx.compute_txid() == history_tx.txid {
-                        //eprintln!("found tx {}", history_tx.txid);
-                        *confirmation = Some((block_height, block.block_hash()));
+                // clear the previously seen block inclusion
+                *confirmation = None;
+
+                while confirmation.is_none() {
+                    if let Some(block_tx) = block_txes.next() {
+                        if block_tx.compute_txid() == history_tx.txid {
+                            //eprintln!("found tx {}", history_tx.txid);
+                            *confirmation = Some((block_height, block.block_hash()));
+                            continue;
+                        } else if let Some(previous_tx) = previous_tx {
+                            if let Some(history_outpoint) = previous_tx.outpoint() {
+                                for (input_index, txin) in block_tx.input.iter().enumerate() {
+                                    if txin.previous_output == history_outpoint {
+                                        *history_tx = Self::try_connect_foreign_tx(secp, &self.parameters, previous_tx, block_tx, input_index as u32)
+                                            // FIXME: a key spend will cause a panic!
+                                            .expect("tx can only be spent by a valid transition tx");
+                                    }
+                                }
+                            } else {
+                                // If we're here we have (unconfirmed) history after the final
+                                // vault transaction and something is very wrong
+                                unreachable!("final vault transactions can't have child transactions");
+                            }
+                        }
+                    } else {
                         break;
                     }
-                } else {
-                    break;
                 }
+            }
+
+            previous_tx = Some(history_tx);
+        }
+
+        // If there's more transactions left, process them this way
+        while let Some(block_tx) = block_txes.next() {
+            // This awkward code ensures we're not holding a reference to self.history
+            // (via previous_tx) when we go to append the history item
+            let history_item = if let Some((previous_tx, _)) = self.history.last() {
+                if let Some(history_outpoint) = previous_tx.outpoint() {
+                    // FIXME: will not properly handle a transaction that keyspends both the
+                    // withdrawal and vault outputs in the same transaction, but we don't handle
+                    // keyspends at all right now.
+                    let mut input_iter = block_tx.input.iter().enumerate();
+                    loop {
+                        if let Some((input_index, txin)) = input_iter.next() {
+                            if txin.previous_output == history_outpoint {
+                                //eprintln!("foreign transaction {}", block_tx.compute_txid());
+                                let history_tx = Self::try_connect_foreign_tx(secp, &self.parameters, &previous_tx, block_tx, input_index as u32)
+                                    // FIXME: a key spend will cause a panic!
+                                    .expect("tx can only be spent by a valid transition tx");
+
+                                break Some(
+                                    (
+                                        history_tx,
+                                        Some((block_height, block.block_hash())),
+                                    )
+                                );
+                            }
+                        } else {
+                            break None;
+                        }
+                    }
+                } else {
+                    // If we're here we have (unconfirmed) history after the final
+                    // vault transaction and something is very wrong
+                    unreachable!("final vault transactions can't have child transactions")
+                }
+            } else {
+                None
+            };
+
+            if let Some(history_item) = history_item {
+                self.history.push(history_item);
             }
         }
 
@@ -2358,19 +2620,14 @@ impl Vault {
 
         let (parameters, outpoint) = match self.history.last() {
             Some((transaction, _)) => {
-                let outpoint = transaction.vout
-                    .map(|vout| OutPoint {
-                        txid: transaction.txid,
-                        vout,
-                    })
+                let outpoint = transaction
+                    .outpoint()
                     .ok_or(DepositCreationError::VaultClosed)?;
 
                 (
-                    VaultStateParameters {
-                        transition: VaultTransition::Deposit(deposit_amount),
-                        previous_value: transaction.result_value,
-                        parent_transition: Some(transaction.transition),
-                    },
+                    transaction
+                        .to_child_parameters(VaultTransition::Deposit(deposit_amount))
+                        .map_err(|_| DepositCreationError::VaultClosed)?,
                     Some(outpoint),
                 )
             }
@@ -2478,8 +2735,17 @@ impl Vault {
     // FIXME: consider how much validation we want to do here. Maybe we should just ensure
     // self.history is always valid, makes more sense
     fn history_to_parameters(&self, tx: &VaultHistoryTransaction, parent_tx: Option<&VaultHistoryTransaction>) -> Result<VaultStateParameters, HistoryToParametersError> {
+        let parent_transition = match parent_tx {
+            Some(parent_tx) => Some(
+                parent_tx.transition
+                    .try_into_transition()
+                    .ok_or(HistoryToParametersError::InvalidParentDepth)?
+            ),
+            None => None,
+        };
+
         let parameters = tx.into_parameters(
-            parent_tx.map(|tx| tx.transition),
+            parent_transition,
             Some(self.parameters.max)
         )
         .and_then(|parameters| self.parameters.validate_parameters(parameters, tx.depth))
@@ -2490,10 +2756,14 @@ impl Vault {
                 return Err(HistoryToParametersError::InvalidParentDepth);
             }
 
+            let transition = &tx.transition
+                .try_into_transition()
+                .ok_or(HistoryToParametersError::InvalidParameters)?;
+
             let expected_parent_result_value = tx
                 .result_value
                 .apply_transition(
-                    tx.transition.invert(),
+                    transition.invert(),
                     Some(self.parameters.max),
                 );
 
@@ -2541,7 +2811,9 @@ impl Vault {
         let vault_total = current_vault_amount.apply_transition(transition, None)
             .ok_or(WithdrawalCreationError::InsufficientFunds)?;
 
-        let parameters = last_vault_transaction.to_child_parameters(VaultTransition::Withdrawal(withdrawal_amount));
+        let parameters = last_vault_transaction
+            .to_child_parameters(VaultTransition::Withdrawal(withdrawal_amount))
+            .map_err(|_| WithdrawalCreationError::VaultClosed)?;
 
         // FIXME: maybe this should return a Result<> instead so I can disambiguate cases
         self.parameters.validate_parameters(parameters, depth)
@@ -2631,9 +2903,11 @@ impl Vault {
 
                 VaultHistoryTransaction {
                     txid: deposit.compute_txid().map_err(|_| ())?,
-                    vout: Some(0),
                     depth: deposit.common().depth,
-                    transition: VaultTransition::Deposit(deposit.common().vault_deposit),
+                    transition: VaultHistoryTransactionDetails::VaultDeposit {
+                        deposit_amount: deposit.common().vault_deposit,
+                        vout: deposit.vout(),
+                    },
                     result_value: deposit.common().vault_total,
                 }
             }
@@ -2642,17 +2916,13 @@ impl Vault {
                     return Err(());
                 }
 
-                let vout = if withdrawal.vault_total > VaultAmount::ZERO {
-                    Some(0)
-                } else {
-                    None
-                };
-
                 VaultHistoryTransaction {
                     txid: withdrawal.compute_txid(),
-                    vout,
                     depth: withdrawal.depth,
-                    transition: VaultTransition::Withdrawal(withdrawal.vault_withdrawal),
+                    transition: VaultHistoryTransactionDetails::VaultWithdrawal {
+                        withdrawal_amount: withdrawal.vault_withdrawal,
+                        vout: withdrawal.vout(),
+                    },
                     result_value: withdrawal.vault_total,
                 }
             }
@@ -2814,52 +3084,50 @@ mod test {
         };
 
         let result_parameters = vault.history_to_parameters(
-            &VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 0,
-                transition: VaultTransition::Withdrawal(VaultAmount(1)),
-                result_value: VaultAmount(0),
-            },
-            Some(&VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 0,
-                transition: VaultTransition::Deposit(VaultAmount(1)),
-                result_value: VaultAmount(1),
-            }),
+            &VaultHistoryTransaction::from_transition(
+                VaultAmount(1),
+                VaultTransition::Withdrawal(VaultAmount(1)),
+                1,
+                dummy_txid,
+            ),
+            Some(
+                &VaultHistoryTransaction::from_transition(
+                    VaultAmount::ZERO,
+                    VaultTransition::Deposit(VaultAmount(1)),
+                    1,
+                    dummy_txid,
+                )
+            ),
         );
 
         result_parameters.expect_err("Gen 0 has no parents");
 
         let result_parameters = vault.history_to_parameters(
-            &VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 0,
-                transition: VaultTransition::Withdrawal(VaultAmount(1)),
-                result_value: VaultAmount(0),
-            },
+            &VaultHistoryTransaction::from_transition(
+                VaultAmount(1),
+                VaultTransition::Withdrawal(VaultAmount(1)),
+                0,
+                dummy_txid,
+            ),
             None,
         );
 
         result_parameters.expect_err("Gen 0 can't be a withdrawal");
 
         let result_parameters = vault.history_to_parameters(
-            &VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: None,
-                depth: 1,
-                transition: VaultTransition::Withdrawal(VaultAmount(1)),
-                result_value: VaultAmount(0),
-            },
-            Some(&VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 0,
-                transition: VaultTransition::Deposit(VaultAmount(1)),
-                result_value: VaultAmount(1),
-            }),
+            &VaultHistoryTransaction::from_transition(
+                VaultAmount(1),
+                VaultTransition::Withdrawal(VaultAmount(1)),
+                1,
+                dummy_txid,
+            ),
+            Some(&VaultHistoryTransaction::from_transition(
+                    VaultAmount(0),
+                    VaultTransition::Deposit(VaultAmount(1)),
+                    0,
+                    dummy_txid,
+                ),
+            ),
         )
         .unwrap();
 
@@ -2873,39 +3141,39 @@ mod test {
         );
 
         let result_parameters = vault.history_to_parameters(
-            &VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 1,
-                transition: VaultTransition::Withdrawal(VaultAmount(2)),
-                result_value: VaultAmount(0),
-            },
-            Some(&VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 0,
-                transition: VaultTransition::Deposit(VaultAmount(1)),
-                result_value: VaultAmount(1),
-            }),
+            &VaultHistoryTransaction::from_transition(
+                VaultAmount(2),
+                VaultTransition::Withdrawal(VaultAmount(2)),
+                1,
+                dummy_txid,
+            ),
+            Some(
+                &VaultHistoryTransaction::from_transition(
+                    VaultAmount::ZERO,
+                    VaultTransition::Deposit(VaultAmount(1)),
+                    0,
+                    dummy_txid,
+                )
+            ),
         );
 
         result_parameters.expect_err("Can't withdraw more than vault total");
 
         let result_parameters = vault.history_to_parameters(
-            &VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 1,
-                transition: VaultTransition::Withdrawal(VaultAmount(1)),
-                result_value: VaultAmount(1),
-            },
-            Some(&VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 0,
-                transition: VaultTransition::Deposit(VaultAmount(2)),
-                result_value: VaultAmount(2),
-            }),
+            &VaultHistoryTransaction::from_transition(
+                VaultAmount(2),
+                VaultTransition::Withdrawal(VaultAmount(1)),
+                1,
+                dummy_txid,
+            ),
+            Some(
+                &VaultHistoryTransaction::from_transition(
+                    VaultAmount(0),
+                    VaultTransition::Deposit(VaultAmount(2)),
+                    0,
+                    dummy_txid,
+                )
+            ),
         )
         .unwrap();
 
@@ -2919,20 +3187,20 @@ mod test {
         );
 
         let result_parameters = vault.history_to_parameters(
-            &VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 1,
-                transition: VaultTransition::Deposit(VaultAmount(1)),
-                result_value: VaultAmount(3),
-            },
-            Some(&VaultHistoryTransaction {
-                txid: dummy_txid,
-                vout: Some(0),
-                depth: 0,
-                transition: VaultTransition::Deposit(VaultAmount(2)),
-                result_value: VaultAmount(2),
-            }),
+            &VaultHistoryTransaction::from_transition(
+                VaultAmount(2),
+                VaultTransition::Deposit(VaultAmount(1)),
+                1,
+                dummy_txid,
+            ),
+            Some(
+                &VaultHistoryTransaction::from_transition(
+                    VaultAmount::ZERO,
+                    VaultTransition::Deposit(VaultAmount(2)),
+                    0,
+                    dummy_txid,
+                )
+            ),
         )
         .unwrap();
 
