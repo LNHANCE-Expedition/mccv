@@ -2781,10 +2781,20 @@ impl Vault {
         self.history.len() as Depth
     }
 
-    // TODO: add current height arg
-    pub fn get_confirmed_balance(&self) -> Amount {
+    /// Return the confirmed balance of the vault by a given height, or any height
+    pub fn confirmed_balance(&self, height: Option<u32>) -> Amount {
         self.history.iter().rev()
-            .skip_while(|(_tx, confirmation)| { dbg!(_tx, confirmation); confirmation.is_none() })
+            .skip_while(|(_tx, confirmation)| {
+                if let Some((confirmation_height, _)) = confirmation {
+                    // If we have a max height and it's greater than the confirmation height of
+                    // this transaction, skip it.
+                    height
+                        .map(|height| height < *confirmation_height)
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            })
             .next()
             .map(|(tx, _confirmation)|
                  self.parameters.scale.scale_amount(tx.result_value)

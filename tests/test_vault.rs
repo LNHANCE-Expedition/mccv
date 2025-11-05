@@ -286,7 +286,7 @@ fn test_deposit_withdraw() {
 
     let mut deposit_transaction = vault.create_deposit(&secp, deposit_amount).unwrap();
 
-    assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
+    assert_eq!(vault.confirmed_balance(None), Amount::ZERO);
 
     let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
         .expect("create shape success");
@@ -322,14 +322,14 @@ fn test_deposit_withdraw() {
 
     let mut vault_block_emitter = Emitter::new(nodes.client(0), genesis_checkpoint, 0, Option::<Txid>::None);
 
-    assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
+    assert_eq!(vault.confirmed_balance(None), Amount::ZERO);
 
     vault.add_transaction(deposit_transaction.into())
         .expect("deposit transaction should add cleanly");
 
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
 
-    assert_eq!(vault.get_confirmed_balance(), total_deposit);
+    assert_eq!(vault.confirmed_balance(None), total_deposit);
 
     // ============ Deposit 2 ============
     let deposit_amount_raw = VAULT_SCALE * 2;
@@ -369,7 +369,7 @@ fn test_deposit_withdraw() {
 
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
 
-    assert_eq!(vault.get_confirmed_balance(), total_deposit);
+    assert_eq!(vault.confirmed_balance(None), total_deposit);
 
     // ============ Withdrawal 1 ============
     match vault.create_withdrawal(&secp, VaultAmount::new(6)) {
@@ -419,7 +419,7 @@ fn test_deposit_withdraw() {
 
     advance_chain(&secp, &mut wallet, nodes.client(0), 1);
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
-    assert_eq!(vault.get_confirmed_balance(), total_deposit);
+    assert_eq!(vault.confirmed_balance(None), total_deposit);
 
     let withdrawal_spend = withdrawal_transaction.spend_withdrawal();
 
@@ -492,12 +492,12 @@ fn test_deposit_withdraw() {
 
     // XXX: We do *not* add the transaction to the vault, to simulate someone else creating it
 
-    let vault_amount = vault.get_confirmed_balance();
+    let vault_amount = vault.confirmed_balance(None);
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
 
     // If the vault is able to reconstruct the vault state from the blockchain the balance should
     // be updated
-    assert_eq!(vault_amount - VAULT_SCALE, vault.get_confirmed_balance());
+    assert_eq!(vault_amount - VAULT_SCALE, vault.confirmed_balance(None));
 
     let mut recovery = vault.create_recovery(&secp).expect("recovery create success");
 
@@ -525,5 +525,5 @@ fn test_deposit_withdraw() {
     advance_chain(&secp, &mut wallet, nodes.client(0), 1);
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
 
-    assert_eq!(Amount::ZERO, vault.get_confirmed_balance());
+    assert_eq!(Amount::ZERO, vault.confirmed_balance(None));
 }
