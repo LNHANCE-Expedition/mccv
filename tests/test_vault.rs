@@ -19,6 +19,9 @@ use bitcoin::{
     Txid,
 };
 
+#[allow(unused_imports)]
+use bitcoin::consensus::encode::serialize_hex;
+
 use bitcoin::secp256k1::{
     Secp256k1,
     Signing,
@@ -77,7 +80,6 @@ pub fn update_wallet(wallet: &mut Wallet, client: &Client) {
 
 pub fn update_vault<C: Verification>(secp: &Secp256k1<C>, vault: &mut Vault, emitter: &mut Emitter<&Client>) {
     while let Some(block) = emitter.next_block().unwrap() {
-        //eprintln!("applying block {}", block.block.block_hash());
         vault.apply_block(secp, &block.block, block.block_height());
     }
 }
@@ -284,7 +286,7 @@ fn test_deposit_withdraw() {
 
     let mut deposit_transaction = vault.create_deposit(&secp, deposit_amount).unwrap();
 
-    assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
+    assert_eq!(vault.confirmed_balance(None), Amount::ZERO);
 
     let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
         .expect("create shape success");
@@ -320,14 +322,14 @@ fn test_deposit_withdraw() {
 
     let mut vault_block_emitter = Emitter::new(nodes.client(0), genesis_checkpoint, 0, Option::<Txid>::None);
 
-    assert_eq!(vault.get_confirmed_balance(), Amount::ZERO);
+    assert_eq!(vault.confirmed_balance(None), Amount::ZERO);
 
     vault.add_transaction(deposit_transaction.into())
         .expect("deposit transaction should add cleanly");
 
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
 
-    assert_eq!(vault.get_confirmed_balance(), total_deposit);
+    assert_eq!(vault.confirmed_balance(None), total_deposit);
 
     // ============ Deposit 2 ============
     let deposit_amount_raw = VAULT_SCALE * 2;
@@ -356,9 +358,6 @@ fn test_deposit_withdraw() {
 
     let transmittable_deposit_transaction = deposit_transaction.to_signed_transaction().expect("deposit transaction signed");
 
-    //eprintln!("tx {} = {shape_transaction:?}", shape_transaction.compute_txid());
-    //eprintln!("tx {} = {:?}", transmittable_deposit_transaction.compute_txid(), &transmittable_deposit_transaction);
-
     nodes.client(0)
         .submit_package(&[&shape_transaction, &transmittable_deposit_transaction])
         .expect("package submission success");
@@ -370,7 +369,7 @@ fn test_deposit_withdraw() {
 
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
 
-    assert_eq!(vault.get_confirmed_balance(), total_deposit);
+    assert_eq!(vault.confirmed_balance(None), total_deposit);
 
     // ============ Withdrawal 1 ============
     match vault.create_withdrawal(&secp, VaultAmount::new(6)) {
@@ -420,7 +419,7 @@ fn test_deposit_withdraw() {
 
     advance_chain(&secp, &mut wallet, nodes.client(0), 1);
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
-    assert_eq!(vault.get_confirmed_balance(), total_deposit);
+    assert_eq!(vault.confirmed_balance(None), total_deposit);
 
     let withdrawal_spend = withdrawal_transaction.spend_withdrawal();
 
@@ -485,9 +484,6 @@ fn test_deposit_withdraw() {
     let transmittable_withdrawal_transaction = withdrawal_transaction.to_signed_transaction()
         .expect("signed tx");
 
-    //vault.add_transaction(withdrawal_transaction.clone().into())
-        //.expect("can add withdrawal");
-
     nodes.client(0)
         .submit_package(&[&transmittable_withdrawal_transaction, &withdrawal_cpfp])
         .expect("package submission success");
@@ -496,11 +492,38 @@ fn test_deposit_withdraw() {
 
     // XXX: We do *not* add the transaction to the vault, to simulate someone else creating it
 
-    let vault_amount = vault.get_confirmed_balance();
+    let vault_amount = vault.confirmed_balance(None);
     update_vault(&secp, &mut vault, &mut vault_block_emitter);
 
     // If the vault is able to reconstruct the vault state from the blockchain the balance should
     // be updated
-    assert_eq!(vault_amount - VAULT_SCALE, vault.get_confirmed_balance());
+    assert_eq!(vault_amount - VAULT_SCALE, vault.confirmed_balance(None));
 
+    let mut recovery = vault.create_recovery(&secp).expect("recovery create success");
+
+    let recovery_keypair = recovery.hot_keypair(&secp, &hot_xpriv)
+        .expect("successful key derivation");
+
+    recovery.sign(&secp, &recovery_keypair)
+        .expect("sign success");
+
+    let mut recovery_cpfp_psbt = wallet.create_cpfp(&secp, &recovery, FeeRate::BROADCAST_MIN)
+        .expect("can cpfp");
+
+    let sign_success = wallet.sign(&mut recovery_cpfp_psbt, SignOptions::default())
+        .expect("sign success");
+    assert!(sign_success);
+
+    let recovery_cpfp = recovery_cpfp_psbt.extract_tx().unwrap();
+
+    let recovery_tx = recovery.into_signed_transaction().expect("valid transaction");
+
+    nodes.client(0)
+        .submit_package(&[&recovery_tx, &recovery_cpfp])
+        .expect("package submission success");
+
+    advance_chain(&secp, &mut wallet, nodes.client(0), 1);
+    update_vault(&secp, &mut vault, &mut vault_block_emitter);
+
+    assert_eq!(Amount::ZERO, vault.confirmed_balance(None));
 }

@@ -14,6 +14,8 @@ use bitcoin::{
     FeeRate,
     OutPoint,
     Psbt,
+    psbt,
+    VarInt,
     Weight,
 };
 
@@ -129,6 +131,26 @@ impl VaultDepositor for Wallet {
     }
 }
 
+pub trait UnderpayingParentTransaction {
+    fn anchor_outpoint(&self) -> OutPoint;
+    fn anchor_output_psbt_input(&self) -> psbt::Input;
+    fn weight(&self) -> Weight;
+}
+
+impl UnderpayingParentTransaction for WithdrawalTransaction {
+    fn anchor_outpoint(&self) -> OutPoint {
+        WithdrawalTransaction::anchor_outpoint(self)
+    }
+
+    fn anchor_output_psbt_input(&self) -> psbt::Input {
+        WithdrawalTransaction::anchor_output_psbt_input(self)
+    }
+
+    fn weight(&self) -> Weight {
+        WithdrawalTransaction::weight(self)
+    }
+}
+
 #[derive(Debug)]
 pub enum CpfpCreationError {
     FeeOverflow,
@@ -140,28 +162,28 @@ pub trait VaultWithdrawer {
     type Error;
 
     /// Create a child-pays-for-parent transaction to bump a withdrawal transaciton
-    fn create_cpfp<C: Verification>(&mut self, _secp: &Secp256k1<C>, withdrawal_transaction: &WithdrawalTransaction, fee_rate: FeeRate) -> Result<Psbt, Self::Error>;
+    fn create_cpfp<C: Verification, T: UnderpayingParentTransaction>(&mut self, _secp: &Secp256k1<C>, transaction: &T, fee_rate: FeeRate) -> Result<Psbt, Self::Error>;
 }
 
 impl VaultWithdrawer for Wallet {
     type Error = CpfpCreationError;
 
-    fn create_cpfp<C: Verification>(&mut self, _secp: &Secp256k1<C>, withdrawal_transaction: &WithdrawalTransaction, fee_rate: FeeRate) -> Result<Psbt, CpfpCreationError> {
-        let parent_weight = withdrawal_transaction.weight();
+    fn create_cpfp<C: Verification, T: UnderpayingParentTransaction>(&mut self, _secp: &Secp256k1<C>, transaction: &T, fee_rate: FeeRate) -> Result<Psbt, CpfpCreationError> {
+        let parent_weight = transaction.weight();
         let mut child_weight = Weight::ZERO;
 
-        let anchor_outpoint = withdrawal_transaction.anchor_outpoint();
-        let psbt_input = withdrawal_transaction.anchor_output_psbt_input();
+        let anchor_outpoint = transaction.anchor_outpoint();
+        let psbt_input = transaction.anchor_output_psbt_input();
         let change_address = self.reveal_next_address(KeychainKind::Internal);
 
         loop {
-            let total_fee = fee_rate.checked_mul_by_weight(parent_weight + child_weight)
+            let required_total_fee = fee_rate.checked_mul_by_weight(parent_weight + child_weight)
                 .ok_or(CpfpCreationError::FeeOverflow)?;
 
             let mut builder = self.build_tx();
             builder
                 .version(3)
-                .fee_absolute(total_fee)
+                .fee_absolute(required_total_fee)
                 .drain_to(change_address.script_pubkey())
                 .add_foreign_utxo(anchor_outpoint, psbt_input.clone(), Weight::ZERO)
                 .expect("we provide correct foreign utxo metadata");
@@ -195,14 +217,16 @@ impl VaultWithdrawer for Wallet {
                                 + WITNESS_ITEM_COUNT_WEIGHT
                         })
                 })
-                .fold(cpfp_psbt.unsigned_tx.weight() + SEGWIT_MARKER_WEIGHT, |x, y| x + y);
+                .chain(Some(cpfp_psbt.unsigned_tx.weight() + SEGWIT_MARKER_WEIGHT))
+                .chain(Some(Weight::from_wu_usize(VarInt(cpfp_psbt.unsigned_tx.input.len() as u64).size())))
+                .sum();
 
             let total_weight = child_weight + parent_weight;
 
             let minimum_fee = fee_rate.checked_mul_by_weight(total_weight)
                 .ok_or(CpfpCreationError::FeeOverflow)?;
 
-            if total_fee >= minimum_fee {
+            if required_total_fee >= minimum_fee {
                 break Ok(cpfp_psbt)
             } else {
                 //eprintln!("{total_fee} < {minimum_fee}");
