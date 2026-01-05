@@ -19,7 +19,7 @@ use bitcoin::{
     Weight,
 };
 
-use crate::vault::{
+use crate::transaction::{
     DepositTransaction,
     WithdrawalTransaction,
 };

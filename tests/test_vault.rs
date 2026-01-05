@@ -37,14 +37,15 @@ use std::thread;
 
 use mccv::{
     AccountId,
+    storage::ChangeLog,
     VaultAmount,
     VaultParameters,
     VaultScale,
     Vault,
     VaultDepositor,
     VaultWithdrawer,
-    vault::SqliteVaultStorage,
     vault::SubmitPackage,
+    vault::Context,
 };
 
 fn test_node_subver(node_index: usize) -> String {
@@ -78,9 +79,10 @@ pub fn update_wallet(wallet: &mut Wallet, client: &Client) {
     }
 }
 
-pub fn update_vault<C: Verification>(secp: &Secp256k1<C>, vault: &mut Vault, emitter: &mut Emitter<&Client>) {
+pub fn update_vault<C: Verification>(secp: &Secp256k1<C>, vault: &mut Vault, context: &Context, changelog: &mut ChangeLog, emitter: &mut Emitter<&Client>) {
     while let Some(block) = emitter.next_block().unwrap() {
-        vault.apply_block(secp, &block.block, block.block_height());
+        vault.apply_block(secp, context, &block.block, block.block_height(), changelog)
+            .expect("success");
     }
 }
 
@@ -269,13 +271,9 @@ fn test_deposit_withdraw() {
     let balance = wallet.balance();
 
     assert_eq!(balance.confirmed.to_sat(), 50 * 100_000_000);
+    let (mut vault, mut changelog) = Vault::new_unpersisted(0, test_parameters);
 
-    let sqlite = rusqlite::Connection::open_in_memory()
-        .expect("open memory wallet should succeed");
-    let mut storage = SqliteVaultStorage::from_connection(sqlite)
-        .expect("initialize vault storage");
-    let mut vault = Vault::create_new(&mut storage, "Test Vault", test_parameters)
-        .expect("create vault");
+    let context = vault.context(&secp);
 
     // ============ Deposit 1 ============
     let mut total_deposit = Amount::ZERO;
@@ -324,10 +322,7 @@ fn test_deposit_withdraw() {
 
     assert_eq!(vault.confirmed_balance(None), Amount::ZERO);
 
-    vault.add_transaction(deposit_transaction.into())
-        .expect("deposit transaction should add cleanly");
-
-    update_vault(&secp, &mut vault, &mut vault_block_emitter);
+    update_vault(&secp, &mut vault, &context, &mut changelog, &mut vault_block_emitter);
 
     assert_eq!(vault.confirmed_balance(None), total_deposit);
 
@@ -362,12 +357,9 @@ fn test_deposit_withdraw() {
         .submit_package(&[&shape_transaction, &transmittable_deposit_transaction])
         .expect("package submission success");
 
-    vault.add_transaction(deposit_transaction.into())
-        .expect("deposit transaction should add cleanly");
-
     generate_to_wallet(&mut wallet, nodes.client(0), 6);
 
-    update_vault(&secp, &mut vault, &mut vault_block_emitter);
+    update_vault(&secp, &mut vault, &context, &mut changelog, &mut vault_block_emitter);
 
     assert_eq!(vault.confirmed_balance(None), total_deposit);
 
@@ -404,9 +396,6 @@ fn test_deposit_withdraw() {
     let transmittable_withdrawal_transaction = withdrawal_transaction.to_signed_transaction()
         .expect("signed tx");
 
-    vault.add_transaction(withdrawal_transaction.clone().into())
-        .expect("can add withdrawal");
-
     nodes.client(0).send_raw_transaction(&transmittable_withdrawal_transaction)
         .expect_err("can't broadcast withdrawal without a cpfp");
 
@@ -418,7 +407,7 @@ fn test_deposit_withdraw() {
         .expect("package submission success");
 
     advance_chain(&secp, &mut wallet, nodes.client(0), 1);
-    update_vault(&secp, &mut vault, &mut vault_block_emitter);
+    update_vault(&secp, &mut vault, &context, &mut changelog, &mut vault_block_emitter);
     assert_eq!(vault.confirmed_balance(None), total_deposit);
 
     let withdrawal_spend = withdrawal_transaction.spend_withdrawal();
@@ -493,7 +482,7 @@ fn test_deposit_withdraw() {
     // XXX: We do *not* add the transaction to the vault, to simulate someone else creating it
 
     let vault_amount = vault.confirmed_balance(None);
-    update_vault(&secp, &mut vault, &mut vault_block_emitter);
+    update_vault(&secp, &mut vault, &context, &mut changelog, &mut vault_block_emitter);
 
     // If the vault is able to reconstruct the vault state from the blockchain the balance should
     // be updated
@@ -523,7 +512,7 @@ fn test_deposit_withdraw() {
         .expect("package submission success");
 
     advance_chain(&secp, &mut wallet, nodes.client(0), 1);
-    update_vault(&secp, &mut vault, &mut vault_block_emitter);
+    update_vault(&secp, &mut vault, &context, &mut changelog, &mut vault_block_emitter);
 
     assert_eq!(Amount::ZERO, vault.confirmed_balance(None));
 }
