@@ -5,6 +5,7 @@ mod migrate;
 pub mod storage;
 mod transaction;
 pub mod vault;
+pub mod vault_storage;
 pub mod wallet;
 
 pub use vault::{

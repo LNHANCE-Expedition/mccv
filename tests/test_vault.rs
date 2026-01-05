@@ -31,13 +31,10 @@ use bitcoin::secp256k1::{
 
 use bitcoin::secp256k1::rand::{RngCore, thread_rng};
 
-use std::str::FromStr;
-use std::time;
-use std::thread;
-
 use mccv::{
     AccountId,
     storage::ChangeLog,
+    storage::Storage,
     VaultAmount,
     VaultParameters,
     VaultScale,
@@ -46,7 +43,12 @@ use mccv::{
     VaultWithdrawer,
     vault::SubmitPackage,
     vault::Context,
+    vault_storage::SqliteStorage,
 };
+
+use std::str::FromStr;
+use std::time;
+use std::thread;
 
 fn test_node_subver(node_index: usize) -> String {
     format!("mccv_testnode{node_index}")
@@ -79,7 +81,7 @@ pub fn update_wallet(wallet: &mut Wallet, client: &Client) {
     }
 }
 
-pub fn update_vault<C: Verification>(secp: &Secp256k1<C>, vault: &mut Vault, context: &Context, changelog: &mut ChangeLog, emitter: &mut Emitter<&Client>) {
+pub fn update_vault<C: Verification>(secp: &Secp256k1<C>, vault: &mut Vault, context: &Context, changelog: &mut ChangeLog<SqliteStorage>, emitter: &mut Emitter<&Client>) {
     while let Some(block) = emitter.next_block().unwrap() {
         vault.apply_block(secp, context, &block.block, block.block_height(), changelog)
             .expect("success");
@@ -236,7 +238,6 @@ impl TestNodes {
 //   - clawback withdrawal UTXO only
 //   - clawback both UTXOs simultaneously
 // - load and store
-// - reorgs
 
 #[test]
 fn test_deposit_withdraw() {
@@ -271,9 +272,19 @@ fn test_deposit_withdraw() {
     let balance = wallet.balance();
 
     assert_eq!(balance.confirmed.to_sat(), 50 * 100_000_000);
-    let (mut vault, mut changelog) = Vault::new_unpersisted(0, test_parameters);
+
+    let mut storage = SqliteStorage::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap()
+        )
+        .unwrap();
+
+    let (mut vault, mut changelog) = storage.create("test", test_parameters)
+        .unwrap();
 
     let context = vault.context(&secp);
+
+    let regtest_genesis = bitcoin::blockdata::constants::genesis_block(&bitcoin::params::REGTEST);
+    vault.apply_block(&secp, &context, &regtest_genesis, 0, &mut changelog).unwrap();
 
     // ============ Deposit 1 ============
     let mut total_deposit = Amount::ZERO;
@@ -479,9 +490,17 @@ fn test_deposit_withdraw() {
 
     advance_chain(&secp, &mut wallet, nodes.client(0), 1);
 
-    // XXX: We do *not* add the transaction to the vault, to simulate someone else creating it
-
     let vault_amount = vault.confirmed_balance(None);
+
+    let mut changelog = storage.store(changelog).unwrap();
+    let (vault2, _) = storage.load(&secp, changelog.id())
+        .unwrap();
+
+    assert_eq!(
+        vault2.confirmed_balance(None),
+        vault_amount,
+    );
+
     update_vault(&secp, &mut vault, &context, &mut changelog, &mut vault_block_emitter);
 
     // If the vault is able to reconstruct the vault state from the blockchain the balance should
