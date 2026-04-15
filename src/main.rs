@@ -36,6 +36,7 @@ use rand::{
     thread_rng,
 };
 
+#[allow(unused_imports)]
 use rusqlite::{
     Connection,
     params,
@@ -48,6 +49,7 @@ use serde::{
 
 use std::path::PathBuf;
 
+#[allow(unused_imports)]
 use mccv::{
     AccountId,
     VaultAmount,
@@ -57,11 +59,10 @@ use mccv::{
     Vault,
 };
 
-use mccv::vault::{
-    SqliteVaultStorage,
+use mccv::storage::{
+    SqliteStorage,
+    VaultStorage,
 };
-
-const DEFAULT_VAULT: VaultId = 0;
 
 fn new_xpriv(network: NetworkKind) -> Xpriv {
     let mut rng = thread_rng();
@@ -71,6 +72,11 @@ fn new_xpriv(network: NetworkKind) -> Xpriv {
     rng.fill_bytes(&mut seed);
     Xpriv::new_master(network, &seed)
         .expect("privkey generation")
+}
+
+#[derive(Clone, Args)]
+struct GenerateArg {
+    name: String,
 }
 
 #[derive(Clone, Args)]
@@ -87,7 +93,7 @@ struct WithdrawArg {
 
 #[derive(Clone, Subcommand)]
 enum Command {
-    Generate,
+    Generate(GenerateArg),
     List,
     Receive,
     Sync,
@@ -98,6 +104,9 @@ enum Command {
 #[derive(Parser)]
 #[command(name = "mccv")]
 struct CommandLine {
+    #[arg(short = 'v', long = "vault")]
+    vault_id: Option<u64>,
+
     #[arg(short = 'c', long = "config", default_value="./config.toml")]
     config: PathBuf,
 
@@ -137,7 +146,7 @@ fn main() {
     let secp = Secp256k1::new();
 
     match args.command {
-        Command::Generate => {
+        Command::Generate(generate_arg) => {
             let master_xpriv = new_xpriv(args.network.into());
             let account = AccountId::new(0)
                 .expect("account id < 0x7FFFFFFF");
@@ -196,9 +205,12 @@ fn main() {
             wallet.persist(&mut sqlite)
                 .expect("update sqlite");
 
-            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+            let mut storage = SqliteStorage::from_connection(sqlite)
                 .expect("initialize vault storage");
 
+            let (vault, changelog) = storage.create_vault(&generate_arg.name, vault_parameters)
+                .expect("vault creation success");
+            /*
             let vault = Vault::create_new(&mut storage, "Default Vault", vault_parameters.clone()).expect("vault create");
 
             let config = Configuration {
@@ -230,6 +242,7 @@ fn main() {
 
             let config = toml::to_string(&config).expect("serialize config");
             std::fs::write(args.config, config.as_bytes()).expect("write config");
+            */
         },
         Command::List => {
             let config = read_config(&args.config);
@@ -265,9 +278,9 @@ fn main() {
             println!("----------------------------------");
             println!("total: {}", balance.total());
 
-            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+            let mut storage = SqliteStorage::from_connection(sqlite)
                 .expect("initialize vault storage");
-            let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
+            //let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
             todo!()
         }
         Command::Sync => {
@@ -297,9 +310,9 @@ fn main() {
             wallet.persist(&mut sqlite)
                 .expect("update sqlite");
 
-            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+            let mut storage = SqliteStorage::from_connection(sqlite)
                 .expect("initialize vault storage");
-            let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
+            //let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
 
             println!("Sync'd");
         }
@@ -317,9 +330,9 @@ fn main() {
 
             wallet.persist(&mut sqlite).expect("sqlite sync");
 
-            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+            let mut storage = SqliteStorage::from_connection(sqlite)
                 .expect("initialize vault storage");
-            let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
+            //let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
 
             println!("Address: {}", address.to_string());
         }
@@ -346,10 +359,10 @@ fn main() {
                 .load_wallet(&mut sqlite)
                 .expect("success");
 
-            let mut storage = SqliteVaultStorage::from_connection(sqlite)
+            let mut storage = SqliteStorage::from_connection(sqlite)
                 .expect("initialize vault storage");
 
-            let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
+            //let vault = Vault::load(DEFAULT_VAULT, &mut storage).expect("load vault");
 
             todo!()
         }

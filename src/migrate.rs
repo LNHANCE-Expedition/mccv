@@ -1,13 +1,13 @@
 use rusqlite::{
-    Connection,
+    Transaction,
     params,
 };
 
-pub fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {
-    connection.pragma_update(None, "foreign_keys", 1)
-}
+#[allow(dead_code)]
+pub static VAULT_VERSION_ID: i64 = 1;
 
-static MIGRATIONS: [(u32, &str); 1] = [
+#[allow(dead_code)]
+pub static VAULT_MIGRATIONS: [(u32, &str); 1] = [
     (1, include_str!("../data/migrations/0001-initial.sql")),
 ];
 
@@ -18,35 +18,37 @@ pub enum MigrationError {
     FinalizationFailed(rusqlite::Error),
 }
 
-fn get_and_clear_migration_version(connection: &mut Connection) -> Result<(rusqlite::Transaction<'_>, u32), rusqlite::Error> {
-    connection.execute(r#"
+#[allow(dead_code)]
+fn get_and_clear_migration_version(transaction: &mut Transaction<'_>, id: i64) -> Result<u32, rusqlite::Error> {
+    transaction.execute(r#"
         create table
             if not exists
             mccv_migration_version
         (
+            id integer,
             version integer
         )
     "#, [])?;
 
-    let transaction = connection.transaction()?;
-
     let version: u32 = transaction
-        .prepare(r#"select version from mccv_migration_version"#)?
-        .query_map([], |row| row.get(0))?
-        .next().unwrap_or(Ok(0))?;
+        .prepare(r#"select version from mccv_migration_version where id = ?"#)?
+        .query_map(params![id], |row| row.get(0))?
+        .next()
+        .unwrap_or(Ok(0))?;
 
-    transaction.execute(r#"delete from mccv_migration_version"#, [])?;
+    transaction.execute(r#"delete from mccv_migration_version where id = ?"#, params![id])?;
 
-    Ok((transaction, version))
+    Ok(version)
 }
 
-pub fn migrate(connection: &mut Connection) -> Result<(u32, u32), MigrationError> {
-    let (transaction, mut version) = get_and_clear_migration_version(connection)
+#[allow(dead_code)]
+pub fn migrate(transaction: &mut Transaction<'_>, id: i64, migrations: &[(u32, &str)]) -> Result<(u32, u32), MigrationError> {
+    let mut version = get_and_clear_migration_version(transaction, id)
         .map_err(|e| MigrationError::InitializationFailed(e))?;
 
     let initial_version = version;
 
-    for (migration_version, script) in MIGRATIONS.iter() {
+    for (migration_version, script) in migrations.iter() {
         let migration_version = *migration_version;
         if migration_version > version {
             transaction.execute_batch(script)
@@ -55,11 +57,8 @@ pub fn migrate(connection: &mut Connection) -> Result<(u32, u32), MigrationError
         }
     }
 
-    transaction.execute(r#"insert into mccv_migration_version (version) values (?)"#, params![version])
-        .map_err(|e| MigrationError::FinalizationFailed(e))?;
-
-    transaction.commit()
-        .map_err(|e| MigrationError::FinalizationFailed(e))?;
+    transaction.execute(r#"insert into mccv_migration_version (version, id) values (?, ?)"#, params![version, id])
+        .map_err(MigrationError::FinalizationFailed)?;
 
     Ok((initial_version, version))
 }
