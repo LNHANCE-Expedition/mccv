@@ -1,131 +1,18 @@
 use bitcoin::{
     BlockHash,
-    Txid,
 };
 
-use rusqlite;
-
-use crate::vault::{
-    VaultStateTransaction,
+use bitcoin::secp256k1::{
+    Secp256k1,
+    Verification,
 };
 
-use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
-use crate::migrate::{
-    MigrationError,
-};
-
-use crate::{
-    Vault,
-    VaultId,
-    VaultParameters,
-};
-
-pub struct SqliteStorage {
-    sqlite: rusqlite::Connection,
-}
-
-#[derive(Debug)]
-pub enum SqliteInitializationError {
-    MigrationError(MigrationError),
-    ConnectionConfigurationError(rusqlite::Error),
-}
-
-#[allow(dead_code)]
-impl SqliteStorage {
-    pub fn from_connection(mut _sqlite: rusqlite::Connection) -> Result<Self, SqliteInitializationError> {
-        todo!()
-    }
-
-    fn store_change(_transaction: &mut rusqlite::Transaction, _vault_id: VaultId, _change: &Change) -> Result<(), StoreError> {
-        todo!()
-    }
-}
-
-impl Deref for SqliteStorage {
-    type Target = rusqlite::Connection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.sqlite
-    }
-}
-
-impl DerefMut for SqliteStorage {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.sqlite
-    }
-}
-
-#[derive(Debug)]
-pub enum StoreError {
-    SqliteError(rusqlite::Error),
-    InvalidState,
-    InternalError,
-}
-
-#[derive(Debug)]
-pub enum LoadError {
-    SqliteError(rusqlite::Error),
-    InvalidState,
-    InternalError,
-    NotFound,
-    InvalidXpub,
-    InvalidWithdrawal,
-    InvalidDeposit,
-}
-
-impl From<rusqlite::Error> for LoadError {
-    fn from(e: rusqlite::Error) -> Self {
-        LoadError::SqliteError(e)
-    }
-}
-
-impl From<rusqlite::types::FromSqlError> for LoadError {
-    fn from(e: rusqlite::types::FromSqlError) -> Self {
-        LoadError::SqliteError(e.into())
-    }
-}
-
-impl std::fmt::Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LoadError::SqliteError(e) => e.fmt(f),
-            LoadError::InvalidState => write!(f, "Invalid state"),
-            LoadError::InternalError => write!(f, "Internal error"),
-            LoadError::NotFound => write!(f, "Not found"),
-            LoadError::InvalidXpub => write!(f, "Invalid xpub"),
-            LoadError::InvalidWithdrawal => write!(f, "Invalid withdrawal"),
-            LoadError::InvalidDeposit => write!(f, "Invalid deposit"),
-
-        }
-    }
-}
-
-impl std::error::Error for LoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            LoadError::SqliteError(e) => Some(e),
-            _ => None,
-        }
-    }
-
-    fn description(&self) -> &str {
-        "Error loading vault data"
-    }
-}
-
-impl From<rusqlite::Error> for StoreError {
-    fn from(e: rusqlite::Error) -> Self {
-        StoreError::SqliteError(e)
-    }
-}
-
 #[derive(Clone,Debug)]
-#[allow(dead_code)]
-pub(crate) enum Change {
+pub enum Change<T> {
     /// Informs the storage backend or VaultState about the existence of a transaction
-    AddTransaction(Rc<VaultStateTransaction>),
+    AddTransaction(BlockHash, Rc<T>),
 
     /// Informs the storage backend or VaultState about the existence of a block, presumably a relevant one
     AddBlock {
@@ -133,68 +20,61 @@ pub(crate) enum Change {
         block_hash: BlockHash,
         parent_block_hash: BlockHash,
     },
-
-    /// Informs the storage backend or VaultState of a transaction's inclusion in a given block
-    /// Must be issued after AddTransaction and AddBlock for the provided blocks
-    // FIXME: Lose the height from this? Backend and now VaultState can derive height 
-    Confirm(Txid, BlockHash, u32),
-
-    /// Instructs the storage backend to drop metadata related to the given block
-    Unconfirm(BlockHash),
 }
 
-pub struct ChangeLog {
-    id: VaultId,
-    changes: Vec<Change>,
+pub struct ChangeLog<S: Storage> {
+    id: S::Id,
+    changes: Vec<Change<S::Transaction>>,
 }
 
-impl ChangeLog {
-    pub(crate) fn new(id: VaultId) -> Self { Self { id, changes: vec![] } }
+pub struct ChangeIterator<S: Storage>(std::vec::IntoIter<Change<S::Transaction>>);
 
-    pub fn id(&self) -> VaultId { self.id }
+impl<S: Storage> Iterator for ChangeIterator<S> {
+    type Item = Change<S::Transaction>;
 
-    pub(crate) fn add(&mut self, change: Change) {
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+impl<S: Storage> ChangeLog<S> {
+    /// Create a new, empty changelog
+    /// Must be used with discipline, creating multiple changelogs with the same
+    /// id may cause unpredictable results
+    pub fn new(id: S::Id) -> Self { Self { id, changes: vec![] } }
+
+    pub fn id(&self) -> S::Id { self.id }
+
+    pub fn add(&mut self, change: Change<S::Transaction>) {
         self.changes.push(change);
     }
 
-    pub fn store<S: VaultStorage>(&mut self, storage: S) -> Result<(), S::StoreError> {
-        let _ = storage.store_vault(&self)?;
-        self.changes = Vec::new();
-        Ok(())
+    pub fn to_iterator(self) -> (ChangeLog<S>, ChangeIterator<S>) {
+        (
+            Self::new(self.id),
+            ChangeIterator(self.changes.into_iter()),
+        )
     }
 }
 
-pub trait VaultStorage {
+pub trait Storage: Sized {
     type StoreError;
     type LoadError;
+    type PruneError;
+    type Id: Clone + Copy;
+    type StaticParameters;
+    type State;
+    type Transaction;
 
-    fn create_vault(self, name: &str, parameters: VaultParameters) -> Result<(Vault, ChangeLog), Self::StoreError>;
+    fn create(&mut self, name: &str, parameters: Self::StaticParameters) -> Result<(Self::State, ChangeLog<Self>), Self::StoreError>;
 
-    fn load_vault(self, id: VaultId) -> Result<(Vault, ChangeLog), Self::LoadError>;
+    fn load<C: Verification>(&mut self, secp: &Secp256k1<C>, id: Self::Id) -> Result<(Self::State, ChangeLog<Self>), Self::LoadError>;
 
-    fn list_vaults(self) -> Result<Vec<(VaultId, String)>, Self::LoadError>;
+    fn list(&mut self) -> Result<Vec<(Self::Id, String)>, Self::LoadError>;
 
     // FIXME: Probably shouldn't be part of a public trait
-    fn store_vault(self, changes: &ChangeLog) -> Result<(), Self::StoreError>;
-}
+    fn store(&mut self, changes: ChangeLog<Self>) -> Result<ChangeLog<Self>, Self::StoreError>;
 
-impl VaultStorage for &mut SqliteStorage {
-    type StoreError = StoreError;
-    type LoadError = LoadError;
-
-    fn create_vault(self, _name: &str, _parameters: VaultParameters) -> Result<(Vault, ChangeLog), Self::StoreError> {
-        todo!()
-    }
-
-    fn load_vault(self, _id: VaultId) -> Result<(Vault, ChangeLog), Self::LoadError> {
-        todo!()
-    }
-
-    fn store_vault(self, _changes: &ChangeLog) -> Result<(), Self::StoreError> {
-        todo!()
-    }
-
-    fn list_vaults(self) -> Result<Vec<(VaultId, String)>, Self::LoadError> {
-        todo!()
-    }
+    /// Prune chain tips and unused blocks below a certain height
+    fn prune(&mut self, height: u32) -> Result<(), Self::PruneError>;
 }

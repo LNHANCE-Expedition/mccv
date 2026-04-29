@@ -5,6 +5,28 @@ use bitcoin::{
     Txid,
 };
 
+#[cfg(test)]
+use bitcoin::{
+    locktime::absolute,
+    Amount,
+    block,
+    CompactTarget,
+    script::PushBytes,
+    ScriptBuf,
+    Sequence,
+    transaction,
+    Transaction,
+    TxIn,
+    TxOut,
+    Witness,
+};
+
+#[cfg(test)]
+use bitcoin::hashes::Hash;
+
+#[cfg(test)]
+use bitcoin::io::Write;
+
 use bitcoin::secp256k1::{
     Secp256k1,
     Verification,
@@ -101,7 +123,51 @@ pub struct SeenBlock<T> {
     /// Most recent important ancestor (will not be pruned)
     important_ancestor: Option<Rc<SeenBlock<T>>>,
 
-    transactions: RefCell<BTreeSet<Rc<T>>>,
+    pub(crate) transactions: RefCell<BTreeSet<Rc<T>>>,
+}
+
+#[cfg(test)]
+fn make_test_block_hash<T>(parent: Option<&SeenBlock<T>>, seed: u64) -> BlockHash {
+    let mut engine = BlockHash::engine();
+
+    let _ = engine.write("TEST_BLOCK_TAG".as_bytes())
+        .expect("hash writes always succeed");
+
+    if let Some(parent) = parent {
+        let _ = engine.write(parent.block_hash.as_byte_array())
+            .expect("hash writes always succeed");
+    }
+
+    let _ = engine.write(&seed.to_be_bytes())
+        .expect("hash writes always succeed");
+
+    BlockHash::from_engine(engine)
+}
+
+#[cfg(test)]
+impl<T> SeenBlock<T>
+where
+    T: Ord,
+{
+    pub fn genesis<I>(transactions: I) -> Rc<Self>
+    where
+        I: IntoIterator<Item = T>
+    {
+        let transactions: BTreeSet<_> = transactions
+                    .into_iter()
+                    .map(|transaction| Rc::new(transaction))
+                    .collect();
+
+        Rc::new(
+            Self {
+                height: 0,
+                block_hash: make_test_block_hash::<T>(None, transactions.len() as u64),
+                parent_hash: BlockHash::from_byte_array([0; 32]),
+                important_ancestor: None,
+                transactions: RefCell::new(transactions),
+            }
+        )
+    }
 }
 
 impl<T> Ord for SeenBlock<T> {
@@ -264,8 +330,19 @@ pub enum RevertConfirmedTransactionError {
     /// Indicates its being reverted before a child transaction
     UtxoSpent,
     Inconsistent,
-    MissingTxid,
+    MissingTxid(Txid),
     MissingInput,
+}
+
+impl std::fmt::Display for RevertConfirmedTransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RevertConfirmedTransactionError::UtxoSpent => write!(f, "UTXO spent"),
+            RevertConfirmedTransactionError::Inconsistent => write!(f, "Inconsistent"),
+            RevertConfirmedTransactionError::MissingTxid(txid) => write!(f, "Missing TXID: {txid}"),
+            RevertConfirmedTransactionError::MissingInput => write!(f, "Missing input"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -274,6 +351,17 @@ pub enum AddBlockError {
     MissingParent(BlockHash),
     RevertConfirmedTransactionError(RevertConfirmedTransactionError),
     AddTransactionError,
+}
+
+impl std::fmt::Display for AddBlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddBlockError::IrreconcilableHistory => write!(f, "Irreconcilable history"),
+            AddBlockError::MissingParent(block_hash) => write!(f, "Missing parent block {block_hash}"),
+            AddBlockError::RevertConfirmedTransactionError(e) => write!(f, "Revert confirmed transaction error {e}"),
+            AddBlockError::AddTransactionError => write!(f, "Add transaction error"),
+        }
+    }
 }
 
 impl<T, O> ChainTipState<T, O> {
@@ -350,7 +438,7 @@ where
         let transaction = if let Some((transaction, _height)) = self.transactions.get(&txid) {
             transaction.clone()
         } else {
-            return Err(RevertConfirmedTransactionError::MissingTxid);
+            return Err(RevertConfirmedTransactionError::MissingTxid(txid));
         };
 
         let utxos: BTreeSet<_> = utxos(transaction.clone()).collect();
@@ -449,6 +537,16 @@ pub enum AddTransactionError<E> {
     InternalError,
     ConnectError(E),
     MissingInputs,
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for AddTransactionError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddTransactionError::InternalError => write!(f, "Internal error"),
+            AddTransactionError::ConnectError(e) => write!(f, "Connect error: {e}"),
+            AddTransactionError::MissingInputs => write!(f, "Missing inputs"),
+        }
+    }
 }
 
 pub struct ContractState<T, O> {
@@ -624,13 +722,13 @@ where
         };
 
         let block = Rc::new(
-                SeenBlock {
-                    height: new_height,
-                    block_hash: new_chain_tip,
-                    parent_hash,
-                    important_ancestor,
-                    transactions: RefCell::new(BTreeSet::new()),
-                }
+            SeenBlock {
+                height: new_height,
+                block_hash: new_chain_tip,
+                parent_hash,
+                important_ancestor,
+                transactions: RefCell::new(BTreeSet::new()),
+            }
         );
 
         self.blocks.insert(block.block_hash, Rc::downgrade(&block));
@@ -646,7 +744,7 @@ where
         });
 
         // First block is handled specially
-        let tip_state = if block.height == 1 {
+        let tip_state = if block.height == 0 {
             self.chain_tips.add_block(None, block.clone())
         } else if let Some(parent) = parent {
             self.chain_tips.add_block(Some(parent), block.clone())
@@ -779,6 +877,94 @@ where
 }
 
 #[cfg(test)]
+pub(crate) trait TestBlock {
+    fn test_coinbase() -> Transaction {
+        let anyonecanspend = ScriptBuf::from_hex("51")
+            .expect("OP_TRUE is a valid script");
+
+        let mut coinbase_scriptsig = ScriptBuf::new();
+        coinbase_scriptsig
+            .push_slice::<&PushBytes>(
+                "test"
+                    .as_bytes()
+                    .try_into()
+                    .expect("short string is valid pushdata")
+            );
+
+        Transaction {
+            version: transaction::Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([0; 32]),
+                        vout: 0,
+                    },
+                    script_sig: coinbase_scriptsig,
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![
+                TxOut {
+                    value: Amount::from_btc(50.0)
+                        .expect("50BTC is a valid amount"),
+                    script_pubkey: anyonecanspend,
+                }
+            ],
+        }
+    }
+
+    fn test_genesis() -> Self;
+
+    fn test_block(prev_blockhash: BlockHash, time: u32, nonce: u32, txdata: Vec<Transaction>) -> Self;
+
+    fn test_child<T: IntoIterator<Item = Transaction>>(&self, nonce: u32, transactions: T) -> Self;
+}
+
+#[cfg(test)]
+impl TestBlock for Block {
+    fn test_genesis() -> Self {
+        bitcoin::blockdata::constants::genesis_block(&bitcoin::params::REGTEST)
+    }
+
+    fn test_block(prev_blockhash: BlockHash, time: u32, nonce: u32, txdata: Vec<Transaction>) -> Self {
+        let mut initial_block = Block {
+            header: block::Header {
+                version: block::Version::ONE,
+                prev_blockhash,
+                merkle_root: block::TxMerkleNode::from_byte_array([0; 32]),
+                time,
+                bits: CompactTarget::default(),
+                nonce,
+            },
+            txdata,
+        };
+
+        if let Some(merkle_root) = initial_block.compute_merkle_root() {
+            initial_block.header.merkle_root = merkle_root;
+        }
+
+        initial_block
+    }
+
+    fn test_child<T: IntoIterator<Item = Transaction>>(&self, nonce: u32, transactions: T) -> Self {
+        let mut txdata = vec![
+            Self::test_coinbase(),
+        ];
+
+        txdata.extend(transactions);
+
+        Self::test_block(
+            self.block_hash(),
+            self.header.time + 1,
+            nonce,
+            txdata
+        )
+    }
+}
+
+#[cfg(test)]
 mod test {
     // XXX: We abuse the fact there's very little/no validation of blocks and transactions in
     // rust-bitcoin to construct these pseudo-mocks.
@@ -786,16 +972,13 @@ mod test {
     use super::*;
 
     use bitcoin::{
-        Amount,
         block,
-        CompactTarget,
         locktime::absolute,
         Transaction,
         TxIn,
         TxOut,
         transaction,
         ScriptBuf,
-        Sequence,
         Witness,
     };
 
@@ -1063,17 +1246,7 @@ mod test {
     }
 
     fn make_test_genesis() -> Block {
-        Block {
-            header: block::Header {
-                version: block::Version::ONE,
-                prev_blockhash: BlockHash::from_byte_array([0; 32]),
-                merkle_root: block::TxMerkleNode::from_byte_array([0; 32]),
-                time: 0,
-                bits: CompactTarget::default(),
-                nonce: 0,
-            },
-            txdata: vec![],
-        }
+        bitcoin::blockdata::constants::genesis_block(&bitcoin::params::REGTEST)
     }
 
     fn make_test_block_inner(previous: BlockHash, nonce: u32, txdata: Vec<Transaction>) -> Block {
@@ -1220,6 +1393,7 @@ mod test {
 
         assert_eq!(state.chain_tips.0.len(), 0);
 
+        state.apply_block(&secp, &contract.context, &genesis, 0).unwrap();
         state.apply_block(&secp, &contract.context, &block1, 1).unwrap();
         let seen_block1 = state.blocks.get_rc(&block1.block_hash()).unwrap();
         let utxos = get_utxos(&state);
@@ -1275,6 +1449,11 @@ mod test {
 
         let genesis = make_test_genesis();
         let block1 = make_test_block(&genesis, 0, vec![]);
+
+        let _ = contract.state.apply_block(&secp, &contract.context, &genesis, 0)
+            .unwrap();
+        let _ = contract2.state.apply_block(&secp, &contract2.context, &genesis, 0)
+            .unwrap();
 
         let txes = contract.state.apply_block(&secp, &contract.context, &block1, 1)
             .unwrap();

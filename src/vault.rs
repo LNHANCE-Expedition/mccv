@@ -76,6 +76,10 @@ use crate::storage::{
     ChangeLog,
 };
 
+use crate::vault_storage::{
+    SqliteStorage,
+};
+
 use crate::cache::{
     AddTransactionStateCache,
     VaultTemplateCache,
@@ -146,6 +150,7 @@ pub enum VaultAmountError {
     OutOfRange,
 }
 
+/// Satoshis per increment
 #[derive(Clone,Copy,Debug,Eq,PartialEq,Serialize,Deserialize)]
 #[serde(transparent)]
 pub struct VaultScale(u32);
@@ -389,6 +394,15 @@ pub(crate) trait VaultTemplates {
 }
 
 pub struct Context(VaultParameters, VaultTemplateCache, AddTransactionStateCache);
+
+impl Context {
+    pub(crate) fn from_parameters<C: Verification>(secp: &Secp256k1<C>, parameters: VaultParameters) -> Context {
+        let templates = VaultTemplateCache::new(parameters);
+        let cache = AddTransactionStateCache::new(secp, &templates);
+
+        Self(parameters, templates, cache)
+    }
+}
 
 // FIXME: Don't love that this had to be public because VaultTemplates is in the public interface.
 // Consider wrapping this in a newtype to protect it.
@@ -1203,11 +1217,11 @@ pub(crate) enum VaultTransactionMetadata {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct VaultStateTransaction {
-    txid: Txid,
-    transaction: Transaction,
+    pub(crate) txid: Txid,
+    pub(crate) transaction: Transaction,
     // Depth of vault transaction from initial deposit
-    depth: Depth,
-    metadata: VaultTransactionMetadata,
+    pub(crate) depth: Depth,
+    pub(crate) metadata: VaultTransactionMetadata,
     /// Key: parent txid
     parents: BTreeMap<Txid, Rc<VaultStateTransaction>>,
 }
@@ -1664,6 +1678,15 @@ pub enum ConnectVaultTransactionError {
     InvalidTransaction,
 }
 
+impl std::fmt::Display for ConnectVaultTransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectVaultTransactionError::Placeholder => write!(f, "Placeholder error"),
+            ConnectVaultTransactionError::InvalidTransaction => write!(f, "Invalid transaction"),
+        }
+    }
+}
+
 impl ContractTransactionConnector for Context {
     type Transaction = VaultStateTransaction;
     type OutputMetadata = VaultStateOutput;
@@ -1990,6 +2013,9 @@ pub struct VaultState(ContractState<VaultStateTransaction, VaultStateOutput>);
 
 impl VaultState {
     pub(crate) fn new() -> Self { Self(ContractState::new()) }
+    #[allow(dead_code)]
+    pub(crate) fn state(&self) -> &ContractState<VaultStateTransaction, VaultStateOutput> { &self.0 }
+    pub(crate) fn state_mut(&mut self) -> &mut ContractState<VaultStateTransaction, VaultStateOutput> { &mut self.0 }
 }
 
 pub struct Vault {
@@ -2005,7 +2031,7 @@ impl Vault {
         }
     }
 
-    pub fn new_unpersisted(id: VaultId, parameters: VaultParameters) -> (Self, ChangeLog) {
+    pub fn new_unpersisted(id: VaultId, parameters: VaultParameters) -> (Self, ChangeLog<SqliteStorage>) {
         let state = VaultState::new();
         (
             Vault::new(parameters, state),
@@ -2040,7 +2066,7 @@ impl Vault {
 
     // FIXME: this should probably be on ContractState
     #[cfg(feature = "bitcoind")]
-    pub fn apply_block<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, block: &Block, block_height: u32, changelog: &mut ChangeLog) -> Result<(), ApplyBlockError> {
+    pub fn apply_block<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, block: &Block, block_height: u32, changelog: &mut ChangeLog<SqliteStorage>) -> Result<(), ApplyBlockError> {
         let block_hash = block.block_hash();
         let parent_block_hash = block.header.prev_blockhash;
 
@@ -2061,8 +2087,7 @@ impl Vault {
             // TODO: Re-evaluate error variants
             match add_result {
                 Ok(AddTransactionSuccess::TransactionAdded(tx)) => {
-                    changelog.add(Change::AddTransaction(tx.clone()));
-                    changelog.add(Change::Confirm(txid, block_hash, block_height));
+                    changelog.add(Change::AddTransaction(block_hash, tx.clone()));
                 },
                 Ok(AddTransactionSuccess::TransactionIgnored) => { }
                 Err(AddTransactionError::InternalError) => { return Err(ApplyBlockError::InternalError); },
@@ -2526,10 +2551,7 @@ impl Vault {
     }
 
     pub fn context<C: Verification>(&self, secp: &Secp256k1<C>) -> Context {
-        let templates = VaultTemplateCache::new(self.parameters);
-        let cache = AddTransactionStateCache::new(secp, &templates);
-
-        Context(self.parameters, templates, cache)
+        Context::from_parameters(secp, self.parameters)
     }
 
     pub fn to_vault_amount(&self, amount: Amount) -> Result<(VaultAmount, Amount), VaultAmountError> {
@@ -2560,7 +2582,7 @@ mod test {
     }
 
     // master xpriv derived from milk sad key,
-    // XXX: copied in two places
+    // XXX: copied in three places
     fn test_xprivs<C: Signing>(secp: &Secp256k1<C>, account: u32) -> (Xpriv, Xpriv) {
         let milk_sad_master = Xpriv::from_str("tprv8ZgxMBicQKsPd1EzCPZcQSPhsotX5HvRDCivA7ASNQFmjWuTsW3WWEwUNKFAZrnD9qpz55rtyLdphqkwRZUqNWYXwSEzd6P4pYvXGByRim3").unwrap();
 

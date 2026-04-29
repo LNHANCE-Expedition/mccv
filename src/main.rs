@@ -60,8 +60,11 @@ use mccv::{
 };
 
 use mccv::storage::{
+    Storage,
+};
+
+use mccv::vault_storage::{
     SqliteStorage,
-    VaultStorage,
 };
 
 fn new_xpriv(network: NetworkKind) -> Xpriv {
@@ -208,7 +211,7 @@ fn main() {
             let mut storage = SqliteStorage::from_connection(sqlite)
                 .expect("initialize vault storage");
 
-            let (vault, changelog) = storage.create_vault(&generate_arg.name, vault_parameters)
+            let (vault, changelog) = storage.create(&generate_arg.name, vault_parameters)
                 .expect("vault creation success");
             /*
             let vault = Vault::create_new(&mut storage, "Default Vault", vault_parameters.clone()).expect("vault create");
