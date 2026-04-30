@@ -1,3 +1,8 @@
+use bdk_core::{
+    BlockId,
+    CheckPoint,
+};
+
 use bitcoin::{
     Block,
     BlockHash,
@@ -23,9 +28,6 @@ use bitcoin::{
 
 #[cfg(test)]
 use bitcoin::hashes::Hash;
-
-#[cfg(test)]
-use bitcoin::io::Write;
 
 use bitcoin::secp256k1::{
     Secp256k1,
@@ -126,47 +128,42 @@ pub struct SeenBlock<T> {
     pub(crate) transactions: RefCell<BTreeSet<Rc<T>>>,
 }
 
-#[cfg(test)]
-fn make_test_block_hash<T>(parent: Option<&SeenBlock<T>>, seed: u64) -> BlockHash {
-    let mut engine = BlockHash::engine();
-
-    let _ = engine.write("TEST_BLOCK_TAG".as_bytes())
-        .expect("hash writes always succeed");
-
-    if let Some(parent) = parent {
-        let _ = engine.write(parent.block_hash.as_byte_array())
-            .expect("hash writes always succeed");
+impl<T> SeenBlock<T> {
+    pub fn important_ancestor_hash(&self) -> Option<BlockHash> {
+        self.important_ancestor.as_ref().map(|ancestor| ancestor.block_hash)
     }
-
-    let _ = engine.write(&seed.to_be_bytes())
-        .expect("hash writes always succeed");
-
-    BlockHash::from_engine(engine)
 }
 
-#[cfg(test)]
-impl<T> SeenBlock<T>
-where
-    T: Ord,
-{
-    pub fn genesis<I>(transactions: I) -> Rc<Self>
-    where
-        I: IntoIterator<Item = T>
-    {
-        let transactions: BTreeSet<_> = transactions
-                    .into_iter()
-                    .map(|transaction| Rc::new(transaction))
-                    .collect();
+impl<T> From<&SeenBlock<T>> for BlockId {
+    fn from(block: &SeenBlock<T>) -> Self {
+        Self {
+            height: block.height,
+            hash: block.block_hash,
+        }
+    }
+}
 
-        Rc::new(
-            Self {
-                height: 0,
-                block_hash: make_test_block_hash::<T>(None, transactions.len() as u64),
-                parent_hash: BlockHash::from_byte_array([0; 32]),
-                important_ancestor: None,
-                transactions: RefCell::new(transactions),
-            }
-        )
+impl<T> TryFrom<&SeenBlock<T>> for CheckPoint {
+    type Error = Option<CheckPoint>;
+
+    fn try_from(block: &SeenBlock<T>) -> Result<Self, Self::Error> {
+        // XXX: Really feeling the friction from being unable to implement traits against
+        // [`Rc<SeenBlock<T>>`] which is everywhere in this module. Probably should have made a
+        // newtype. Maybe later... Might as well rename it while I'm at it.
+        // XXX: Don't love building a vec but I'm not sure there's a better way since ChainWalker
+        // is basically traversing a (singly) linked list in the opposite direciton from what we need.
+        let mut block_ids = vec![ BlockId::from(block) ];
+
+        if let Some(ancestor) = &block.important_ancestor {
+            block_ids.extend(
+                ChainWalker::new(ancestor.clone())
+                    .map(|block| BlockId::from(block.as_ref()))
+            );
+        }
+
+        block_ids.reverse();
+
+        CheckPoint::from_block_ids(block_ids)
     }
 }
 

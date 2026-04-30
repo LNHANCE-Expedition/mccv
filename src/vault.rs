@@ -1,6 +1,8 @@
 #[cfg(feature = "bitcoind")]
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi, self};
 
+use bdk_core::CheckPoint;
+
 use bitcoin::bip32::{
     Xpub,
     ChildNumber,
@@ -2062,6 +2064,16 @@ impl Vault {
                 .sum()
             })
             .unwrap_or(Amount::ZERO)
+    }
+
+    #[cfg(feature = "bitcoind")]
+    pub fn checkpoint(&self) -> Option<CheckPoint> {
+        self.state.0.longest_chain_tip()
+            .map(|(seen_block, _)| {
+                    CheckPoint::try_from(seen_block.as_ref())
+                        .expect("valid block history")
+                }
+            )
     }
 
     #[cfg(feature = "bitcoind")]
