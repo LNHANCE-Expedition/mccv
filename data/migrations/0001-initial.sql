@@ -14,7 +14,9 @@ create table mccv_vault (
 	delay_per_increment integer,
 	max_withdrawal_per_step integer,
 	max_deposit_per_step integer,
-	max_depth integer
+	max_depth integer,
+	constraint unique_name
+		unique ( name )
 );
 
 create table mccv_transaction (
