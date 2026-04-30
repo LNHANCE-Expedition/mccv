@@ -16,7 +16,6 @@ use bitcoin::{
     FeeRate,
     Network,
     relative,
-    Txid,
 };
 
 #[allow(unused_imports)]
@@ -329,7 +328,7 @@ fn test_deposit_withdraw() {
     let _ = nodes.client(0).get_mempool_entry(&transmittable_deposit_transaction.compute_txid())
         .expect_err("deposit tx has been mined");
 
-    let mut vault_block_emitter = Emitter::new(nodes.client(0), genesis_checkpoint, 0, Option::<Txid>::None);
+    let mut vault_block_emitter = Emitter::new(nodes.client(0), genesis_checkpoint, 0, &[]);
 
     assert_eq!(vault.confirmed_balance(None), Amount::ZERO);
 
