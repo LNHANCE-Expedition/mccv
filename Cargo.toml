@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bdk_electrum = "0.23.0"
-bdk_wallet = { version = "2.0.0", features = ["rusqlite"] }
+bdk_core = { version = "0.6.0" }
 bdk_bitcoind_rpc = { version = "0.20.0", optional = true }
+bdk_wallet = { version = "2.0.0", features = ["rusqlite"] }
 bitcoin = { version = "0.32", features = ["serde"] }
 bitcoin_hashes = "0.15.0"
 clap = { version = "4.5.21", features = ["derive"] }
@@ -16,10 +16,9 @@ rusqlite = "0.31"
 serde = { version = "1.0.215", features = ["derive"] }
 serde_json = { version = "1.0.133", optional = true }
 toml = "0.8.19"
-bdk_core = { version = "0.6.0", optional = true }
 
 [features]
-bitcoind = [ "bdk_bitcoind_rpc", "bdk_core", "serde_json" ]
+bitcoind = [ "bdk_bitcoind_rpc", "serde_json" ]
 
 [dev-dependencies]
 mccv = { path = ".", features = [ "bitcoind" ] }

@@ -1,10 +1,10 @@
 use bitcoin::{BlockHash, Transaction, Txid};
-use bitcoin::bip32::Xpub;
+use bitcoin::bip32::{Xpub, Fingerprint, Xpriv, DerivationPath};
 use bitcoin::consensus::{Encodable, Decodable};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, Verification};
 
-use rusqlite;
+use rusqlite::{self, OptionalExtension};
 use rusqlite::{
     params,
     types::FromSql,
@@ -63,6 +63,15 @@ pub enum SqliteInitializationError {
     CommitError(rusqlite::Error),
 }
 
+pub struct StoredSecrets {
+    pub master_fingerprint: Fingerprint,
+    pub master_xpriv: Option<Xpriv>,
+    pub hot_path: DerivationPath,
+    pub hot_xpriv: Xpriv,
+    pub descriptor: String,
+    pub change_descriptor: String,
+}
+
 #[allow(dead_code)]
 impl SqliteStorage {
     pub fn from_connection(mut sqlite: rusqlite::Connection) -> Result<Self, SqliteInitializationError> {
@@ -77,6 +86,116 @@ impl SqliteStorage {
         }
 
         Ok(SqliteStorage { sqlite })
+    }
+
+    pub fn store_secrets(&mut self, id: VaultId, secrets: &StoredSecrets) -> Result<(), StoreError> {
+        let transaction = self.sqlite.transaction()?;
+
+        transaction.execute(r#"
+            insert
+            into mccv_secret (
+                id,
+                master_fingerprint,
+                master_xpriv,
+                hot_path,
+                hot_xpriv,
+                descriptor,
+                change_descriptor
+            )
+            values ( ?, ?, ?, ?, ?, ?, ? )
+            "#,
+            params![
+                id,
+                secrets.master_fingerprint.to_bytes(),
+                secrets.master_xpriv
+                    .map(|xpriv| xpriv.to_string()),
+                secrets.hot_path.to_string(),
+                secrets.hot_xpriv.to_string(),
+                secrets.descriptor,
+                secrets.change_descriptor,
+            ],
+        )?;
+
+        transaction.commit()?;
+
+        Ok(())
+    }
+
+    pub fn load_secrets(&mut self, id: VaultId) -> Result<Option<StoredSecrets>, StoreError> {
+        let transaction = self.sqlite.transaction()?;
+
+        let secrets = transaction.query_row(r#"
+            select
+                master_fingerprint,
+                master_xpriv,
+                hot_path,
+                hot_xpriv,
+                descriptor,
+                change_descriptor
+            from
+                mccv_secret
+            where
+                id = ?
+            "#,
+            params![ id ],
+            |row| {
+                let master_fingerprint: [u8; 4] = row.get(0)?;
+                let master_xpriv: Option<Xpriv> = row.get_ref(1)?
+                        .as_str_or_null()?
+                        .map(|s| s
+                            .parse()
+                            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                                    1,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            )
+                        )
+                        .transpose()?;
+
+                let hot_path: DerivationPath = row.get_ref(2)?
+                    .as_str()?
+                    .parse()
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    )?;
+
+                let hot_xpriv: Xpriv = row.get_ref(3)?
+                    .as_str()?
+                    .parse()
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    )?;
+
+
+
+                Ok(
+                    StoredSecrets {
+                        master_fingerprint: master_fingerprint.into(),
+                        master_xpriv,
+                        hot_path,
+                        hot_xpriv,
+                        descriptor: row
+                            .get_ref(4)?
+                            .as_str()?
+                            .to_owned(),
+                        change_descriptor: row
+                            .get_ref(5)?
+                            .as_str()?
+                            .to_owned(),
+                    }
+                )
+            }
+        )
+        .optional()?;
+
+        Ok(secrets)
     }
 }
 

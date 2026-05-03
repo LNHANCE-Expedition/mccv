@@ -1,7 +1,12 @@
 create table mccv_secret (
+	id integer primary key,
+	master_fingerprint blob not null,
 	master_xpriv text,
-	descriptor text,
-	change_descriptor text
+	hot_path text not null,
+	hot_xpriv text not null,
+	descriptor text not null,
+	change_descriptor text not null,
+	foreign key ( id ) references mccv_vault ( id )
 );
 
 create table mccv_vault (

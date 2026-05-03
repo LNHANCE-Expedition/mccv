@@ -44,6 +44,10 @@ impl<S: Storage> ChangeLog<S> {
     /// id may cause unpredictable results
     pub fn new(id: S::Id) -> Self { Self { id, changes: vec![] } }
 
+    pub fn take(&mut self) -> Self {
+        std::mem::replace(self, Self::new(self.id))
+    }
+
     pub fn id(&self) -> S::Id { self.id }
 
     pub fn add(&mut self, change: Change<S::Transaction>) {
