@@ -33,66 +33,105 @@ create table block (
 	block_hash blob not null,
 	parent_block_hash blob,
 	height integer not null,
-	primary key (block_hash),
-	constraint valid_parent_block_hash
-		foreign key (parent_block_hash) references block (block_hash)
+	primary key (block_hash)
 ) strict, without rowid;
 
+create table sparse_chain (
+	block_hash blob not null,
+	sparse_parent_block_hash blob,
+	vault integer not null,
+
+	primary key ( vault, block_hash ),
+	foreign key ( vault, sparse_parent_block_hash )
+		references sparse_chain ( vault, block_hash ),
+	foreign key ( vault )
+		references mccv_vault ( id )
+) strict, without rowid;
+
+-- FIXME: It might make sense to directly record chain tips
+-- With the posibility that two contracts might share a database
+-- but one might not be synced as high as the other, I think there's some benefit
+-- to manually maintaining that.
 create view chain_tip (
 	block_hash,
-	height
+	height,
+	vault
 ) as select
-	block.block_hash,
-	block.height
-from block
+	sparse_chain.block_hash as block_hash,
+	block.height as height,
+	sparse_chain.vault as vault
+from sparse_chain
+join block
+	on block.block_hash = sparse_chain.block_hash
 where not exists (
 	select 1
+		from sparse_chain as child_block
+		where child_block.sparse_parent_block_hash = sparse_chain.block_hash
+			and child_block.vault = sparse_chain.vault
+)
+and not exists (
+	select 1
 		from block as child_block
-		where block.block_hash = child_block.parent_block_hash
+		where child_block.parent_block_hash = sparse_chain.block_hash
 );
 
-CREATE INDEX block_by_parent ON block(parent_block_hash);
+create index sparse_block_by_parent ON sparse_chain ( vault, block_hash );
 
-create unique index unique_genesis_block
-	on block((1))
-	where block_hash is null;
-
-create view chain (
+create view contract_chain (
 	chain_tip_hash,
 	block_hash,
-	height
+	parent_block_hash,
+	sparse_parent_block_hash,
+	height,
+	vault
 ) as with recursive c (
 	chain_tip_hash,
-	parent_block_hash,
 	block_hash,
-	height
+	parent_block_hash,
+	sparse_parent_block_hash,
+	height,
+	vault
 ) as not materialized (
 	select
 		tip.block_hash as chain_tip_hash,
-		block.parent_block_hash as parent_block_hash,
 		tip.block_hash as block_hash,
-		tip.height as height
+		block.parent_block_hash as parent_block_hash,
+		sparse_chain.sparse_parent_block_hash as sparse_parent_block_hash,
+		tip.height as height,
+		tip.vault as vault
 	from
 		chain_tip tip
+	join sparse_chain
+		on sparse_chain.block_hash = tip.block_hash
+			and sparse_chain.vault = tip.vault
 	join block
 		on block.block_hash = tip.block_hash
 
 	union all
 
 	select
-		c.chain_tip_hash as chain_tip_hash,
-		parent.parent_block_hash as parent_block_hash,
+		child.chain_tip_hash as chain_tip_hash,
 		parent.block_hash as block_hash,
-		parent.height as height
+		parent.parent_block_hash as parent_block_hash,
+		sparse_chain.sparse_parent_block_hash as sparse_parent_block_hash,
+		parent.height as height,
+		child.vault as vault
 	from
-		c
-	join block parent on
-		c.parent_block_hash = parent.block_hash
+		c as child
+	join sparse_chain
+		on sparse_chain.block_hash = child.sparse_parent_block_hash
+			and sparse_chain.vault = child.vault
+	join block parent
+		on parent.block_hash = child.sparse_parent_block_hash
 ) select
 	chain_tip_hash,
 	block_hash,
-	height
-from c;
+	parent_block_hash,
+	sparse_parent_block_hash,
+	height,
+	vault
+from c
+where block_hash is not null;
 
 create table "transaction" (
 	txid blob not null,

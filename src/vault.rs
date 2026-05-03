@@ -15,6 +15,7 @@ use bitcoin::Block;
 #[cfg(feature = "bitcoind")]
 use bitcoin::consensus::encode::serialize_hex;
 
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{
     PublicKey,
     Secp256k1,
@@ -34,6 +35,7 @@ use bitcoin::{
     Amount,
     blockdata::locktime::relative,
     blockdata::transaction::Version,
+    BlockHash,
     OutPoint,
     ScriptBuf,
     Script,
@@ -73,18 +75,30 @@ use std::rc::Rc;
 
 use crate::bip119::get_default_template;
 
-use crate::storage::{
-    Change,
-    ChangeLog,
-};
-
-use crate::vault_storage::{
-    SqliteStorage,
-};
-
 use crate::cache::{
     AddTransactionStateCache,
     VaultTemplateCache,
+};
+
+use crate::chain;
+use crate::chain::{
+    ChainTipState,
+    ConnectTransactionSuccess,
+    ContractInputs,
+    ContractOutputs,
+    ContractTransaction,
+    ContractTransactionConnector,
+    Either,
+    UtxoSelector,
+};
+
+pub use crate::chain::{
+    ContractState,
+};
+
+use crate::storage::{
+    Change,
+    ChangeLog,
 };
 
 use crate::transaction::{
@@ -105,22 +119,8 @@ use crate::transaction::{
     WithdrawalTransaction,
 };
 
-use crate::chain::{
-    AddBlockError,
-    AddTransactionError,
-    AddTransactionSuccess,
-    ChainTipState,
-    ConnectTransactionSuccess,
-    ContractInputs,
-    ContractOutputs,
-    ContractTransaction,
-    ContractTransactionConnector,
-    Either,
-    UtxoSelector,
-};
-
-pub use crate::chain::{
-    ContractState,
+use crate::vault_storage::{
+    SqliteStorage,
 };
 
 // struct.unpack(">I", hashlib.sha256(b'mccv').digest()[:4])[0] & 0x7FFFFFFF
@@ -1469,13 +1469,8 @@ impl VaultStateTransaction {
     }
 }
 
-#[derive(Debug)]
 #[cfg(feature = "bitcoind")]
-pub enum ApplyBlockError {
-    AddBlockError(AddBlockError),
-    AddTransactionError(AddTransactionError<ConnectVaultTransactionError>),
-    InternalError,
-}
+pub type ApplyBlockError = chain::ApplyBlockError<ConnectVaultTransactionError>;
 
 // Kind of annoying how much must be copied. the Control block can be up to 4KiB + 33B
 #[allow(dead_code)]
@@ -2011,6 +2006,12 @@ impl ContractTransactionConnector for Context {
     }
 }
 
+#[derive(Debug)]
+pub enum BirthdayError {
+    MissingGenesisBlock,
+    MatureVault,
+}
+
 pub struct VaultState(ContractState<VaultStateTransaction, VaultStateOutput>);
 
 impl VaultState {
@@ -2076,36 +2077,42 @@ impl Vault {
             )
     }
 
+    /// Set this vault's birthday to a given height and block hash
+    /// Blocks before and including this one are assumed not to contain vault
+    /// transactions.
+    pub fn birthday(&mut self, block_hash: BlockHash, parent_block_hash: BlockHash, height: u32, changelog: &mut ChangeLog<SqliteStorage>) {
+        let birthday = self.state.0.birthday(block_hash, parent_block_hash, height);
+
+        changelog.add(
+            Change::AddBlock {
+                height,
+                block_hash,
+                parent_block_hash,
+                sparse_parent_block_hash: birthday
+                    .important_ancestor_hash()
+                    .unwrap_or(BlockHash::from_byte_array([0; 32])),
+            }
+        );
+    }
+
     #[cfg(feature = "bitcoind")]
     pub fn apply_block<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, block: &Block, block_height: u32, changelog: &mut ChangeLog<SqliteStorage>) -> Result<(), ApplyBlockError> {
         let block_hash = block.block_hash();
         let parent_block_hash = block.header.prev_blockhash;
 
-        let seen_block = self.state.0.add_block(block_height, block_hash, parent_block_hash)
-            .map_err(ApplyBlockError::AddBlockError)?;
+        let (seen_block, added_transactions) = self.state.0.apply_block(secp, context, block, block_height)?;
 
-        changelog.add(Change::AddBlock { height: block_height, block_hash, parent_block_hash });
+        changelog.add(Change::AddBlock {
+            height: block_height,
+            block_hash,
+            parent_block_hash,
+            sparse_parent_block_hash: seen_block
+                .important_ancestor_hash()
+                .unwrap_or(BlockHash::from_byte_array([0; 32]))
+        });
 
-        self.state.0.normalize();
-
-        let state = self.state.0.get_tip_mut(&seen_block)
-            .expect("block was just added");
-
-        for transaction in &block.txdata {
-            let txid = transaction.compute_txid();
-            let add_result = state.add(secp, context, txid, transaction, block_height);
-
-            // TODO: Re-evaluate error variants
-            match add_result {
-                Ok(AddTransactionSuccess::TransactionAdded(tx)) => {
-                    changelog.add(Change::AddTransaction(block_hash, tx.clone()));
-                },
-                Ok(AddTransactionSuccess::TransactionIgnored) => { }
-                Err(AddTransactionError::InternalError) => { return Err(ApplyBlockError::InternalError); },
-                // TODO: Could pass through the connect error, in a new variant, why not?
-                Err(AddTransactionError::ConnectError(_e)) => { return Err(ApplyBlockError::InternalError); }
-                Err(AddTransactionError::MissingInputs) => { return Err(ApplyBlockError::InternalError); }
-            }
+        for added_transaction in added_transactions {
+            changelog.add(Change::AddTransaction(block_hash, added_transaction.clone()));
         }
 
         Ok(())

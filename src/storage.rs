@@ -19,6 +19,7 @@ pub enum Change<T> {
         height: u32,
         block_hash: BlockHash,
         parent_block_hash: BlockHash,
+        sparse_parent_block_hash: BlockHash,
     },
 }
 
