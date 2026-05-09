@@ -2064,7 +2064,6 @@ impl Vault {
             .unwrap_or(Amount::ZERO)
     }
 
-    // FIXME: this should probably be on ContractState
     #[cfg(feature = "bitcoind")]
     pub fn apply_block<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, block: &Block, block_height: u32, changelog: &mut ChangeLog<SqliteStorage>) -> Result<(), ApplyBlockError> {
         let block_hash = block.block_hash();
