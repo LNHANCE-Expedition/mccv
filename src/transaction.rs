@@ -1038,7 +1038,7 @@ impl WithdrawalTransaction {
     }
 
     // TODO: eliminate need to construct transaction
-    fn compute_txid(&self) -> Txid {
+    pub(crate) fn compute_txid(&self) -> Txid {
         let tx: Transaction = self.clone().into_transaction();
 
         tx.compute_txid()
@@ -1179,6 +1179,8 @@ impl WithdrawalSpendTransaction {
     pub fn timelock(&self) -> relative::LockTime {
         self.withdrawal_output_info.timelock
     }
+
+    pub(crate) fn prevout(&self) -> OutPoint { self.prevout }
 
     pub fn hot_keypair<C: Signing>(&self, secp: &Secp256k1<C>, xpriv: &Xpriv) -> Result<Keypair, KeypairDerivationError> {
         let keypair = xpriv.derive_priv(secp, &[

@@ -59,11 +59,16 @@ use rusqlite::{
 
 use std::path::PathBuf;
 
+#[cfg(feature = "bitcoind")]
+use mccv::{
+    vault::SubmitPackage,
+};
+
 use mccv::{
     AccountId,
     storage::ChangeLog,
+    UtxoSelector,
     vault::Context,
-    vault::SubmitPackage,
     VaultAmount,
     VaultDepositor,
     VaultId,
@@ -174,23 +179,15 @@ fn vault_parameters_from_args(args: &GenerateArg, cold_xpub: Xpub, hot_xpub: Xpu
 }
 
 #[derive(Clone, Args)]
-struct ModifyArg {
-    #[arg(short, long = "vault-name", help = "Human readable identifier string")]
-    name: Option<String>,
-
+struct FeeRateArg {
     #[arg(short, long, help = "Fee rate override in sats/vbyte")]
     fee_rate: Option<u64>,
 
     #[arg(short, long, default_value_t = 6, help = "Target confirmation block for fee rate estimation")]
     block_confirmation_target: u16,
-
-    #[command(flatten)]
-    rpc_conf: RpcConf,
-
-    amount: Amount,
 }
 
-impl ModifyArg {
+impl FeeRateArg {
     fn fee_rate(&self, rpc_client: &Client) -> FeeRate {
         if let Some(fee_rate) = self.fee_rate {
             FeeRate::from_sat_per_vb(fee_rate)
@@ -211,6 +208,20 @@ impl ModifyArg {
     }
 }
 
+#[derive(Clone, Args)]
+struct ModifyArg {
+    #[arg(short, long = "vault-name", help = "Human readable identifier string")]
+    name: Option<String>,
+
+    #[command(flatten)]
+    rpc_conf: RpcConf,
+
+    #[command(flatten)]
+    fee_rate: FeeRateArg,
+
+    amount: Amount,
+}
+
 #[derive(Clone, Subcommand)]
 enum Command {
     Generate(GenerateArg),
@@ -220,6 +231,16 @@ enum Command {
         name: Option<String>
     },
     Receive {
+        #[arg(short, long = "vault-name", help = "Human readable identifier string")]
+        name: Option<String>,
+    },
+    SweepToHot {
+        #[command(flatten)]
+        fee_rate: FeeRateArg,
+
+        #[command(flatten)]
+        rpc_conf: RpcConf,
+
         #[arg(short, long = "vault-name", help = "Human readable identifier string")]
         name: Option<String>,
     },
@@ -718,6 +739,49 @@ fn main() {
             vault.store();
             println!("Synced!");
         }
+        Command::SweepToHot { ref name, ref fee_rate, ref rpc_conf } => {
+            let storage = args.open_storage();
+            let rpc_client = rpc_conf.open();
+
+            let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
+
+            let current_height = vault.vault.height()
+                .expect("must have synced at least one block");
+
+            let mature_withdrawals: Vec<_> =
+                vault
+                    .vault
+                    .spend_withdrawal_transactions(&secp, UtxoSelector::any_confirmed())
+                    .into_iter()
+                    .filter(|(maturity_height, _)|
+                        maturity_height
+                            .map(|maturity_height| maturity_height <= current_height)
+                            .unwrap_or(false)
+                    )
+                    .map(|(_, withdrawal)| withdrawal)
+                    .collect();
+
+
+            let min_fee = Amount::ZERO;
+            let min_fee_rate = fee_rate.fee_rate(&rpc_client);
+
+            for withdrawal in mature_withdrawals {
+                let keypair = withdrawal.hot_keypair(&secp, &vault.secrets.hot_xpriv)
+                    .expect("valid keypair");
+                let address = vault.wallet.reveal_next_address(KeychainKind::External);
+
+                let transaction = withdrawal
+                    .spend(&secp, &keypair, address.script_pubkey(), min_fee, min_fee_rate)
+                    .expect("create sweep tx");
+
+                println!("Sweep TX: {}", serialize_hex(&transaction));
+
+                rpc_client.send_raw_transaction(&transaction)
+                    .expect("send sweep tx");
+            }
+
+            vault.store();
+        },
         Command::Receive { ref name } => {
             let storage = args.open_storage();
 
@@ -732,7 +796,7 @@ fn main() {
         Command::Deposit(ref deposit_args) => {
             let rpc_client = deposit_args.rpc_conf.open();
 
-            let fee_rate = deposit_args.fee_rate(&rpc_client);
+            let fee_rate = deposit_args.fee_rate.fee_rate(&rpc_client);
 
             let storage = args.open_storage();
 
@@ -791,7 +855,7 @@ fn main() {
         Command::Withdraw(ref withdrawal_args) => {
             let rpc_client = withdrawal_args.rpc_conf.open();
 
-            let fee_rate = withdrawal_args.fee_rate(&rpc_client);
+            let fee_rate = withdrawal_args.fee_rate.fee_rate(&rpc_client);
 
             let storage = args.open_storage();
 

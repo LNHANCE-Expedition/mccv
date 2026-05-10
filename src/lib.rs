@@ -8,6 +8,10 @@ pub mod vault;
 pub mod vault_storage;
 pub mod wallet;
 
+pub use chain::{
+    UtxoSelector,
+};
+
 pub use vault::{
     AccountId,
     VaultAmount,

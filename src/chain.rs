@@ -129,6 +129,7 @@ pub struct SeenBlock<T> {
 }
 
 impl<T> SeenBlock<T> {
+    pub fn height(&self) -> u32 { self.height }
     pub fn important_ancestor_hash(&self) -> Option<BlockHash> {
         self.important_ancestor.as_ref().map(|ancestor| ancestor.block_hash)
     }

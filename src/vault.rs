@@ -116,6 +116,7 @@ use crate::transaction::{
     VaultTransactionTemplate,
     WithdrawalOutputSpendInfo,
     WithdrawalSpendingCondition,
+    WithdrawalSpendTransaction,
     WithdrawalTransaction,
 };
 
@@ -2042,6 +2043,11 @@ impl Vault {
         )
     }
 
+    pub fn height(&self) -> Option<u32> {
+        self.state.0.longest_chain_tip()
+            .map(|(block, _)| block.height())
+    }
+
     pub fn parameters(&self) -> &VaultParameters { &self.parameters }
 
     /// Return the confirmed balance of the vault by a given height, or any height
@@ -2127,6 +2133,50 @@ impl Vault {
                     .collect()
             })
             .unwrap_or_else(|| BTreeSet::new())
+    }
+
+    /// Returns a list of transactions spending withdrawal utxos together with the minimum block
+    /// height they can be spent
+    pub fn spend_withdrawal_transactions<C: Verification>(&self, secp: &Secp256k1<C>, selector: UtxoSelector) -> Vec<(Option<u32>, WithdrawalSpendTransaction)> {
+        let tip_state = self.state.0.longest_chain_tip()
+            .map(|(_, tip_state)| tip_state);
+
+        self.utxos(selector)
+            .into_iter()
+            .filter(|VaultStateUtxo(_, output)| *output == VaultStateOutput::Withdrawal)
+            .map(|VaultStateUtxo(tx, _output)| {
+                    match tx.metadata {
+                        VaultTransactionMetadata::Withdrawal { withdrawal, .. } => {
+                            let (_, vault_parent_utxo) = tx.input_utxos().next()
+                                .expect("Withdrawal transaction has a single parent");
+
+                            let withdrawal = self.build_withdrawal(secp, vault_parent_utxo, withdrawal)
+                                .expect("Withdrawal has already been created once");
+
+                            let spend = withdrawal.spend_withdrawal();
+
+                            let maturity = match spend.timelock() {
+                                relative::LockTime::Blocks(blocks) => {
+                                    tip_state
+                                        .and_then(|tip_state| {
+                                            tip_state
+                                                .utxo(
+                                                    spend.prevout()
+                                                )
+                                                .map(|(_, _, height)| height + blocks.value() as u32)
+                                        })
+                                }
+                                relative::LockTime::Time(_) =>
+                                    unreachable!("Vault always uses block timelocks"),
+                            };
+
+                            (maturity, spend)
+                        }
+                        _ => unreachable!("Withdrawal output must be on a withdrawal tx"),
+                    }
+                }
+            )
+            .collect()
     }
 
     pub fn create_recovery<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<RecoveryTransaction, RecoveryCreationError> {
@@ -2468,7 +2518,7 @@ impl Vault {
                             Some(&parent_templates),
                         )
                     })
-                    // FIXME: consider making an error variant
+                    // TODO: consider making an error variant
                     .expect("tail deposits have transaction history");
 
                 let vault_outpoint = outpoint.expect("non-initial deposit must have outpoint of previous vault");
@@ -2494,31 +2544,28 @@ impl Vault {
         );
 
         // TODO: Find smallest UTXO larger than or equal to requested withdrawal
-        let vault_utxo = utxos.best_vault_utxo();
-
-        let current_vault_value = vault_utxo
-            .as_ref()
-            .and_then(|VaultStateUtxo(tx, _)| tx.result_value())
-            .unwrap_or(VaultAmount::ZERO);
-
-        let depth = vault_utxo
-            .as_ref()
-            .map(|VaultStateUtxo(tx, _)| tx.depth + 1)
+        let vault_utxo = utxos.best_vault_utxo()
             .ok_or(WithdrawalCreationError::InsufficientFunds)?;
+
+        self.build_withdrawal(secp, vault_utxo, withdrawal_amount)
+    }
+
+    pub fn build_withdrawal<C: Verification>(&self, secp: &Secp256k1<C>, vault_utxo: VaultStateUtxo, withdrawal_amount: VaultAmount) -> Result<WithdrawalTransaction, WithdrawalCreationError> {
+        let depth = vault_utxo.0.depth + 1;
 
         let transition = VaultTransition::Withdrawal(withdrawal_amount);
 
-        let previous_output = vault_utxo
-            .as_ref()
-            .and_then(|VaultStateUtxo(tx, _)| tx.outpoint(VaultStateOutput::Vault))
+        let previous_output = vault_utxo.0.outpoint(VaultStateOutput::Vault)
             .ok_or(WithdrawalCreationError::VaultClosed)?;
+
+        let current_vault_value = vault_utxo.0.result_value()
+            .ok_or(WithdrawalCreationError::InsufficientFunds)?;
 
         let vault_total = current_vault_value.apply_transition(transition, None)
             .ok_or(WithdrawalCreationError::InsufficientFunds)?;
 
-        let parameters = vault_utxo
-            .as_ref()
-            .and_then(|VaultStateUtxo(tx, _)| tx.vault_state_parameters())
+        let parameters = vault_utxo.0
+            .vault_state_parameters()
             .and_then(|parameters| parameters
                 .next(VaultTransition::Withdrawal(withdrawal_amount), &self.parameters, depth)
             )
@@ -2538,8 +2585,8 @@ impl Vault {
             VaultTransactionTemplate::Withdrawal(withdrawal) => withdrawal,
         };
 
-        let spend_info = vault_utxo
-            .and_then(|VaultStateUtxo(tx, _)| tx.vault_state_parameters())
+        let spend_info = vault_utxo.0
+            .vault_state_parameters()
             .map(|parent_parameters| {
                 debug_assert!(depth > 0, "Depth 0 has no ancestors");
 
