@@ -247,6 +247,16 @@ enum Command {
         #[arg(short, long = "vault-name", help = "Human readable identifier string")]
         name: Option<String>,
     },
+    Recover {
+        #[command(flatten)]
+        fee_rate: FeeRateArg,
+
+        #[command(flatten)]
+        rpc_conf: RpcConf,
+
+        #[arg(short, long = "vault-name", help = "Human readable identifier string")]
+        name: Option<String>,
+    },
     Send {
         #[arg(short, long = "vault-name", help = "Human readable identifier string")]
         name: Option<String>,
@@ -835,6 +845,45 @@ fn main() {
 
             vault.store();
         },
+        Command::Recover { ref name, ref fee_rate, ref rpc_conf } => {
+            let storage = args.open_storage();
+            let rpc_client = rpc_conf.open();
+
+            let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
+
+            let mut recovery = vault.vault.create_recovery(&secp)
+                .expect("create recovery");
+
+            let recovery_keypair = recovery.hot_keypair(&secp, &vault.secrets.hot_xpriv)
+                .expect("successful key derivation");
+
+            recovery.sign(&secp, &recovery_keypair)
+                .expect("sign success");
+
+            let min_fee_rate = fee_rate.fee_rate(&rpc_client);
+
+            let mut recovery_cpfp_psbt = vault.wallet.create_cpfp(&secp, &recovery, min_fee_rate)
+                .expect("create cpfp");
+
+            vault.store_wallet();
+
+            let sign_success = vault.wallet.sign(&mut recovery_cpfp_psbt, SignOptions::default())
+                .expect("sign success");
+            assert!(sign_success);
+
+            let recovery_cpfp = recovery_cpfp_psbt.extract_tx().unwrap();
+
+            let recovery_tx = recovery.into_signed_transaction().expect("valid transaction");
+
+            println!("Recovery TX: {}", serialize_hex(&recovery_tx));
+            println!("Recovery CPFP TX: {}", serialize_hex(&recovery_cpfp));
+
+            rpc_client
+                .submit_package(&[&recovery_tx, &recovery_cpfp])
+                .expect("submit transaction package");
+
+            vault.store();
+        }
         Command::Send { ref name, ref address, ref amount, ref rpc_conf, ref fee_rate, sweep } => {
             let rpc_client = rpc_conf.open();
 
