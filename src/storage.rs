@@ -19,6 +19,7 @@ pub enum Change<T> {
         height: u32,
         block_hash: BlockHash,
         parent_block_hash: BlockHash,
+        sparse_parent_block_hash: BlockHash,
     },
 }
 
@@ -42,6 +43,10 @@ impl<S: Storage> ChangeLog<S> {
     /// Must be used with discipline, creating multiple changelogs with the same
     /// id may cause unpredictable results
     pub fn new(id: S::Id) -> Self { Self { id, changes: vec![] } }
+
+    pub fn take(&mut self) -> Self {
+        std::mem::replace(self, Self::new(self.id))
+    }
 
     pub fn id(&self) -> S::Id { self.id }
 

@@ -1,3 +1,8 @@
+use bdk_core::{
+    BlockId,
+    CheckPoint,
+};
+
 use bitcoin::{
     Block,
     BlockHash,
@@ -23,9 +28,6 @@ use bitcoin::{
 
 #[cfg(test)]
 use bitcoin::hashes::Hash;
-
-#[cfg(test)]
-use bitcoin::io::Write;
 
 use bitcoin::secp256k1::{
     Secp256k1,
@@ -126,47 +128,43 @@ pub struct SeenBlock<T> {
     pub(crate) transactions: RefCell<BTreeSet<Rc<T>>>,
 }
 
-#[cfg(test)]
-fn make_test_block_hash<T>(parent: Option<&SeenBlock<T>>, seed: u64) -> BlockHash {
-    let mut engine = BlockHash::engine();
-
-    let _ = engine.write("TEST_BLOCK_TAG".as_bytes())
-        .expect("hash writes always succeed");
-
-    if let Some(parent) = parent {
-        let _ = engine.write(parent.block_hash.as_byte_array())
-            .expect("hash writes always succeed");
+impl<T> SeenBlock<T> {
+    pub fn height(&self) -> u32 { self.height }
+    pub fn important_ancestor_hash(&self) -> Option<BlockHash> {
+        self.important_ancestor.as_ref().map(|ancestor| ancestor.block_hash)
     }
-
-    let _ = engine.write(&seed.to_be_bytes())
-        .expect("hash writes always succeed");
-
-    BlockHash::from_engine(engine)
 }
 
-#[cfg(test)]
-impl<T> SeenBlock<T>
-where
-    T: Ord,
-{
-    pub fn genesis<I>(transactions: I) -> Rc<Self>
-    where
-        I: IntoIterator<Item = T>
-    {
-        let transactions: BTreeSet<_> = transactions
-                    .into_iter()
-                    .map(|transaction| Rc::new(transaction))
-                    .collect();
+impl<T> From<&SeenBlock<T>> for BlockId {
+    fn from(block: &SeenBlock<T>) -> Self {
+        Self {
+            height: block.height,
+            hash: block.block_hash,
+        }
+    }
+}
 
-        Rc::new(
-            Self {
-                height: 0,
-                block_hash: make_test_block_hash::<T>(None, transactions.len() as u64),
-                parent_hash: BlockHash::from_byte_array([0; 32]),
-                important_ancestor: None,
-                transactions: RefCell::new(transactions),
-            }
-        )
+impl<T> TryFrom<&SeenBlock<T>> for CheckPoint {
+    type Error = Option<CheckPoint>;
+
+    fn try_from(block: &SeenBlock<T>) -> Result<Self, Self::Error> {
+        // XXX: Really feeling the friction from being unable to implement traits against
+        // [`Rc<SeenBlock<T>>`] which is everywhere in this module. Probably should have made a
+        // newtype. Maybe later... Might as well rename it while I'm at it.
+        // XXX: Don't love building a vec but I'm not sure there's a better way since ChainWalker
+        // is basically traversing a (singly) linked list in the opposite direciton from what we need.
+        let mut block_ids = vec![ BlockId::from(block) ];
+
+        if let Some(ancestor) = &block.important_ancestor {
+            block_ids.extend(
+                ChainWalker::new(ancestor.clone())
+                    .map(|block| BlockId::from(block.as_ref()))
+            );
+        }
+
+        block_ids.reverse();
+
+        CheckPoint::from_block_ids(block_ids)
     }
 }
 
@@ -264,6 +262,13 @@ impl<T, O> ChainTips<T, O> {
 
     fn get_mut(&mut self, block: &Rc<SeenBlock<T>>) -> Option<&mut ChainTipState<T, O>> {
         self.0.get_mut(block)
+    }
+
+    fn genesis(&self) -> Option<Rc<SeenBlock<T>>> {
+        self.0.keys()
+            .filter(|block| block.height == 0)
+            .next()
+            .cloned()
     }
 }
 
@@ -585,6 +590,27 @@ impl<T, O> ContractState<T, O> {
     pub fn get_tip_mut(&mut self, tip: &Rc<SeenBlock<T>>) -> Option<&mut ChainTipState<T, O>> {
         self.chain_tips.get_mut(tip)
     }
+
+    /// Set this contract's birthday to a given height and block hash
+    /// All blocks prior to and including this one are assumed to be irrelevant
+    pub fn birthday(&mut self, block_hash: BlockHash, parent_hash: BlockHash, height: u32) -> Rc<SeenBlock<T>> {
+        let block = Rc::new(
+            SeenBlock {
+                height,
+                block_hash,
+                parent_hash,
+                important_ancestor: self.chain_tips.genesis(),
+                transactions: RefCell::new(BTreeSet::new()),
+            }
+        );
+
+        self.chain_tips.0.insert(
+            block.clone(),
+            ChainTipState::new(),
+        );
+
+        block
+    }
 }
 
 #[derive(Debug)]
@@ -702,7 +728,7 @@ where
         Err(AddBlockError::IrreconcilableHistory)
     }
 
-    pub fn add_block(&mut self, new_height: u32, new_chain_tip: BlockHash, parent_hash: BlockHash) -> Result<Rc<SeenBlock<T>>, AddBlockError> {
+    pub fn add_block(&mut self, new_height: u32, new_chain_tip: BlockHash, parent_hash: BlockHash, important_ancestor_override: Option<BlockHash>) -> Result<Rc<SeenBlock<T>>, AddBlockError> {
         if let Some(block) = self.blocks.get_rc(&new_chain_tip) {
             return Ok(block);
         }
@@ -711,14 +737,35 @@ where
             .get(&parent_hash)
             .and_then(|block_ref| block_ref.upgrade());
 
-        let important_ancestor = if let Some(ref parent) = parent {
+        let important_ancestor_from_parent = if let Some(ref parent) = parent {
             if !parent.transactions.borrow().is_empty() {
+                Some(parent.clone())
+            } else if parent.height == 0 {
                 Some(parent.clone())
             } else {
                 parent.important_ancestor.clone()
             }
         } else {
             None
+        };
+
+        let important_ancestor = important_ancestor_override
+            .and_then(|block_hash|
+                self.blocks
+                    .get_rc(&block_hash)
+            );
+
+        let important_ancestor = match (important_ancestor_from_parent, important_ancestor) {
+            (Some(iafp), Some(ia)) => {
+                if iafp != ia {
+                    return Err(AddBlockError::IrreconcilableHistory);
+                }
+
+                Some(ia)
+            }
+            (Some(iafp), None) => Some(iafp),
+            (None, Some(ia)) => Some(ia),
+            (None, None) => None,
         };
 
         let block = Rc::new(
@@ -748,6 +795,15 @@ where
             self.chain_tips.add_block(None, block.clone())
         } else if let Some(parent) = parent {
             self.chain_tips.add_block(Some(parent), block.clone())
+        } else if let Some(important_ancestor) = &block.important_ancestor {
+            // This path is really for loading from a persisted sparse blockchain, otherwise
+            // blocks are expected to come in in topological order without gaps.
+            // It might have some utility for electrum+esplora clients as well
+            let (parent, rewound_state) = self.rewind_to(important_ancestor.height, important_ancestor.block_hash)?;
+
+            let state = self.chain_tips.add_block(Some(parent), block.clone());
+            *state = rewound_state;
+            state
         } else {
             let parent_height = block.height.saturating_sub(1);
 
@@ -772,14 +828,14 @@ where
         Ok(block)
     }
 
-    pub fn apply_block<C: Verification, Cc, E>(&mut self, secp: &Secp256k1<C>, connector: &Cc, block: &Block, block_height: u32) -> Result<Vec<Rc<T>>, ApplyBlockError<E>>
+    pub fn apply_block<C: Verification, Cc, E>(&mut self, secp: &Secp256k1<C>, connector: &Cc, block: &Block, block_height: u32) -> Result<(Rc<SeenBlock<T>>, Vec<Rc<T>>), ApplyBlockError<E>>
     where
         Cc: ContractTransactionConnector<Transaction = T, OutputMetadata = O, Error=E>,
     {
         let block_hash = block.block_hash();
         let parent_block_hash = block.header.prev_blockhash;
 
-        let seen_block = self.add_block(block_height, block_hash, parent_block_hash)
+        let seen_block = self.add_block(block_height, block_hash, parent_block_hash, None)
             .map_err(ApplyBlockError::AddBlockError)?;
 
         let state = self.get_tip_mut(&seen_block)
@@ -814,7 +870,7 @@ where
 
         self.normalize();
 
-        Ok(added_txes)
+        Ok((seen_block, added_txes))
     }
 
     pub fn drop(&mut self, minimum_height: u32) {
@@ -1455,22 +1511,22 @@ mod test {
         let _ = contract2.state.apply_block(&secp, &contract2.context, &genesis, 0)
             .unwrap();
 
-        let txes = contract.state.apply_block(&secp, &contract.context, &block1, 1)
+        let (_, txes) = contract.state.apply_block(&secp, &contract.context, &block1, 1)
             .unwrap();
         assert_eq!(txes, vec![]);
 
-        let txes = contract2.state.apply_block(&secp, &contract2.context, &block1, 1)
+        let (_, txes) = contract2.state.apply_block(&secp, &contract2.context, &block1, 1)
             .unwrap();
         assert_eq!(txes, vec![]);
 
         let contract2_tx1 = contract2.initial(&secp, make_test_prevout(0));
         let block2 = make_test_block(&block1, 0, vec![contract2_tx1.transaction.clone()]);
 
-        let txes = contract.state.apply_block(&secp, &contract.context, &block2, 2)
+        let (_, txes) = contract.state.apply_block(&secp, &contract.context, &block2, 2)
             .unwrap();
         assert_eq!(txes, vec![]);
 
-        let txes = contract2.state.apply_block(&secp, &contract2.context, &block2, 2)
+        let (_, txes) = contract2.state.apply_block(&secp, &contract2.context, &block2, 2)
             .unwrap();
         assert_eq!(as_refs(&txes), vec![&contract2_tx1]);
     }

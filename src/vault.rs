@@ -1,6 +1,8 @@
 #[cfg(feature = "bitcoind")]
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi, self};
 
+use bdk_core::CheckPoint;
+
 use bitcoin::bip32::{
     Xpub,
     ChildNumber,
@@ -13,6 +15,7 @@ use bitcoin::Block;
 #[cfg(feature = "bitcoind")]
 use bitcoin::consensus::encode::serialize_hex;
 
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{
     PublicKey,
     Secp256k1,
@@ -32,6 +35,7 @@ use bitcoin::{
     Amount,
     blockdata::locktime::relative,
     blockdata::transaction::Version,
+    BlockHash,
     OutPoint,
     ScriptBuf,
     Script,
@@ -71,18 +75,30 @@ use std::rc::Rc;
 
 use crate::bip119::get_default_template;
 
-use crate::storage::{
-    Change,
-    ChangeLog,
-};
-
-use crate::vault_storage::{
-    SqliteStorage,
-};
-
 use crate::cache::{
     AddTransactionStateCache,
     VaultTemplateCache,
+};
+
+use crate::chain;
+use crate::chain::{
+    ChainTipState,
+    ConnectTransactionSuccess,
+    ContractInputs,
+    ContractOutputs,
+    ContractTransaction,
+    ContractTransactionConnector,
+    Either,
+    UtxoSelector,
+};
+
+pub use crate::chain::{
+    ContractState,
+};
+
+use crate::storage::{
+    Change,
+    ChangeLog,
 };
 
 use crate::transaction::{
@@ -100,25 +116,12 @@ use crate::transaction::{
     VaultTransactionTemplate,
     WithdrawalOutputSpendInfo,
     WithdrawalSpendingCondition,
+    WithdrawalSpendTransaction,
     WithdrawalTransaction,
 };
 
-use crate::chain::{
-    AddBlockError,
-    AddTransactionError,
-    AddTransactionSuccess,
-    ChainTipState,
-    ConnectTransactionSuccess,
-    ContractInputs,
-    ContractOutputs,
-    ContractTransaction,
-    ContractTransactionConnector,
-    Either,
-    UtxoSelector,
-};
-
-pub use crate::chain::{
-    ContractState,
+use crate::vault_storage::{
+    SqliteStorage,
 };
 
 // struct.unpack(">I", hashlib.sha256(b'mccv').digest()[:4])[0] & 0x7FFFFFFF
@@ -1467,13 +1470,8 @@ impl VaultStateTransaction {
     }
 }
 
-#[derive(Debug)]
 #[cfg(feature = "bitcoind")]
-pub enum ApplyBlockError {
-    AddBlockError(AddBlockError),
-    AddTransactionError(AddTransactionError<ConnectVaultTransactionError>),
-    InternalError,
-}
+pub type ApplyBlockError = chain::ApplyBlockError<ConnectVaultTransactionError>;
 
 // Kind of annoying how much must be copied. the Control block can be up to 4KiB + 33B
 #[allow(dead_code)]
@@ -2009,6 +2007,12 @@ impl ContractTransactionConnector for Context {
     }
 }
 
+#[derive(Debug)]
+pub enum BirthdayError {
+    MissingGenesisBlock,
+    MatureVault,
+}
+
 pub struct VaultState(ContractState<VaultStateTransaction, VaultStateOutput>);
 
 impl VaultState {
@@ -2039,6 +2043,11 @@ impl Vault {
         )
     }
 
+    pub fn height(&self) -> Option<u32> {
+        self.state.0.longest_chain_tip()
+            .map(|(block, _)| block.height())
+    }
+
     pub fn parameters(&self) -> &VaultParameters { &self.parameters }
 
     /// Return the confirmed balance of the vault by a given height, or any height
@@ -2065,35 +2074,51 @@ impl Vault {
     }
 
     #[cfg(feature = "bitcoind")]
+    pub fn checkpoint(&self) -> Option<CheckPoint> {
+        self.state.0.longest_chain_tip()
+            .map(|(seen_block, _)| {
+                    CheckPoint::try_from(seen_block.as_ref())
+                        .expect("valid block history")
+                }
+            )
+    }
+
+    /// Set this vault's birthday to a given height and block hash
+    /// Blocks before and including this one are assumed not to contain vault
+    /// transactions.
+    pub fn birthday(&mut self, block_hash: BlockHash, parent_block_hash: BlockHash, height: u32, changelog: &mut ChangeLog<SqliteStorage>) {
+        let birthday = self.state.0.birthday(block_hash, parent_block_hash, height);
+
+        changelog.add(
+            Change::AddBlock {
+                height,
+                block_hash,
+                parent_block_hash,
+                sparse_parent_block_hash: birthday
+                    .important_ancestor_hash()
+                    .unwrap_or(BlockHash::from_byte_array([0; 32])),
+            }
+        );
+    }
+
+    #[cfg(feature = "bitcoind")]
     pub fn apply_block<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, block: &Block, block_height: u32, changelog: &mut ChangeLog<SqliteStorage>) -> Result<(), ApplyBlockError> {
         let block_hash = block.block_hash();
         let parent_block_hash = block.header.prev_blockhash;
 
-        let seen_block = self.state.0.add_block(block_height, block_hash, parent_block_hash)
-            .map_err(ApplyBlockError::AddBlockError)?;
+        let (seen_block, added_transactions) = self.state.0.apply_block(secp, context, block, block_height)?;
 
-        changelog.add(Change::AddBlock { height: block_height, block_hash, parent_block_hash });
+        changelog.add(Change::AddBlock {
+            height: block_height,
+            block_hash,
+            parent_block_hash,
+            sparse_parent_block_hash: seen_block
+                .important_ancestor_hash()
+                .unwrap_or(BlockHash::from_byte_array([0; 32]))
+        });
 
-        self.state.0.normalize();
-
-        let state = self.state.0.get_tip_mut(&seen_block)
-            .expect("block was just added");
-
-        for transaction in &block.txdata {
-            let txid = transaction.compute_txid();
-            let add_result = state.add(secp, context, txid, transaction, block_height);
-
-            // TODO: Re-evaluate error variants
-            match add_result {
-                Ok(AddTransactionSuccess::TransactionAdded(tx)) => {
-                    changelog.add(Change::AddTransaction(block_hash, tx.clone()));
-                },
-                Ok(AddTransactionSuccess::TransactionIgnored) => { }
-                Err(AddTransactionError::InternalError) => { return Err(ApplyBlockError::InternalError); },
-                // TODO: Could pass through the connect error, in a new variant, why not?
-                Err(AddTransactionError::ConnectError(_e)) => { return Err(ApplyBlockError::InternalError); }
-                Err(AddTransactionError::MissingInputs) => { return Err(ApplyBlockError::InternalError); }
-            }
+        for added_transaction in added_transactions {
+            changelog.add(Change::AddTransaction(block_hash, added_transaction.clone()));
         }
 
         Ok(())
@@ -2110,11 +2135,51 @@ impl Vault {
             .unwrap_or_else(|| BTreeSet::new())
     }
 
-    pub fn create_recovery<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<RecoveryTransaction, RecoveryCreationError> {
-        // TODO: We need to detect and track which outputs on the last transaction are still unspent
-        // For now, just assume the vault has the correct state info (as long as it's been fed recent
-        // blocks)
+    /// Returns a list of transactions spending withdrawal utxos together with the minimum block
+    /// height they can be spent
+    pub fn spend_withdrawal_transactions<C: Verification>(&self, secp: &Secp256k1<C>, selector: UtxoSelector) -> Vec<(Option<u32>, WithdrawalSpendTransaction)> {
+        let tip_state = self.state.0.longest_chain_tip()
+            .map(|(_, tip_state)| tip_state);
 
+        self.utxos(selector)
+            .into_iter()
+            .filter(|VaultStateUtxo(_, output)| *output == VaultStateOutput::Withdrawal)
+            .map(|VaultStateUtxo(tx, _output)| {
+                    match tx.metadata {
+                        VaultTransactionMetadata::Withdrawal { withdrawal, .. } => {
+                            let (_, vault_parent_utxo) = tx.input_utxos().next()
+                                .expect("Withdrawal transaction has a single parent");
+
+                            let withdrawal = self.build_withdrawal(secp, vault_parent_utxo, withdrawal)
+                                .expect("Withdrawal has already been created once");
+
+                            let spend = withdrawal.spend_withdrawal();
+
+                            let maturity = match spend.timelock() {
+                                relative::LockTime::Blocks(blocks) => {
+                                    tip_state
+                                        .and_then(|tip_state| {
+                                            tip_state
+                                                .utxo(
+                                                    spend.prevout()
+                                                )
+                                                .map(|(_, _, height)| height + blocks.value() as u32)
+                                        })
+                                }
+                                relative::LockTime::Time(_) =>
+                                    unreachable!("Vault always uses block timelocks"),
+                            };
+
+                            (maturity, spend)
+                        }
+                        _ => unreachable!("Withdrawal output must be on a withdrawal tx"),
+                    }
+                }
+            )
+            .collect()
+    }
+
+    pub fn create_recovery<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<RecoveryTransaction, RecoveryCreationError> {
         let utxos = self.utxos(
             UtxoSelector::any_confirmed(),
         );
@@ -2152,7 +2217,7 @@ impl Vault {
             })
             .max_by(|a, b| a.2.cmp(&b.2));
 
-        let (tx, _outputs, _value) = utxos.ok_or(RecoveryCreationError::NoOutputs)?;
+        let (tx, outputs, _value) = utxos.ok_or(RecoveryCreationError::NoOutputs)?;
 
         let depth = tx.depth + 1;
         let parent_depth = tx.depth;
@@ -2178,25 +2243,33 @@ impl Vault {
 
         let templates = self.parameters.templates_at_depth(secp, depth);
 
-        // FIXME: This shouldn't be run unconditionally. It will panic for vault states that have
-        // no vault output (complete withdrawals)
-        let parent_output_info = self.parameters.vault_output(
-            secp,
-            parent_depth,
-            &parent_parameters,
-            Some(&templates),
-        );
+        let has_vault_output = outputs.contains(&VaultStateOutput::Vault);
+
+        let parent_output_info = if has_vault_output {
+            Some(
+                self.parameters.vault_output(
+                        secp,
+                        parent_depth,
+                        &parent_parameters,
+                        Some(&templates),
+                    )
+            )
+        } else {
+            None
+        };
 
         match tx.metadata {
             VaultTransactionMetadata::InitialDeposit(_deposit) => {
-                let vault_signing_info = parent_output_info.get_spending_condition(
-                    VaultOutputSpendCondition::Recovery {
-                        recovery_type: RecoveryType::VaultOnly,
-                        vault_balance: parent_result,
-                        withdrawal_amount: VaultAmount::ZERO,
-                    }
-                )
-                .expect("spend condition should exist");
+                let vault_signing_info = parent_output_info
+                    .expect("deposit has vault output")
+                    .get_spending_condition(
+                        VaultOutputSpendCondition::Recovery {
+                            recovery_type: RecoveryType::VaultOnly,
+                            vault_balance: parent_result,
+                            withdrawal_amount: VaultAmount::ZERO,
+                        }
+                    )
+                    .expect("spend condition should exist");
 
                 Ok(
                     RecoveryTransaction::new(
@@ -2215,14 +2288,16 @@ impl Vault {
                 )
             }
             VaultTransactionMetadata::Deposit { .. } => {
-                let vault_signing_info = parent_output_info.get_spending_condition(
-                    VaultOutputSpendCondition::Recovery {
-                        recovery_type: RecoveryType::VaultOnly,
-                        vault_balance: parent_result,
-                        withdrawal_amount: VaultAmount::ZERO,
-                    }
-                )
-                .expect("spend condition should exist");
+                let vault_signing_info = parent_output_info
+                    .expect("deposit has vault output")
+                    .get_spending_condition(
+                        VaultOutputSpendCondition::Recovery {
+                            recovery_type: RecoveryType::VaultOnly,
+                            vault_balance: parent_result,
+                            withdrawal_amount: VaultAmount::ZERO,
+                        }
+                    )
+                    .expect("spend condition should exist");
 
                 Ok(
                     RecoveryTransaction::new(
@@ -2254,13 +2329,16 @@ impl Vault {
                 };
 
                 let vault_signing_info = if let Some(vault_recovery_type) = vault_recovery_type {
-                    parent_output_info.get_spending_condition(
-                        VaultOutputSpendCondition::Recovery {
-                            recovery_type: vault_recovery_type,
-                            vault_balance: parent_result,
-                            withdrawal_amount: withdrawal,
-                        }
-                    )
+                    parent_output_info
+                        .and_then(|output_info| output_info
+                            .get_spending_condition(
+                                VaultOutputSpendCondition::Recovery {
+                                    recovery_type: vault_recovery_type,
+                                    vault_balance: parent_result,
+                                    withdrawal_amount: withdrawal,
+                                }
+                            )
+                        )
                 } else {
                     None
                 };
@@ -2449,7 +2527,7 @@ impl Vault {
                             Some(&parent_templates),
                         )
                     })
-                    // FIXME: consider making an error variant
+                    // TODO: consider making an error variant
                     .expect("tail deposits have transaction history");
 
                 let vault_outpoint = outpoint.expect("non-initial deposit must have outpoint of previous vault");
@@ -2475,31 +2553,28 @@ impl Vault {
         );
 
         // TODO: Find smallest UTXO larger than or equal to requested withdrawal
-        let vault_utxo = utxos.best_vault_utxo();
-
-        let current_vault_value = vault_utxo
-            .as_ref()
-            .and_then(|VaultStateUtxo(tx, _)| tx.result_value())
-            .unwrap_or(VaultAmount::ZERO);
-
-        let depth = vault_utxo
-            .as_ref()
-            .map(|VaultStateUtxo(tx, _)| tx.depth + 1)
+        let vault_utxo = utxos.best_vault_utxo()
             .ok_or(WithdrawalCreationError::InsufficientFunds)?;
+
+        self.build_withdrawal(secp, vault_utxo, withdrawal_amount)
+    }
+
+    pub fn build_withdrawal<C: Verification>(&self, secp: &Secp256k1<C>, vault_utxo: VaultStateUtxo, withdrawal_amount: VaultAmount) -> Result<WithdrawalTransaction, WithdrawalCreationError> {
+        let depth = vault_utxo.0.depth + 1;
 
         let transition = VaultTransition::Withdrawal(withdrawal_amount);
 
-        let previous_output = vault_utxo
-            .as_ref()
-            .and_then(|VaultStateUtxo(tx, _)| tx.outpoint(VaultStateOutput::Vault))
+        let previous_output = vault_utxo.0.outpoint(VaultStateOutput::Vault)
             .ok_or(WithdrawalCreationError::VaultClosed)?;
+
+        let current_vault_value = vault_utxo.0.result_value()
+            .ok_or(WithdrawalCreationError::InsufficientFunds)?;
 
         let vault_total = current_vault_value.apply_transition(transition, None)
             .ok_or(WithdrawalCreationError::InsufficientFunds)?;
 
-        let parameters = vault_utxo
-            .as_ref()
-            .and_then(|VaultStateUtxo(tx, _)| tx.vault_state_parameters())
+        let parameters = vault_utxo.0
+            .vault_state_parameters()
             .and_then(|parameters| parameters
                 .next(VaultTransition::Withdrawal(withdrawal_amount), &self.parameters, depth)
             )
@@ -2519,8 +2594,8 @@ impl Vault {
             VaultTransactionTemplate::Withdrawal(withdrawal) => withdrawal,
         };
 
-        let spend_info = vault_utxo
-            .and_then(|VaultStateUtxo(tx, _)| tx.vault_state_parameters())
+        let spend_info = vault_utxo.0
+            .vault_state_parameters()
             .map(|parent_parameters| {
                 debug_assert!(depth > 0, "Depth 0 has no ancestors");
 

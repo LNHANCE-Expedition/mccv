@@ -1,10 +1,10 @@
 use bitcoin::{BlockHash, Transaction, Txid};
-use bitcoin::bip32::Xpub;
+use bitcoin::bip32::{Xpub, Fingerprint, Xpriv, DerivationPath};
 use bitcoin::consensus::{Encodable, Decodable};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, Verification};
 
-use rusqlite;
+use rusqlite::{self, OptionalExtension};
 use rusqlite::{
     params,
     types::FromSql,
@@ -63,6 +63,15 @@ pub enum SqliteInitializationError {
     CommitError(rusqlite::Error),
 }
 
+pub struct StoredSecrets {
+    pub master_fingerprint: Fingerprint,
+    pub master_xpriv: Option<Xpriv>,
+    pub hot_path: DerivationPath,
+    pub hot_xpriv: Xpriv,
+    pub descriptor: String,
+    pub change_descriptor: String,
+}
+
 #[allow(dead_code)]
 impl SqliteStorage {
     pub fn from_connection(mut sqlite: rusqlite::Connection) -> Result<Self, SqliteInitializationError> {
@@ -77,6 +86,116 @@ impl SqliteStorage {
         }
 
         Ok(SqliteStorage { sqlite })
+    }
+
+    pub fn store_secrets(&mut self, id: VaultId, secrets: &StoredSecrets) -> Result<(), StoreError> {
+        let transaction = self.sqlite.transaction()?;
+
+        transaction.execute(r#"
+            insert
+            into mccv_secret (
+                id,
+                master_fingerprint,
+                master_xpriv,
+                hot_path,
+                hot_xpriv,
+                descriptor,
+                change_descriptor
+            )
+            values ( ?, ?, ?, ?, ?, ?, ? )
+            "#,
+            params![
+                id,
+                secrets.master_fingerprint.to_bytes(),
+                secrets.master_xpriv
+                    .map(|xpriv| xpriv.to_string()),
+                secrets.hot_path.to_string(),
+                secrets.hot_xpriv.to_string(),
+                secrets.descriptor,
+                secrets.change_descriptor,
+            ],
+        )?;
+
+        transaction.commit()?;
+
+        Ok(())
+    }
+
+    pub fn load_secrets(&mut self, id: VaultId) -> Result<Option<StoredSecrets>, StoreError> {
+        let transaction = self.sqlite.transaction()?;
+
+        let secrets = transaction.query_row(r#"
+            select
+                master_fingerprint,
+                master_xpriv,
+                hot_path,
+                hot_xpriv,
+                descriptor,
+                change_descriptor
+            from
+                mccv_secret
+            where
+                id = ?
+            "#,
+            params![ id ],
+            |row| {
+                let master_fingerprint: [u8; 4] = row.get(0)?;
+                let master_xpriv: Option<Xpriv> = row.get_ref(1)?
+                        .as_str_or_null()?
+                        .map(|s| s
+                            .parse()
+                            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                                    1,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            )
+                        )
+                        .transpose()?;
+
+                let hot_path: DerivationPath = row.get_ref(2)?
+                    .as_str()?
+                    .parse()
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    )?;
+
+                let hot_xpriv: Xpriv = row.get_ref(3)?
+                    .as_str()?
+                    .parse()
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    )?;
+
+
+
+                Ok(
+                    StoredSecrets {
+                        master_fingerprint: master_fingerprint.into(),
+                        master_xpriv,
+                        hot_path,
+                        hot_xpriv,
+                        descriptor: row
+                            .get_ref(4)?
+                            .as_str()?
+                            .to_owned(),
+                        change_descriptor: row
+                            .get_ref(5)?
+                            .as_str()?
+                            .to_owned(),
+                    }
+                )
+            }
+        )
+        .optional()?;
+
+        Ok(secrets)
     }
 }
 
@@ -113,6 +232,7 @@ pub enum LoadError {
     ConnectError(ConnectVaultTransactionError),
     AddBlockError(AddBlockError),
     AddTransactionError(AddTransactionError<ConnectVaultTransactionError>),
+    IgnoredContractTransaction(Txid),
 }
 
 impl From<rusqlite::Error> for LoadError {
@@ -140,6 +260,7 @@ impl std::fmt::Display for LoadError {
             LoadError::ConnectError(e) => write!(f, "Error connecting transaction: {e}"),
             LoadError::AddBlockError(e) => write!(f, "Error adding block: {e}"),
             LoadError::AddTransactionError(e) => write!(f, "Error adding transaction {e}"),
+            LoadError::IgnoredContractTransaction(txid) => write!(f, "Transaction {txid} was erroneously ignored"),
         }
     }
 }
@@ -391,7 +512,7 @@ impl Storage for SqliteStorage {
         let transaction = self.sqlite.transaction()?;
 
         let mut parameters = transaction.prepare(r#"
-            select 
+            select
                 scale,
                 "max",
                 cold_xpub,
@@ -448,10 +569,11 @@ impl Storage for SqliteStorage {
             select
                 block.block_hash,
                 block.parent_block_hash,
+                chain.sparse_parent_block_hash,
                 block.height,
                 conf.txid as txid,
                 tx."transaction"
-            from chain
+            from contract_chain chain
             join block
                 on block.block_hash = chain.block_hash
             left join transaction_confirmation as conf
@@ -463,10 +585,11 @@ impl Storage for SqliteStorage {
             where
                 chain.chain_tip_hash in longest_chain and
                 case
-                    when vtx.vault = ? then 1 
-                    when vtx.vault is null then 1 
+                    when vtx.vault = :0 then 1
+                    when vtx.vault is null then 1
                     else 0
-                end
+                end and
+                chain.vault = :0
             order by block.height asc
         "#)?;
 
@@ -474,7 +597,7 @@ impl Storage for SqliteStorage {
         let mut state = VaultState::new();
 
         // (height, parent_block_hash, block_hash)
-        let mut previous_block: Option<(u32, BlockHash, BlockHash)> = None;
+        let mut previous_block: Option<(u32, BlockHash, BlockHash, Option<BlockHash>)> = None;
         let mut block_transactions: HashMap<Txid, Transaction> = HashMap::new();
 
         let mut rows = query_blocks.query(params![ id ])?;
@@ -483,25 +606,29 @@ impl Storage for SqliteStorage {
             let block_hash: BlockHash = hash_column(&row, 0)?;
             let parent_block_hash: BlockHash = optional_hash_column(&row, 1)?
                 .unwrap_or(BlockHash::from_byte_array([0; 32]));
-            let height: u32 = row.get(2)?;
-            let txid: Option<Txid> = optional_hash_column(&row, 3)?;
+            let sparse_parent_block_hash: Option<BlockHash> = optional_hash_column(&row, 2)?;
+            let height: u32 = row.get(3)?;
+            let txid: Option<Txid> = optional_hash_column(&row, 4)?;
             let transaction = {
                 let blob = row
-                    .get_ref(4)?
+                    .get_ref(5)?
                     .as_bytes_or_null()?;
                 blob.map(|mut blob| Transaction::consensus_decode(&mut blob))
                     .transpose()
                     .map_err(|_| LoadError::InvalidState)?
             };
 
-            if Some((height, parent_block_hash, block_hash)) != previous_block {
-                if let Some((previous_height, previous_parent_block_hash, previous_block_hash)) = previous_block {
+            let this_block = (height, block_hash, parent_block_hash, sparse_parent_block_hash);
+
+            if Some(this_block) != previous_block {
+                if let Some((previous_height, previous_block_hash, previous_parent_block_hash, sparse_parent_block_hash)) = previous_block {
                     let seen_block = state
                         .state_mut()
                         .add_block(
                             previous_height,
                             previous_block_hash,
                             previous_parent_block_hash,
+                            sparse_parent_block_hash,
                         )
                         .map_err(|e| LoadError::AddBlockError(e))?;
 
@@ -519,7 +646,11 @@ impl Storage for SqliteStorage {
                                 seen_block.transactions.borrow_mut()
                                     .insert(tx.clone());
                             },
-                            Ok(AddTransactionSuccess::TransactionIgnored) => { }
+                            Ok(AddTransactionSuccess::TransactionIgnored) => {
+                                return Err(
+                                    LoadError::IgnoredContractTransaction(txid)
+                                );
+                            }
 
                             // TODO: We should revert changes in case of error
                             Err(AddTransactionError::InternalError) => { return Err(LoadError::InternalError); },
@@ -536,7 +667,7 @@ impl Storage for SqliteStorage {
                 }
 
                 block_transactions = HashMap::new();
-                previous_block = Some((height, parent_block_hash, block_hash));
+                previous_block = Some(this_block);
             }
 
             match (txid, transaction) {
@@ -548,13 +679,14 @@ impl Storage for SqliteStorage {
             }
         }
 
-        if let Some((previous_height, previous_parent_block_hash, previous_block_hash)) = previous_block {
+        if let Some((previous_height, previous_block_hash, previous_parent_block_hash, sparse_parent_block_hash)) = previous_block {
             let seen_block = state
                 .state_mut()
                 .add_block(
                     previous_height,
                     previous_block_hash,
                     previous_parent_block_hash,
+                    sparse_parent_block_hash,
                 )
                 .map_err(|e| LoadError::AddBlockError(e))?;
 
@@ -572,7 +704,11 @@ impl Storage for SqliteStorage {
                         seen_block.transactions.borrow_mut()
                             .insert(tx.clone());
                     },
-                    Ok(AddTransactionSuccess::TransactionIgnored) => { }
+                    Ok(AddTransactionSuccess::TransactionIgnored) => {
+                        return Err(
+                            LoadError::IgnoredContractTransaction(txid)
+                        );
+                    }
 
                     // TODO: We should revert changes in case of error
                     Err(AddTransactionError::InternalError) => { return Err(LoadError::InternalError); },
@@ -681,25 +817,44 @@ impl Storage for SqliteStorage {
                             ]
                         )?;
                     }
-                    Change::AddBlock { height, block_hash, parent_block_hash } => {
-                        let mut insert_block = transaction.prepare(r#"
-                            insert or ignore
-                            into block (
-                                block_hash, parent_block_hash, height
-                            ) values ( ?, ?, ? )
-                        "#)?;
-
+                    Change::AddBlock { height, block_hash, parent_block_hash, sparse_parent_block_hash } => {
                         let parent_block_hash = if height > 0 {
                             Some(parent_block_hash.as_byte_array())
                         } else {
                             None
                         };
 
-                        insert_block.execute(params![
-                            block_hash.as_byte_array(),
-                            parent_block_hash,
-                            height
-                        ])?;
+                        transaction.execute(r#"
+                                    insert or ignore
+                                    into block (
+                                        block_hash, parent_block_hash, height
+                                    ) values ( ?, ?, ? )
+                                "#,
+                                params![
+                                    block_hash.as_byte_array(),
+                                    parent_block_hash,
+                                    height
+                                ],
+                            )?;
+
+                        let sparse_parent_block_hash = if sparse_parent_block_hash != BlockHash::from_byte_array([0; 32]) {
+                            Some(sparse_parent_block_hash.to_byte_array())
+                        } else {
+                            None
+                        };
+
+                        transaction.execute(r#"
+                                    insert or ignore
+                                    into sparse_chain (
+                                        block_hash, sparse_parent_block_hash, vault
+                                    ) values ( ?, ?, ? )
+                                "#,
+                                params![
+                                    block_hash.as_byte_array(),
+                                    sparse_parent_block_hash,
+                                    vault_id,
+                                ],
+                            )?;
                     }
                 }
             }
@@ -713,6 +868,7 @@ impl Storage for SqliteStorage {
     }
 
     fn prune(&mut self, height: u32) -> Result<(), Self::PruneError> {
+        // FIXME: This is unaaware of multi-contract setups and is dangerous
         let transaction = self.sqlite.transaction()?;
 
         transaction.execute(
@@ -759,7 +915,7 @@ impl Storage for SqliteStorage {
                     select
                         chain.block_hash
                     from
-                        chain
+                        sparse_chain chain
                     where
                         chain.chain_tip_hash in retained_chain_tip
                 )
