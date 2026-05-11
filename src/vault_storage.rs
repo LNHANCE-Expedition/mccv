@@ -271,6 +271,57 @@ fn sorted_transactions(block_transactions: &HashMap<Txid, Transaction>) -> Vec<T
     ordered_txids
 }
 
+fn hash_column<H: bitcoin::hashes::Hash>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<H>
+{
+    let bytes = row
+        .get_ref(index)?
+        .as_bytes()?;
+
+    H::from_slice(bytes)
+        .map_err(|e|
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(e)
+            )
+        )
+}
+
+fn optional_hash_column<H: bitcoin::hashes::Hash>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<H>> {
+    let bytes = row
+        .get_ref(index)?
+        .as_bytes_or_null()?;
+
+    bytes
+        .map(|bytes| H::from_slice(bytes))
+        .transpose()
+        .map_err(|e|
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(e)
+            )
+        )
+}
+
+fn parse_column<T, E>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T>
+where
+    T: FromStr<Err = E>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    row
+        .get_ref(index)?
+        .as_str()?
+        .parse()
+        .map_err(|e|
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(e)
+            )
+        )
+}
+
 impl Storage for SqliteStorage {
     type StoreError = StoreError;
     type LoadError = LoadError;
@@ -418,57 +469,6 @@ impl Storage for SqliteStorage {
                 end
             order by block.height asc
         "#)?;
-
-        fn hash_column<H: bitcoin::hashes::Hash>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<H>
-        {
-            let bytes = row
-                .get_ref(index)?
-                .as_bytes()?;
-
-            H::from_slice(bytes)
-                .map_err(|e|
-                    rusqlite::Error::FromSqlConversionFailure(
-                        index,
-                        rusqlite::types::Type::Text,
-                        Box::new(e)
-                    )
-                )
-        }
-
-        fn optional_hash_column<H: bitcoin::hashes::Hash>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<H>> {
-            let bytes = row
-                .get_ref(index)?
-                .as_bytes_or_null()?;
-
-            bytes
-                .map(|bytes| H::from_slice(bytes))
-                .transpose()
-                .map_err(|e|
-                    rusqlite::Error::FromSqlConversionFailure(
-                        index,
-                        rusqlite::types::Type::Text,
-                        Box::new(e)
-                    )
-                )
-        }
-
-        fn parse_column<T, E>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T>
-        where
-            T: FromStr<Err = E>,
-            E: std::error::Error + Send + Sync + 'static,
-        {
-            row
-                .get_ref(index)?
-                .as_str()?
-                .parse()
-                .map_err(|e|
-                    rusqlite::Error::FromSqlConversionFailure(
-                        index,
-                        rusqlite::types::Type::Text,
-                        Box::new(e)
-                    )
-                )
-        }
 
         let context = Context::from_parameters(secp, parameters);
         let mut state = VaultState::new();
