@@ -1176,6 +1176,8 @@ pub struct WithdrawalSpendTransaction {
 }
 
 impl WithdrawalSpendTransaction {
+    pub fn value(&self) -> Amount { self.withdrawal_output.value }
+
     pub fn timelock(&self) -> relative::LockTime {
         self.withdrawal_output_info.timelock
     }

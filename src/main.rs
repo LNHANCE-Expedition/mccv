@@ -22,8 +22,9 @@ use bdk_wallet::{
     Wallet,
 };
 
+use bitcoin::amount::Display;
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{Amount, FeeRate};
+use bitcoin::{Amount, FeeRate, Denomination};
 
 use bitcoin::bip32::{
     Xpriv,
@@ -717,12 +718,45 @@ fn main() {
             let vault = VaultSystem::load(&secp, storage, name.as_deref());
             let balance = vault.wallet.balance();
 
-            let vault_amount = vault.vault.confirmed_balance(None);
+            let current_height = vault.vault.height()
+                .expect("must have synced at least one block");
 
-            println!("                vaulted: {}", vault_amount);
-            println!("+ available immediately: {}", balance.confirmed);
-            println!("----------------------------------");
-            println!("total: {}", balance.confirmed + vault_amount);
+            let mut withdrawal_utxos =
+                vault
+                    .vault
+                    .spend_withdrawal_transactions(&secp, UtxoSelector::any_confirmed());
+
+            withdrawal_utxos.sort_by_key(|(height, _)| *height);
+
+            let vault_amount = vault.vault.confirmed_balance(None);
+            let mut immature_withdrawal_amount = Amount::ZERO;
+            fn format_amount(amount: Amount) -> Display {
+                amount
+                    .display_in(Denomination::Bitcoin)
+            }
+            immature_withdrawal_amount.display_in(Denomination::Bitcoin);
+
+            println!("                vaulted: {:<14} BTC", format_amount(vault_amount));
+            for (height, utxo) in withdrawal_utxos {
+                immature_withdrawal_amount += utxo.value();
+
+                let height = height.expect("valid withrawal maturity height");
+                let delta = (height as i64) - (current_height as i64);
+                let height_str = format!("@{height}");
+                println!("+ {height_str:>21}: {:<14} BTC ( in {delta} blocks )",
+                    format_amount(utxo.value())
+                );
+                if delta < 0 {
+                    println!("(This withdrawal is mature but has not been swept yet)");
+                }
+            }
+            println!("+ available immediately: {:<14} BTC", format_amount(balance.confirmed));
+            println!("-------------------------------------------");
+            println!("                  total: {:<14} BTC",
+                format_amount(
+                    balance.confirmed + vault_amount + immature_withdrawal_amount
+                )
+            );
         }
 
         Command::Sync { ref name, ref rpc_conf } => {
