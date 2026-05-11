@@ -2180,10 +2180,6 @@ impl Vault {
     }
 
     pub fn create_recovery<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<RecoveryTransaction, RecoveryCreationError> {
-        // TODO: We need to detect and track which outputs on the last transaction are still unspent
-        // For now, just assume the vault has the correct state info (as long as it's been fed recent
-        // blocks)
-
         let utxos = self.utxos(
             UtxoSelector::any_confirmed(),
         );
@@ -2221,7 +2217,7 @@ impl Vault {
             })
             .max_by(|a, b| a.2.cmp(&b.2));
 
-        let (tx, _outputs, _value) = utxos.ok_or(RecoveryCreationError::NoOutputs)?;
+        let (tx, outputs, _value) = utxos.ok_or(RecoveryCreationError::NoOutputs)?;
 
         let depth = tx.depth + 1;
         let parent_depth = tx.depth;
@@ -2247,25 +2243,33 @@ impl Vault {
 
         let templates = self.parameters.templates_at_depth(secp, depth);
 
-        // FIXME: This shouldn't be run unconditionally. It will panic for vault states that have
-        // no vault output (complete withdrawals)
-        let parent_output_info = self.parameters.vault_output(
-            secp,
-            parent_depth,
-            &parent_parameters,
-            Some(&templates),
-        );
+        let has_vault_output = outputs.contains(&VaultStateOutput::Vault);
+
+        let parent_output_info = if has_vault_output {
+            Some(
+                self.parameters.vault_output(
+                        secp,
+                        parent_depth,
+                        &parent_parameters,
+                        Some(&templates),
+                    )
+            )
+        } else {
+            None
+        };
 
         match tx.metadata {
             VaultTransactionMetadata::InitialDeposit(_deposit) => {
-                let vault_signing_info = parent_output_info.get_spending_condition(
-                    VaultOutputSpendCondition::Recovery {
-                        recovery_type: RecoveryType::VaultOnly,
-                        vault_balance: parent_result,
-                        withdrawal_amount: VaultAmount::ZERO,
-                    }
-                )
-                .expect("spend condition should exist");
+                let vault_signing_info = parent_output_info
+                    .expect("deposit has vault output")
+                    .get_spending_condition(
+                        VaultOutputSpendCondition::Recovery {
+                            recovery_type: RecoveryType::VaultOnly,
+                            vault_balance: parent_result,
+                            withdrawal_amount: VaultAmount::ZERO,
+                        }
+                    )
+                    .expect("spend condition should exist");
 
                 Ok(
                     RecoveryTransaction::new(
@@ -2284,14 +2288,16 @@ impl Vault {
                 )
             }
             VaultTransactionMetadata::Deposit { .. } => {
-                let vault_signing_info = parent_output_info.get_spending_condition(
-                    VaultOutputSpendCondition::Recovery {
-                        recovery_type: RecoveryType::VaultOnly,
-                        vault_balance: parent_result,
-                        withdrawal_amount: VaultAmount::ZERO,
-                    }
-                )
-                .expect("spend condition should exist");
+                let vault_signing_info = parent_output_info
+                    .expect("deposit has vault output")
+                    .get_spending_condition(
+                        VaultOutputSpendCondition::Recovery {
+                            recovery_type: RecoveryType::VaultOnly,
+                            vault_balance: parent_result,
+                            withdrawal_amount: VaultAmount::ZERO,
+                        }
+                    )
+                    .expect("spend condition should exist");
 
                 Ok(
                     RecoveryTransaction::new(
@@ -2323,13 +2329,16 @@ impl Vault {
                 };
 
                 let vault_signing_info = if let Some(vault_recovery_type) = vault_recovery_type {
-                    parent_output_info.get_spending_condition(
-                        VaultOutputSpendCondition::Recovery {
-                            recovery_type: vault_recovery_type,
-                            vault_balance: parent_result,
-                            withdrawal_amount: withdrawal,
-                        }
-                    )
+                    parent_output_info
+                        .and_then(|output_info| output_info
+                            .get_spending_condition(
+                                VaultOutputSpendCondition::Recovery {
+                                    recovery_type: vault_recovery_type,
+                                    vault_balance: parent_result,
+                                    withdrawal_amount: withdrawal,
+                                }
+                            )
+                        )
                 } else {
                     None
                 };

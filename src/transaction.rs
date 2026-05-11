@@ -1437,7 +1437,7 @@ impl RecoveryTransaction {
             RecoveryTransactionInput::WithdrawalOnly(withdrawal, _vout) => {
                 (
                     None,
-                    Some(withdrawal.sign(secp, keypair, &transaction, 1, &prevouts).map_err(SignRecoveryError::SignError)?),
+                    Some(withdrawal.sign(secp, keypair, &transaction, 0, &prevouts).map_err(SignRecoveryError::SignError)?),
                 )
             }
             RecoveryTransactionInput::Withdrawal { vault, withdrawal, .. } => {
