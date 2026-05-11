@@ -105,5 +105,3 @@ create table transaction_confirmation (
 	foreign key (txid) references "transaction" (txid),
 	foreign key (block_hash) references block (block_hash)
 ) strict, without rowid;
-
--- TODO: indexes
