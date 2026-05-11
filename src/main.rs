@@ -22,9 +22,10 @@ use bdk_wallet::{
     Wallet,
 };
 
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::amount::Display;
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{Amount, FeeRate, Denomination};
+use bitcoin::{Address, Amount, FeeRate, Denomination};
 
 use bitcoin::bip32::{
     Xpriv,
@@ -59,6 +60,7 @@ use rusqlite::{
 };
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "bitcoind")]
 use mccv::{
@@ -244,6 +246,23 @@ enum Command {
 
         #[arg(short, long = "vault-name", help = "Human readable identifier string")]
         name: Option<String>,
+    },
+    Send {
+        #[arg(short, long = "vault-name", help = "Human readable identifier string")]
+        name: Option<String>,
+
+        #[arg(short, long, help = "Sweep entire contents of the hot wallet (amount will be ignored)")]
+        sweep: bool,
+
+        #[command(flatten)]
+        fee_rate: FeeRateArg,
+
+        #[command(flatten)]
+        rpc_conf: RpcConf,
+
+        address: Address<NetworkUnchecked>,
+
+        amount: Amount,
     },
     Sync {
         #[arg(short, long = "vault-name", help = "Human readable identifier string")]
@@ -816,6 +835,59 @@ fn main() {
 
             vault.store();
         },
+        Command::Send { ref name, ref address, ref amount, ref rpc_conf, ref fee_rate, sweep } => {
+            let rpc_client = rpc_conf.open();
+
+            let storage = args.open_storage();
+
+            let fee_rate = fee_rate.fee_rate(&rpc_client);
+
+            let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
+
+            let address = address.clone().require_network(args.network)
+                .expect("address for expected network");
+
+            let tx = if sweep {
+                let mut builder = vault.wallet.build_tx();
+                    builder
+                        .fee_rate(fee_rate)
+                        .drain_to(address.script_pubkey())
+                        .drain_wallet();
+                    builder.finish()
+            } else {
+                let mut builder = vault.wallet.build_tx();
+                    builder
+                        .fee_rate(fee_rate)
+                        .add_recipient(address, *amount);
+                    builder.finish()
+            };
+
+            let mut tx = tx.expect("build transaction");
+
+            vault.store_wallet();
+
+            let finalized = vault.wallet.sign(
+                    &mut tx,
+                    SignOptions::default(),
+                )
+                .expect("sign transaction");
+
+            assert!(finalized);
+
+            let tx = tx.extract_tx().expect("extract transaction");
+
+            rpc_client.send_raw_transaction(&tx)
+                .expect("broadcast transaction");
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time is never before unix epoch")
+                .as_secs();
+
+            vault.wallet.apply_unconfirmed_txs([(tx, now)]);
+
+            vault.store_wallet();
+        }
         Command::Receive { ref name } => {
             let storage = args.open_storage();
 
