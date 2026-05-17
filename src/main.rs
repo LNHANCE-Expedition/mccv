@@ -647,6 +647,21 @@ fn main() {
 
     let secp = Secp256k1::new();
 
+    assert!(
+        args.network != Network::Bitcoin,
+        "mainnet is not supported!",
+    );
+
+    assert!(
+        args.network != Network::Testnet,
+        "Testnet is not supported!",
+    );
+
+    assert!(
+        args.network != Network::Testnet4,
+        "Testnet4 is not supported!",
+    );
+
     match args.command {
         Command::Generate(ref generate_arg) => {
             let mut rng = thread_rng();
