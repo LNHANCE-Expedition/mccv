@@ -1,3 +1,5 @@
 target/
+mccv-vault.sqlite
+mccv-wallet.sqlite
 mccv-vault.sqlite-*
 mccv-wallet.sqlite-*
