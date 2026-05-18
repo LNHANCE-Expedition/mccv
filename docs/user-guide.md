@@ -41,7 +41,7 @@ The first step to trying out the vault is to clone this repository and build it.
 ```
 git clone https://github.com/LNHANCE-Expedition/mccv.git
 cd mccv
-cargo install -F bitcoind
+cargo install --path . --features bitcoind
 ```
 
 This will install the `mccv` command line tool.
