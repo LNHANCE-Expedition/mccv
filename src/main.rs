@@ -859,6 +859,7 @@ fn main() {
                     .expect("create sweep tx");
 
                 println!("Sweep TX: {}", serialize_hex(&transaction));
+                println!("Sweep TXID: {}", transaction.compute_txid());
 
                 rpc_client.send_raw_transaction(&transaction)
                     .expect("send sweep tx");
@@ -897,7 +898,9 @@ fn main() {
             let recovery_tx = recovery.into_signed_transaction().expect("valid transaction");
 
             println!("Recovery TX: {}", serialize_hex(&recovery_tx));
+            println!("Recovery TXID: {}", recovery_tx.compute_txid());
             println!("Recovery CPFP TX: {}", serialize_hex(&recovery_cpfp));
+            println!("Recovery CPFP TXID: {}", recovery_cpfp.compute_txid());
 
             rpc_client
                 .submit_package(&[&recovery_tx, &recovery_cpfp])
@@ -946,6 +949,8 @@ fn main() {
 
             let tx = tx.extract_tx().expect("extract transaction");
 
+            println!("Send TX: {}", serialize_hex(&tx));
+            println!("Send TXID: {}", tx.compute_txid());
             rpc_client.send_raw_transaction(&tx)
                 .expect("broadcast transaction");
 
@@ -1018,7 +1023,9 @@ fn main() {
                 .expect("tx finalized and complete");
 
             println!("Shape TX: {}", serialize_hex(&deposit_shape));
+            println!("Shape TXID: {}", deposit_shape.compute_txid());
             println!("Deposit TX: {}", serialize_hex(&deposit));
+            println!("Deposit TXID: {}", deposit.compute_txid());
 
             rpc_client.submit_package(&[
                     &deposit_shape,
@@ -1072,7 +1079,9 @@ fn main() {
                 .expect("cpfp transaction final");
 
             println!("Withdrawal TX: {}", serialize_hex(&withdrawal));
+            println!("Withdrawal TXID: {}", withdrawal.compute_txid());
             println!("Withdrawal CPFP TX: {}", serialize_hex(&withdrawal_cpfp));
+            println!("Withdrawal CPFP TXID: {}", withdrawal_cpfp.compute_txid());
 
             rpc_client.submit_package(&[
                     &withdrawal,
