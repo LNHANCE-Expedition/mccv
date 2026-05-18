@@ -1,3 +1,6 @@
+#[cfg(feature = "bitcoind")]
+use bdk_bitcoind_rpc::bitcoincore_rpc;
+
 use bitcoin::{BlockHash, Transaction, Txid};
 use bitcoin::bip32::{Xpub, Fingerprint, Xpriv, DerivationPath};
 use bitcoin::consensus::{Encodable, Decodable};
@@ -14,6 +17,8 @@ use rusqlite::{
 
 use std::collections::{hash_map, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
+#[cfg(feature = "bitcoind")]
+use std::path::PathBuf;
 
 use crate::chain::{
     AddBlockError, AddTransactionSuccess, AddTransactionError,
@@ -196,6 +201,121 @@ impl SqliteStorage {
         .optional()?;
 
         Ok(secrets)
+    }
+
+    #[cfg(feature = "bitcoind")]
+    pub fn store_rpc_conf(&mut self, id: VaultId, rpc_url: &str, auth: &bitcoincore_rpc::Auth) -> Result<(), StoreError> {
+        let transaction = self.sqlite.transaction()?;
+
+        let (rpc_username, rpc_password, rpc_cookie) = match auth {
+            bitcoincore_rpc::Auth::None => (None, None, None),
+            bitcoincore_rpc::Auth::UserPass(username, password) => (
+                Some(username.as_str()),
+                Some(password.as_str()),
+                None,
+            ),
+            bitcoincore_rpc::Auth::CookieFile(cookie_path) => (
+                None,
+                None,
+                Some(
+                    cookie_path.to_str()
+                        // FIXME: really abusing this error variant...
+                        // TODO: Make a new error type for this method
+                        .ok_or(StoreError::InvalidState)?
+                ),
+            ),
+        };
+
+        transaction.execute(r#"
+            insert
+            into mccv_rpc_config (
+                id,
+                rpc_url,
+                rpc_username,
+                rpc_password,
+                rpc_cookie
+            )
+            values ( ?, ?, ?, ?, ? )
+            on conflict ( id )
+                do update
+                    set
+                        rpc_url = excluded.rpc_url,
+                        rpc_username = excluded.rpc_username,
+                        rpc_password = excluded.rpc_password,
+                        rpc_cookie = excluded.rpc_cookie
+            "#,
+            params![
+                id,
+
+                rpc_url,
+                rpc_username,
+                rpc_password,
+                rpc_cookie,
+            ],
+        )?;
+
+        transaction.commit()?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "bitcoind")]
+    pub fn load_rpc_conf(&mut self, id: VaultId) -> Result<Option<(String, bitcoincore_rpc::Auth)>, LoadError> {
+        let transaction = self.sqlite.transaction()?;
+
+        let row =
+            transaction.query_row(r#"
+                    select
+                        rpc_url,
+                        rpc_username,
+                        rpc_password,
+                        rpc_cookie
+                    from mccv_rpc_config
+                    where
+                        id = ?
+                "#,
+                params![ id ],
+                |row| {
+                    let rpc_url: String = row.get(0)?;
+                    let rpc_username: Option<String> = row.get(1)?;
+                    let rpc_password: Option<String> = row.get(2)?;
+                    let cookie_path: Option<PathBuf> = row
+                        .get_ref(3)?
+                        .as_str_or_null()?
+                        .map(|cookie_path| PathBuf::from_str(cookie_path))
+                        .transpose()
+                        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        )?;
+
+                    Ok((rpc_url, rpc_username, rpc_password, cookie_path))
+                }
+            )
+            .optional()?;
+
+        if let Some((rpc_url, rpc_username, rpc_password, cookie_path)) = row {
+            let auth = match (rpc_username, rpc_password, cookie_path) {
+                (None, None, None) => bitcoincore_rpc::Auth::None,
+                (Some(rpc_username), Some(rpc_password), None) =>
+                    bitcoincore_rpc::Auth::UserPass(
+                        rpc_username,
+                        rpc_password,
+                    ),
+                (None, None, Some(cookie_path)) =>
+                    bitcoincore_rpc::Auth::CookieFile(cookie_path),
+                _ => {
+                    // FIXME: Abusing this error variant quite a bit too
+                    return Err(LoadError::InvalidState);
+                }
+            };
+
+            Ok(Some((rpc_url, auth)))
+        } else {
+            Ok(None)
+        }
     }
 }
 
