@@ -664,6 +664,14 @@ fn main() {
 
     match args.command {
         Command::Generate(ref generate_arg) => {
+            let rpc_client = generate_arg.rpc_conf.open();
+            let blockchain_info = rpc_client.get_blockchain_info()
+                .expect("RPC success");
+            assert!(
+                !blockchain_info.initial_block_download,
+                "Bitcoin Core is still in initial block download",
+            );
+
             let mut rng = thread_rng();
 
             let mut seed = [0u8; 128];
@@ -716,8 +724,6 @@ fn main() {
                 .expect("vault apply genesis");
 
             vault.vault_changelog = vault.storage.vault_storage.store(vault.vault_changelog.take()).expect("store vault");
-
-            let rpc_client = generate_arg.rpc_conf.open();
 
             let latest_block = latest_blockid(&rpc_client);
             let checkpoint_start = block_parent(&rpc_client, latest_block, 6);
