@@ -1139,9 +1139,9 @@ fn main() {
 
             assert_eq!(change, Amount::ZERO, "Invalid withdrawal amount");
 
-            let wallet_balance = vault.wallet.balance();
+            let vault_balance = vault.vault.confirmed_balance(None);
 
-            assert!(wallet_balance.confirmed >= withdrawal_args.amount);
+            assert!(vault_balance >= withdrawal_args.amount);
 
             let mut withdrawal = vault.vault.create_withdrawal(&secp, withdrawal_amount)
                 .expect("create withdrawal");
