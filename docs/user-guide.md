@@ -12,7 +12,7 @@ The wallet is divided into two parts: the hot wallet, and the vault.
 The hot wallet is a normal BDK wallet, and can be used for sending and receiving funds.
 When the user's hot wallet balance exceeds a certain amount, they may desire to increase the security of those funds.
 They can then move those funds, in fixed sized chunks, into the vault.
-Vaulted funds may not be spent immediately, they are first withdrawn and subject to a timelock, during the timelock period they can be swept to a recovery address if the withdrawal was unauthorized.
+Vaulted funds may not be spent immediately; they are first withdrawn and subject to a timelock, during the timelock period they can be swept to a recovery address if the withdrawal was unauthorized.
 
 # Overview
 
@@ -77,18 +77,10 @@ For simplicity, I'm just using `rpcuser` and `rpcpassword` for these examples si
 Note also the `addnode` line, this is necessary to ensure transactions using CTV are mined, as not all of the signet network will relay them.
 
 Once you have your configuration, you need to start your bitcoin node.
-The initial release of MCCV, v0.1.0, does not support persistent configuration of `bitcoind` RPC parameters, so every invocation of `mccv` that needs access to `bitcoind` (most of them) will need to have corresponding RPC configuration parameters.
-In `bash` you can handle this pretty easily like this:
-
-```
-RPC_ARGS=(--rpc-username test --rpc-password test --rpc-url http://127.0.0.1:38332)
-```
-
-Later, you can pass them all at once to `mccv` using the bash array expansion syntax like this `mccv sync "${RPC_ARGS[@]}"`.
 
 > [!TIP]
 > MCCV does not currently synchronize automatically.
-> After receiving funds or broadcasting transactions, run `mccv sync ...` to sync to the latest blockchain state.
+> After receiving funds or broadcasting transactions, run `mccv sync` to sync to the latest blockchain state.
 
 ## Using MCCV
 
@@ -110,13 +102,17 @@ mccv generate \
     --max-deposit 4 \
     --max-withdrawal 3 \
     --max-depth 10 \
-    "${RPC_ARGS[@]}"
+    --rpc-username test \
+    --rpc-password test \
+    --rpc-url 'http://127.0.0.1:38332'
 ```
 
 This generates a test vault, named "test" that processes deposits and withdrawals in chunks of 10,000 sats with a maximum deposit size of 40,000 sats, and a maximum withdrawal size of 30,000 sats.
 Withdrawing 10,000 sats incurs a delay of 3 blocks, 20,000 sats incurs a delay of 6 blocks, and 30,000 sats incurs a delay of 9 blocks.
 This vault permits up to 10 deposits and withdrawals before control reverts permanently to the cold recovery key.
-The `"${RPC_ARGS[@]}"` syntax is a bash array expansion to avoid retyping the RPC arguments.
+The `--rpc-*` options define how to connect to `bitcoind`.
+They will be persisted into the vault database in plain text and used for future `mccv` unless overridden on the command line.
+The persisted configuration can be changed later using `mccv configure-rpc ...`.
 For a detailed explanation of these parameters and how they affect security and performance, see the "`generate` Subcommand Arguments" section below.
 
 #### Backup and Restore
@@ -137,7 +133,7 @@ To create a receiving address, issue the command
 mccv receive
 ```
 
-Once funds have been sent to the vault, `mccv sync ...` must be issued to update the vault and hot wallet state.
+Once funds have been sent to the vault, `mccv sync` must be issued to update the vault and hot wallet state.
 
 The received balance can be checked with the command
 
@@ -162,13 +158,13 @@ In this example, no funds have been vaulted *yet*.
 Once the hot wallet contains more than a vault increment, funds can (and probably should) be moved into the vault.
 
 ```
-mccv deposit "${RPC_ARGS[@]}" 10000sat
+mccv deposit 10000sat
 ```
 
 After syncing, the vault balance should update.
 
 ```
-mccv sync "${RPC_ARGS[@]}"
+mccv sync
 ```
 
 Now `mccv balance` should display an output like this:
@@ -188,7 +184,7 @@ Withdrawing funds into the hot wallet is presently a two step process.
 The first step is to initiate the withdrawal using a command like the following:
 
 ```
-mccv withdraw "${RPC_ARGS[@]}" 10000sat
+mccv withdraw 10000sat
 ```
 
 After the withdrawal has been included in a block, and the vault is synced, the balance should be updated accordingly.
@@ -227,15 +223,15 @@ At any point until it is spent, the withdrawal and the entire vault can be swept
 The command to sweep to recovery is
 
 ```
-mccv recover "${RPC_ARGS[@]}"
+mccv recover
 ```
 
 This will sweep an open withdrawal UTXO as well as the vault UTXO to the recovery address.
 
-To spend these funds instead, they must first be moved into the hot wallet (see note above. this is a transient UX wart)
+To spend these funds instead, they must first be moved into the hot wallet (see note above; this is a transient UX wart)
 
 ```
-mccv sweep-to-hot "${RPC_ARGS[@]}"
+mccv sweep-to-hot
 ```
 
 After the sweep completes, the funds will be available in the hot wallet.
@@ -250,7 +246,7 @@ After the sweep completes, the funds will be available in the hot wallet.
 At this point the funds can be spent from the hot wallet.
 
 ```
-mccv send "${RPC_ARGS[@]}" tb1p0dvncdux9r4wqdetetng0xe830r6wum06legmk29ek5l43497epse2u5vz 10000sat
+mccv send tb1p0dvncdux9r4wqdetetng0xe830r6wum06legmk29ek5l43497epse2u5vz 10000sat
 ```
 
 # MCCV Command Reference
@@ -281,7 +277,9 @@ mccv generate \
     --max-deposit 4 \
     --max-withdrawal 3 \
     --max-depth 10 \
-    "${RPC_ARGS[@]}"
+    --rpc-username test \
+    --rpc-password test \
+    --rpc-url 'http://127.0.0.1:38332'
 ```
 
 The command line options are as follows
@@ -309,14 +307,22 @@ Doubling `max-deposit + max-withdrawal` doubles the time it takes to generate yo
 Persistent caching will greatly help here but it's not yet implemented.
 * `--max-depth` - This is the maximum number of vault operations (deposit or withdraw) you can perform.
 After the operations are exhausted, the vault will only be spendable by the cold key.
-* `"${RPC_ARGS[@]}"` - Your RPC arguments as described earlier, conveniently bundled together.
+* `--rpc-username` - Use this username to connect to `bitcoind`.
+* `--rpc-password` - Use this password to connect to `bitcoind`.
+  Note that this will be persisted in plain text in the `mccv-vault.sqlite`.
+  All of the stored RPC configuration can be updated later using `mccv configure-rpc ...`.
+  Using `--rpc-cookie` is generally preferable, and can be used instead of username and password, avoiding storing a password in the vault database.
+* `--rpc-url` - Connect to `bitcoind` at this URL.
+* `--rpc-cookie` - Use cookie-based authentication with `bitcoind` instead of username and password.
+  This avoids storing an RPC password in the vault database and is generally the preferred authentication method.
+  See `bitcoind` configuration for using cookie authentication.
 
 # Known Issues
 
 These are warts that should be removed but weren't deemed blockers to demonstrating the core concepts of this vault.
 
 ## Withdrawal Requires an Extra Sweep Step
-As stated above, the CLI currently makes vault spends a 3 step process: withdrawal, sweep, spend, instead of a 2 step process: withdraw, spend.
+As stated above, the CLI currently makes vault spends a three-step process: withdrawal, sweep, spend, instead of a 2 step process: withdraw, spend.
 This is wasteful on-chain and bad UX.
 The protocol already supports the two step process, but the code that spends the withdrawal UTXOs needs to be more flexible.
 
