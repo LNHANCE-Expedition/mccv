@@ -905,10 +905,21 @@ fn main() {
             let current_height = vault.vault.height()
                 .expect("must have synced at least one block");
 
-            let mature_withdrawals: Vec<_> =
+            let withdrawal_utxos =
                 vault
                     .vault
-                    .spend_withdrawal_transactions(&secp, UtxoSelector::any_confirmed())
+                    .spend_withdrawal_transactions(&secp, UtxoSelector::any_confirmed());
+
+            let next_maturity = withdrawal_utxos
+                .iter()
+                .filter_map(|(maturity_height, _)|
+                    maturity_height
+                        .filter(|maturity_height| *maturity_height > current_height)
+                )
+                .min();
+
+            let mature_withdrawals: Vec<_> =
+                withdrawal_utxos
                     .into_iter()
                     .filter(|(maturity_height, _)|
                         maturity_height
@@ -918,6 +929,17 @@ fn main() {
                     .map(|(_, withdrawal)| withdrawal)
                     .collect();
 
+            if mature_withdrawals.is_empty() {
+                match next_maturity {
+                    Some(height) => {
+                        let blocks = height - current_height;
+                        println!("No mature withdrawals to sweep. Next withdrawal matures at height {height} (in {blocks} blocks).");
+                    }
+                    None => println!("No withdrawal UTXOs to sweep."),
+                }
+                vault.store();
+                return;
+            }
 
             let min_fee = Amount::ZERO;
             let min_fee_rate = fee_rate.fee_rate(&rpc_client);
