@@ -4,7 +4,7 @@ compile_error!("Vault CLI requires a blockchain interface, enable the `bitcoind`
 #[cfg(feature = "bitcoind")]
 use bdk_bitcoind_rpc::Emitter;
 #[cfg(feature = "bitcoind")]
-use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi};
+use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
 #[cfg(feature = "bitcoind")]
 use bdk_bitcoind_rpc::bitcoincore_rpc::json::GetChainTipsResultStatus;
 
@@ -105,14 +105,16 @@ enum AuthArgError {
     Invalid,
 }
 
-impl TryFrom<RpcAuthArg> for bdk_bitcoind_rpc::bitcoincore_rpc::Auth {
+impl TryFrom<&RpcAuthArg> for Option<Auth> {
     type Error = AuthArgError;
 
-    fn try_from(auth: RpcAuthArg) -> Result<Self, Self::Error> {
-        match (auth.username, auth.password, auth.cookie_path) {
-            (_, _, Some(cookie_path)) => Ok(Self::CookieFile(cookie_path)),
-            (Some(username), Some(password), _) => Ok(Self::UserPass(username, password)),
-            (None, None, None) => Ok(Self::None),
+    fn try_from(auth: &RpcAuthArg) -> Result<Self, Self::Error> {
+        match (&auth.username, &auth.password, &auth.cookie_path) {
+            (_, _, Some(cookie_path)) =>
+                Ok(Some(Auth::CookieFile(cookie_path.clone()))),
+            (Some(username), Some(password), _) =>
+                Ok(Some(Auth::UserPass(username.clone(), password.clone()))),
+            (None, None, None) => Ok(None),
             _ => Err(AuthArgError::Invalid),
         }
     }
@@ -123,19 +125,7 @@ struct RpcConf {
     #[command(flatten)]
     rpc_auth: RpcAuthArg,
     #[arg(short = 'U', long = "rpc-url")]
-    rpc_url: String,
-}
-
-impl RpcConf {
-    fn open(&self) -> Client {
-        Client::new(
-            self.rpc_url.as_ref(),
-            self.rpc_auth.clone()
-                .try_into()
-                .expect("valid auth settings")
-        )
-        .expect("valid RPC settings")
-    }
+    rpc_url: Option<String>,
 }
 
 #[derive(Clone, Args)]
@@ -228,6 +218,13 @@ struct ModifyArg {
 #[derive(Clone, Subcommand)]
 enum Command {
     Generate(GenerateArg),
+    ConfigureRpc {
+        #[arg(short, long = "vault-name", help = "Human readable identifier string")]
+        name: Option<String>,
+
+        #[command(flatten)]
+        rpc_conf: RpcConf,
+    },
     List,
     Balance {
         #[arg(short, long = "vault-name", help = "Human readable identifier string")]
@@ -438,6 +435,56 @@ impl VaultSystem {
             vault,
             vault_changelog,
         }
+    }
+
+    fn rpc_parameters(&mut self, rpc_conf: &RpcConf) -> Option<(String, Auth)> {
+        let cli_rpc_auth = Option::<Auth>::try_from(&rpc_conf.rpc_auth)
+            .expect("invalid RPC arguments");
+
+        let stored_conf = self.storage.vault_storage.load_rpc_conf(self.vault_changelog.id())
+            .expect("load rpc conf");
+
+        let rpc_url = match (&rpc_conf.rpc_url, &stored_conf) {
+            (Some(cli_rpc_url), _) => cli_rpc_url.clone(),
+            (None, Some((stored_rpc_url, _))) => stored_rpc_url.clone(),
+            (None, None) => {
+                panic!("No RPC config provided!");
+            }
+        };
+
+        let rpc_auth = match (cli_rpc_auth, stored_conf) {
+            (Some(cli_rpc_auth), _) => cli_rpc_auth,
+            (None, Some((_, stored_auth))) => stored_auth,
+            (None, None) => Auth::None,
+        };
+
+        Some(
+            (
+                rpc_url,
+                rpc_auth,
+            )
+        )
+    }
+
+    fn open_rpc(&mut self, rpc_conf: &RpcConf) -> Client {
+        let (rpc_url, rpc_auth) = self.rpc_parameters(rpc_conf)
+            .expect("RPC parameters");
+
+        Client::new(
+                rpc_url.as_ref(),
+                rpc_auth,
+            )
+            .expect("open RPC")
+    }
+
+    fn store_rpc_conf(&mut self, rpc_url: &str, rpc_auth: &Auth) {
+        self.storage.vault_storage
+            .store_rpc_conf(
+                self.vault_changelog.id(),
+                rpc_url,
+                rpc_auth,
+            )
+            .expect("store rpc config");
     }
 
     fn store(&mut self) {
@@ -664,7 +711,20 @@ fn main() {
 
     match args.command {
         Command::Generate(ref generate_arg) => {
-            let rpc_client = generate_arg.rpc_conf.open();
+            let rpc_auth = Option::<Auth>::try_from(&generate_arg.rpc_conf.rpc_auth)
+                .expect("valid RPC arguments")
+                .unwrap_or(Auth::None);
+
+            let rpc_url = generate_arg.rpc_conf.rpc_url
+                        .clone()
+                        .expect("rpc URL");
+
+            let rpc_client = Client::new(
+                    rpc_url.as_ref(),
+                    rpc_auth.clone(),
+                )
+                .expect("open rpc");
+
             let blockchain_info = rpc_client.get_blockchain_info()
                 .expect("RPC success");
             assert!(
@@ -746,7 +806,20 @@ fn main() {
 
             vault.store_vault();
 
+            vault.store_rpc_conf(rpc_url.as_ref(), &rpc_auth);
+
             println!("Saved!");
+        }
+        Command::ConfigureRpc { ref name, ref rpc_conf } => {
+            let storage = args.open_storage();
+
+            let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
+
+            let (rpc_url, rpc_auth) =
+                vault.rpc_parameters(&rpc_conf)
+                    .expect("fix");
+
+            vault.store_rpc_conf(rpc_url.as_ref(), &rpc_auth);
         }
         Command::List => {
             let mut vault_storage = SqliteStorage::from_connection(
@@ -766,6 +839,7 @@ fn main() {
             let storage = args.open_storage();
 
             let vault = VaultSystem::load(&secp, storage, name.as_deref());
+
             let balance = vault.wallet.balance();
 
             let current_height = vault.vault.height()
@@ -813,8 +887,7 @@ fn main() {
             let storage = args.open_storage();
 
             let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
-
-            let rpc_client = rpc_conf.open();
+            let rpc_client = vault.open_rpc(rpc_conf);
 
             let context = vault.vault.context(&secp);
 
@@ -825,17 +898,28 @@ fn main() {
         }
         Command::SweepToHot { ref name, ref fee_rate, ref rpc_conf } => {
             let storage = args.open_storage();
-            let rpc_client = rpc_conf.open();
 
             let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
+            let rpc_client = vault.open_rpc(rpc_conf);
 
             let current_height = vault.vault.height()
                 .expect("must have synced at least one block");
 
-            let mature_withdrawals: Vec<_> =
+            let withdrawal_utxos =
                 vault
                     .vault
-                    .spend_withdrawal_transactions(&secp, UtxoSelector::any_confirmed())
+                    .spend_withdrawal_transactions(&secp, UtxoSelector::any_confirmed());
+
+            let next_maturity = withdrawal_utxos
+                .iter()
+                .filter_map(|(maturity_height, _)|
+                    maturity_height
+                        .filter(|maturity_height| *maturity_height > current_height)
+                )
+                .min();
+
+            let mature_withdrawals: Vec<_> =
+                withdrawal_utxos
                     .into_iter()
                     .filter(|(maturity_height, _)|
                         maturity_height
@@ -845,6 +929,17 @@ fn main() {
                     .map(|(_, withdrawal)| withdrawal)
                     .collect();
 
+            if mature_withdrawals.is_empty() {
+                match next_maturity {
+                    Some(height) => {
+                        let blocks = height - current_height;
+                        println!("No mature withdrawals to sweep. Next withdrawal matures at height {height} (in {blocks} blocks).");
+                    }
+                    None => println!("No withdrawal UTXOs to sweep."),
+                }
+                vault.store();
+                return;
+            }
 
             let min_fee = Amount::ZERO;
             let min_fee_rate = fee_rate.fee_rate(&rpc_client);
@@ -866,12 +961,12 @@ fn main() {
             }
 
             vault.store();
-        },
+        }
         Command::Recover { ref name, ref fee_rate, ref rpc_conf } => {
             let storage = args.open_storage();
-            let rpc_client = rpc_conf.open();
 
             let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
+            let rpc_client = vault.open_rpc(rpc_conf);
 
             let mut recovery = vault.vault.create_recovery(&secp)
                 .expect("create recovery");
@@ -909,16 +1004,15 @@ fn main() {
             vault.store();
         }
         Command::Send { ref name, ref address, ref amount, ref rpc_conf, ref fee_rate, sweep } => {
-            let rpc_client = rpc_conf.open();
-
             let storage = args.open_storage();
 
-            let fee_rate = fee_rate.fee_rate(&rpc_client);
-
             let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
+            let rpc_client = vault.open_rpc(rpc_conf);
 
             let address = address.clone().require_network(args.network)
                 .expect("address for expected network");
+
+            let fee_rate = fee_rate.fee_rate(&rpc_client);
 
             let tx = if sweep {
                 let mut builder = vault.wallet.build_tx();
@@ -975,13 +1069,10 @@ fn main() {
             println!("Address: {}", address.to_string());
         }
         Command::Deposit(ref deposit_args) => {
-            let rpc_client = deposit_args.rpc_conf.open();
-
-            let fee_rate = deposit_args.fee_rate.fee_rate(&rpc_client);
-
             let storage = args.open_storage();
 
             let mut vault = VaultSystem::load(&secp, storage, deposit_args.name.as_deref());
+            let rpc_client = vault.open_rpc(&deposit_args.rpc_conf);
 
             let (deposit_amount, change) = vault.vault.to_vault_amount(deposit_args.amount)
                 .expect("invalid deposit amount");
@@ -994,6 +1085,8 @@ fn main() {
 
             let mut deposit = vault.vault.create_deposit(&secp, deposit_amount)
                 .expect("create deposit");
+
+            let fee_rate = deposit_args.fee_rate.fee_rate(&rpc_client);
 
             let mut deposit_shape_psbt = vault
                 .wallet
@@ -1036,13 +1129,10 @@ fn main() {
             // TODO: Persist unconfirmed transactions for rebroadcast
         }
         Command::Withdraw(ref withdrawal_args) => {
-            let rpc_client = withdrawal_args.rpc_conf.open();
-
-            let fee_rate = withdrawal_args.fee_rate.fee_rate(&rpc_client);
-
             let storage = args.open_storage();
 
             let mut vault = VaultSystem::load(&secp, storage, withdrawal_args.name.as_deref());
+            let rpc_client = vault.open_rpc(&withdrawal_args.rpc_conf);
 
             let (withdrawal_amount, change) = vault.vault.to_vault_amount(withdrawal_args.amount)
                 .expect("invalid withdrawal amount");
@@ -1055,6 +1145,8 @@ fn main() {
 
             let mut withdrawal = vault.vault.create_withdrawal(&secp, withdrawal_amount)
                 .expect("create withdrawal");
+
+            let fee_rate = withdrawal_args.fee_rate.fee_rate(&rpc_client);
 
             let mut withdrawal_cpfp_psbt = vault.wallet.create_cpfp(&secp, &withdrawal, fee_rate)
                 .expect("can cpfp");

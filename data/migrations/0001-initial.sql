@@ -9,6 +9,30 @@ create table mccv_secret (
 	foreign key ( id ) references mccv_vault ( id )
 );
 
+create table mccv_rpc_config (
+	id integer primary key,
+
+	rpc_url text,
+	rpc_username text,
+	rpc_password text,
+	rpc_cookie text,
+
+	constraint rpc_user_auth
+	check (
+		case
+		-- Corresponds to bitcoincore_rpc::Auth::None
+		when rpc_cookie is null and rpc_username is null and rpc_password is null then 1
+		-- Corresponds to bitcoincore_rpc::Auth::UserPass
+		when rpc_username not null and rpc_password not null then 1
+		-- Corresponds to bitcoincore_rpc::Auth::CookieFile
+		when rpc_cookie not null then 1
+		else 0
+		end
+	),
+
+	foreign key ( id ) references mccv_vault ( id )
+);
+
 create table mccv_vault (
 	id integer primary key,
 	name text,
