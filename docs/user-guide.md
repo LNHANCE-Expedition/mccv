@@ -78,10 +78,6 @@ Note also the `addnode` line, this is necessary to ensure transactions using CTV
 
 Once you have your configuration, you need to start your bitcoin node.
 
-> [!TIP]
-> MCCV does not currently synchronize automatically.
-> After receiving funds or broadcasting transactions, run `mccv sync` to sync to the latest blockchain state.
-
 ## Using MCCV
 
 MCCV v0.1.0 doesn't yet support multi-vault setups, so it stores its data and configuration files in the current directory by default.
@@ -133,8 +129,6 @@ To create a receiving address, issue the command
 mccv receive
 ```
 
-Once funds have been sent to the vault, `mccv sync` must be issued to update the vault and hot wallet state.
-
 The received balance can be checked with the command
 
 ```
@@ -159,12 +153,6 @@ Once the hot wallet contains more than a vault increment, funds can (and probabl
 
 ```
 mccv deposit 10000sat
-```
-
-After syncing, the vault balance should update.
-
-```
-mccv sync
 ```
 
 Now `mccv balance` should display an output like this:

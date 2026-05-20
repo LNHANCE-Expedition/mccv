@@ -228,7 +228,10 @@ enum Command {
     List,
     Balance {
         #[arg(short, long = "vault-name", help = "Human readable identifier string")]
-        name: Option<String>
+        name: Option<String>,
+
+        #[command(flatten)]
+        rpc_conf: RpcConf,
     },
     Receive {
         #[arg(short, long = "vault-name", help = "Human readable identifier string")]
@@ -299,6 +302,9 @@ struct CommandLine {
 
     #[arg(short = 'n', long = "network", default_value="signet")]
     network: Network,
+
+    #[arg(long, help = "Do not synchronize with the blockchain")]
+    skip_sync: bool,
 }
 
 impl CommandLine {
@@ -835,10 +841,16 @@ fn main() {
                 println!("\"{name}\"");
             }
         }
-        Command::Balance { ref name } => {
+        Command::Balance { ref name, ref rpc_conf } => {
             let storage = args.open_storage();
 
-            let vault = VaultSystem::load(&secp, storage, name.as_deref());
+            let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
+            let rpc_client = vault.open_rpc(rpc_conf);
+
+            if !args.skip_sync {
+                let context = vault.vault.context(&secp);
+                vault.sync(&secp, &context, &rpc_client);
+            }
 
             let balance = vault.wallet.balance();
 
@@ -901,6 +913,11 @@ fn main() {
 
             let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
             let rpc_client = vault.open_rpc(rpc_conf);
+
+            if !args.skip_sync {
+                let context = vault.vault.context(&secp);
+                vault.sync(&secp, &context, &rpc_client);
+            }
 
             let current_height = vault.vault.height()
                 .expect("must have synced at least one block");
@@ -968,6 +985,11 @@ fn main() {
             let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
             let rpc_client = vault.open_rpc(rpc_conf);
 
+            if !args.skip_sync {
+                let context = vault.vault.context(&secp);
+                vault.sync(&secp, &context, &rpc_client);
+            }
+
             let mut recovery = vault.vault.create_recovery(&secp)
                 .expect("create recovery");
 
@@ -1008,6 +1030,11 @@ fn main() {
 
             let mut vault = VaultSystem::load(&secp, storage, name.as_deref());
             let rpc_client = vault.open_rpc(rpc_conf);
+
+            if !args.skip_sync {
+                let context = vault.vault.context(&secp);
+                vault.sync(&secp, &context, &rpc_client);
+            }
 
             let address = address.clone().require_network(args.network)
                 .expect("address for expected network");
@@ -1079,6 +1106,11 @@ fn main() {
 
             assert_eq!(change, Amount::ZERO, "Invalid deposit amount");
 
+            if !args.skip_sync {
+                let context = vault.vault.context(&secp);
+                vault.sync(&secp, &context, &rpc_client);
+            }
+
             let wallet_balance = vault.wallet.balance();
 
             assert!(wallet_balance.confirmed >= deposit_args.amount);
@@ -1138,6 +1170,11 @@ fn main() {
                 .expect("invalid withdrawal amount");
 
             assert_eq!(change, Amount::ZERO, "Invalid withdrawal amount");
+
+            if !args.skip_sync {
+                let context = vault.vault.context(&secp);
+                vault.sync(&secp, &context, &rpc_client);
+            }
 
             let vault_balance = vault.vault.confirmed_balance(None);
 
