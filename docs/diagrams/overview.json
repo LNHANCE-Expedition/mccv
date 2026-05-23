@@ -1,0 +1,444 @@
+{
+	"transactions": [
+		{
+		  "title": "Withdraw 1 (depth=1)",
+		  "id": "withdrawal_1_d1",
+		  "status": "candidate",
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 90000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 10000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Withdraw 2 (depth=1)",
+		  "id": "withdrawal_2_d1",
+		  "status": "candidate",
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 80000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 20000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 1 (depth=1)",
+		  "id": "deposit_1_d1",
+		  "status": "candidate",
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 110000
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 2 (depth=1)",
+		  "id": "deposit_2_d1",
+		  "status": "candidate",
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 120000
+			  }
+		  ]
+		},
+
+		{
+		  "title": "Withdraw 1 (depth=2, last=\"Withdraw 1\")",
+		  "id": "withdrawal_1_v9_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "withdrawal_1_d1:0",
+				  "sequence": {
+					  "height": 3
+				  }
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 80000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 10000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Withdraw 2 (depth=2, last=\"Withdraw 1\")",
+		  "id": "withdrawal_2_v9_d1",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "withdrawal_1_d1:0",
+				  "sequence": {
+					  "height": 3
+				  }
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 70000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 20000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 1 (depth=2, last=\"Withdraw 1\")",
+		  "id": "deposit_1_v9_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "withdrawal_1_d1:0",
+				  "sequence": {
+					  "height": 3
+				  }
+			  },
+			  {
+				  "title": "Deposit",
+				  "amount_sat": 10123
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 100000
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 2 (depth=2, last=\"Withdraw 1\")",
+		  "id": "deposit_2_v9_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "withdrawal_1_d1:0",
+				  "sequence": {
+					  "height": 3
+				  }
+			  },
+			  {
+				  "title": "Deposit",
+				  "amount_sat": 20123
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 110000
+			  }
+		  ]
+		},
+
+		{
+		  "title": "Withdraw 1 (depth=2, last=\"Withdraw 2\")",
+		  "id": "withdrawal_1_v8_d1",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "withdrawal_2_d1:0",
+				  "sequence": {
+					  "height": 6
+				  }
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 70000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 10000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Withdraw 2 (depth=2, last=\"Withdraw 2\")",
+		  "id": "withdrawal_2_v8_d1",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "withdrawal_2_d1:0",
+				  "sequence": {
+					  "height": 6
+				  }
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 60000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 20000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 1 (depth=2, last=\"Withdraw 2\")",
+		  "id": "deposit_1_v8_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "withdrawal_2_d1:0",
+				  "sequence": {
+					  "height": 6
+				  }
+			  },
+			  {
+				  "title": "Deposit",
+				  "amount_sat": 10123
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 90000
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 2 (depth=2, last=\"Withdraw 2\")",
+		  "id": "deposit_2_v8_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "withdrawal_2_d1:0",
+				  "sequence": {
+					  "height": 6
+				  }
+			  },
+			  {
+				  "title": "Deposit",
+				  "amount_sat": 20123
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 100000
+			  }
+		  ]
+		},
+
+		{
+		  "title": "Withdraw 1 (depth=2, last=\"Deposit 1\")",
+		  "id": "withdraw_1_v11_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "deposit_1_d1:0"
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 100000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 10000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Withdraw 2 (depth=2, last=\"Deposit 1\")",
+		  "id": "withdrawal_2_v11_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "deposit_1_d1:0"
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 90000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 20000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 1 (depth=2, last=\"Deposit 1\")",
+		  "id": "deposit_1_v11_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "deposit_1_d1:0"
+			  },
+			  {
+				  "title": "Deposit",
+				  "amount_sat": 10123
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 120000
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 2 (depth=2, last=\"Deposit 1\")",
+		  "id": "deposit_2_v11_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "deposit_1_d1:0"
+			  },
+			  {
+				  "title": "Deposit",
+				  "amount_sat": 20123
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 130000
+			  }
+		  ]
+		},
+
+		{
+		  "title": "Withdraw 1 (depth=2, last=\"Deposit 2\")",
+		  "id": "withdraw_1_v12_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "deposit_2_d1:0"
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 110000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 10000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Withdraw 2 (depth=2, last=\"Deposit 2\")",
+		  "id": "withdrawal_2_v12_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "deposit_2_d1:0"
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 100000
+			  },
+			  {
+				  "title": "Withdrawal Output",
+				  "amount_sat": 20000
+			  },
+			  {
+				  "title": "Anchor",
+				  "amount_sat": 0
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 1 (depth=2, last=\"Deposit 2\")",
+		  "id": "deposit_1_v12_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "deposit_2_d1:0"
+			  },
+			  {
+				  "title": "Deposit",
+				  "amount_sat": 10123
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 130000
+			  }
+		  ]
+		},
+		{
+		  "title": "Deposit 2 (depth=2, last=\"Deposit 2\")",
+		  "id": "deposit_2_v12_d2",
+		  "status": "candidate",
+		  "inputs": [
+			  {
+				  "spends": "deposit_2_d1:0"
+			  },
+			  {
+				  "title": "Deposit",
+				  "amount_sat": 20123
+			  }
+		  ],
+		  "outputs": [
+			  {
+				  "title": "Vault Output",
+				  "amount_sat": 140000
+			  }
+		  ]
+		}
+	]
+}

@@ -1,0 +1,123 @@
+{
+  "transactions": [
+    {
+	  "title": "Withdraw",
+      "id": "withdrawal",
+      "status": "candidate",
+      "outputs": [
+		  {
+			  "title": "Vault Output",
+			  "amount_sat": 90000
+		  },
+		  {
+			  "title": "Withdrawal Output",
+			  "amount_sat": 10000
+		  },
+		  {
+			  "title": "Anchor",
+			  "amount_sat": 0
+		  }
+	  ]
+    },
+    {
+	  "title": "Spend Withdrawal",
+      "id": "withdrawal_1_spend",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "withdrawal:1",
+			  "sequence": {
+				  "height": 3
+			  },
+			  "satisfaction": {
+				  "description": "and(hot(pk), csv(delay))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Spend",
+			  "amount_sat": 10000
+		  }
+	  ]
+    },
+    {
+	  "title": "Recover Vault",
+      "id": "recover_vault",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "withdrawal:0",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Recover Vault\"))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Recovery Output",
+			  "description": "Only spendable by cold key",
+			  "amount_sat": 90000
+		  },
+		  {
+			  "title": "Anchor",
+			  "amount_sat": 0
+		  }
+	  ]
+    },
+    {
+	  "title": "Recover Withdrawal",
+      "id": "recover_withdrawal",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "withdrawal:1",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Recover Withdrawal\"))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Recovery Output",
+			  "description": "Only spendable by cold key",
+			  "amount_sat": 10000
+		  },
+		  {
+			  "title": "Anchor",
+			  "amount_sat": 0
+		  }
+	  ]
+    },
+    {
+	  "title": "Recover Both",
+      "id": "recovery",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "withdrawal:0",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Recover Both\"))"
+			  }
+		  },
+		  {
+			  "spends": "withdrawal:1",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Recover Both\"))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Recovery Output",
+			  "description": "Only spendable by cold key",
+			  "amount_sat": 100000
+		  },
+		  {
+			  "title": "Anchor",
+			  "amount_sat": 0
+		  }
+	  ]
+    }
+  ]
+}

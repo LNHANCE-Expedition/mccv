@@ -1,0 +1,22 @@
+svg {
+	font-family: sans-serif;
+}
+
+.title {
+	font-weight: 800;
+}
+
+.transaction rect {
+	rx: 6px;
+	ry: 6px;
+	stroke-width: 2px;
+}
+
+.spend {
+	stroke-width: 2px;
+}
+
+.spend.candidate {
+	stroke: grey;
+	stroke-dasharray: 8px, 8px;
+}
