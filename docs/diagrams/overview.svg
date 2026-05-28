@@ -1,0 +1,313 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="1372" height="2164">
+  <metadata>txviz (docs/diagrams/overview.json)</metadata>
+  <style>svg {
+	font-family: sans-serif;
+}
+
+.title {
+	font-weight: 800;
+}
+
+.transaction rect {
+	rx: 6px;
+	ry: 6px;
+	stroke-width: 2px;
+}
+
+.spend {
+	stroke-width: 2px;
+}
+
+.spend.candidate {
+	stroke: grey;
+	stroke-dasharray: 8px, 8px;
+}
+</style>
+  <rect class="diagram-background" x="0" y="0" width="1372" height="2164" fill="#FFFFFF"/>
+  <g class="spend-links" fill="none" stroke="black" stroke-width="1">
+    <path class="spend-link spend" d="M 436 396 C 577.6 396, 766.4 44, 908 44"/>
+    <path class="spend-link spend" d="M 436 396 C 577.6 396, 766.4 196, 908 196"/>
+    <path class="spend-link spend" d="M 436 396 C 577.6 396, 766.4 348, 908 348"/>
+    <path class="spend-link spend" d="M 436 396 C 577.6 396, 766.4 464, 908 464"/>
+    <path class="spend-link spend" d="M 436 900 C 577.6 900, 766.4 580, 908 580"/>
+    <path class="spend-link spend" d="M 436 900 C 577.6 900, 766.4 732, 908 732"/>
+    <path class="spend-link spend" d="M 436 900 C 577.6 900, 766.4 884, 908 884"/>
+    <path class="spend-link spend" d="M 436 900 C 577.6 900, 766.4 1000, 908 1000"/>
+    <path class="spend-link spend" d="M 404 1460 C 555.2 1460, 756.8 1116, 908 1116"/>
+    <path class="spend-link spend" d="M 404 1460 C 555.2 1460, 756.8 1268, 908 1268"/>
+    <path class="spend-link spend" d="M 404 1460 C 555.2 1460, 756.8 1420, 908 1420"/>
+    <path class="spend-link spend" d="M 404 1460 C 555.2 1460, 756.8 1536, 908 1536"/>
+    <path class="spend-link spend" d="M 404 1948 C 555.2 1948, 756.8 1652, 908 1652"/>
+    <path class="spend-link spend" d="M 404 1948 C 555.2 1948, 756.8 1804, 908 1804"/>
+    <path class="spend-link spend" d="M 404 1948 C 555.2 1948, 756.8 1956, 908 1956"/>
+    <path class="spend-link spend" d="M 404 1948 C 555.2 1948, 756.8 2072, 908 2072"/>
+  </g>
+  <g class="spend-descriptions">
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_1_d1">
+    <g class="tx-title"><text class="title" x="20" y="366" fill="black">Withdraw 1 (depth=1)</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="20" y="372" width="432" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="196" y="382" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="401" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="428" y="401" text-anchor="end" fill="black">90000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="196" y="418" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="437" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="428" y="437" text-anchor="end" fill="black">10000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="196" y="454" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="473" text-anchor="start" fill="black">Anchor</text><text class="amount" x="428" y="473" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_2_d1">
+    <g class="tx-title"><text class="title" x="20" y="870" fill="black">Withdraw 2 (depth=1)</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="20" y="876" width="432" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="196" y="886" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="905" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="428" y="905" text-anchor="end" fill="black">80000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="196" y="922" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="941" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="428" y="941" text-anchor="end" fill="black">20000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="196" y="958" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="977" text-anchor="start" fill="black">Anchor</text><text class="amount" x="428" y="977" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_1_d1">
+    <g class="tx-title"><text class="title" x="20" y="1430" fill="black">Deposit 1 (depth=1)</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="20" y="1436" width="400" height="48" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="196" y="1446" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="1465" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="396" y="1465" text-anchor="end" fill="black">110000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_2_d1">
+    <g class="tx-title"><text class="title" x="20" y="1918" fill="black">Deposit 2 (depth=1)</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="20" y="1924" width="400" height="48" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="196" y="1934" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="1953" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="396" y="1953" text-anchor="end" fill="black">120000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_1_v9_d2">
+    <g class="tx-title"><text class="title" x="892" y="14" fill="black">Withdraw 1 (depth=2, last="Withdraw 1")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="20" width="440" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="30" width="120" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="916" y="49" text-anchor="start" fill="black">after 3 blocks</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1076" y="30" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="49" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="49" text-anchor="end" fill="black">80000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="1076" y="66" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="85" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="1308" y="85" text-anchor="end" fill="black">10000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1076" y="102" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="121" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1308" y="121" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_2_v9_d1">
+    <g class="tx-title"><text class="title" x="892" y="166" fill="black">Withdraw 2 (depth=2, last="Withdraw 1")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="172" width="440" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="182" width="120" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="916" y="201" text-anchor="start" fill="black">after 3 blocks</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1076" y="182" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="201" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="201" text-anchor="end" fill="black">70000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="1076" y="218" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="237" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="1308" y="237" text-anchor="end" fill="black">20000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1076" y="254" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="273" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1308" y="273" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_1_v9_d2">
+    <g class="tx-title"><text class="title" x="892" y="318" fill="black">Deposit 1 (depth=2, last="Withdraw 1")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="324" width="440" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="334" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="916" y="353" text-anchor="start" fill="black">after 3 blocks</text></g>
+        <g class="input" data-title="Deposit"><rect x="908" y="370" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text x="916" y="389" text-anchor="start" fill="black">Deposit</text><text class="amount" x="1060" y="389" text-anchor="end" fill="black">10123 sat</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1108" y="334" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1116" y="353" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="353" text-anchor="end" fill="black">100000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_2_v9_d2">
+    <g class="tx-title"><text class="title" x="892" y="434" fill="black">Deposit 2 (depth=2, last="Withdraw 1")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="440" width="440" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="450" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="916" y="469" text-anchor="start" fill="black">after 3 blocks</text></g>
+        <g class="input" data-title="Deposit"><rect x="908" y="486" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text x="916" y="505" text-anchor="start" fill="black">Deposit</text><text class="amount" x="1060" y="505" text-anchor="end" fill="black">20123 sat</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1108" y="450" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1116" y="469" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="469" text-anchor="end" fill="black">110000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_1_v8_d1">
+    <g class="tx-title"><text class="title" x="892" y="550" fill="black">Withdraw 1 (depth=2, last="Withdraw 2")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="556" width="440" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="566" width="120" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="916" y="585" text-anchor="start" fill="black">after 6 blocks</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1076" y="566" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="585" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="585" text-anchor="end" fill="black">70000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="1076" y="602" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="621" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="1308" y="621" text-anchor="end" fill="black">10000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1076" y="638" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="657" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1308" y="657" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_2_v8_d1">
+    <g class="tx-title"><text class="title" x="892" y="702" fill="black">Withdraw 2 (depth=2, last="Withdraw 2")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="708" width="440" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="718" width="120" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="916" y="737" text-anchor="start" fill="black">after 6 blocks</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1076" y="718" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="737" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="737" text-anchor="end" fill="black">60000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="1076" y="754" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="773" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="1308" y="773" text-anchor="end" fill="black">20000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1076" y="790" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1084" y="809" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1308" y="809" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_1_v8_d2">
+    <g class="tx-title"><text class="title" x="892" y="854" fill="black">Deposit 1 (depth=2, last="Withdraw 2")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="860" width="432" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="870" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="916" y="889" text-anchor="start" fill="black">after 6 blocks</text></g>
+        <g class="input" data-title="Deposit"><rect x="908" y="906" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text x="916" y="925" text-anchor="start" fill="black">Deposit</text><text class="amount" x="1060" y="925" text-anchor="end" fill="black">10123 sat</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1108" y="870" width="200" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1116" y="889" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1300" y="889" text-anchor="end" fill="black">90000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_2_v8_d2">
+    <g class="tx-title"><text class="title" x="892" y="970" fill="black">Deposit 2 (depth=2, last="Withdraw 2")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="976" width="440" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="986" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="916" y="1005" text-anchor="start" fill="black">after 6 blocks</text></g>
+        <g class="input" data-title="Deposit"><rect x="908" y="1022" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text x="916" y="1041" text-anchor="start" fill="black">Deposit</text><text class="amount" x="1060" y="1041" text-anchor="end" fill="black">20123 sat</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1108" y="986" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1116" y="1005" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="1005" text-anchor="end" fill="black">100000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdraw_1_v11_d2">
+    <g class="tx-title"><text class="title" x="892" y="1086" fill="black">Withdraw 1 (depth=2, last="Deposit 1")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="1092" width="432" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="1102" width="120" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1068" y="1102" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1121" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1300" y="1121" text-anchor="end" fill="black">100000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="1068" y="1138" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1157" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="1300" y="1157" text-anchor="end" fill="black">10000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1068" y="1174" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1193" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1300" y="1193" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_2_v11_d2">
+    <g class="tx-title"><text class="title" x="892" y="1238" fill="black">Withdraw 2 (depth=2, last="Deposit 1")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="1244" width="432" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="1254" width="120" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1068" y="1254" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1273" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1300" y="1273" text-anchor="end" fill="black">90000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="1068" y="1290" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1309" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="1300" y="1309" text-anchor="end" fill="black">20000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1068" y="1326" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1345" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1300" y="1345" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_1_v11_d2">
+    <g class="tx-title"><text class="title" x="892" y="1390" fill="black">Deposit 1 (depth=2, last="Deposit 1")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="1396" width="440" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="1406" width="160" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+        <g class="input" data-title="Deposit"><rect x="908" y="1442" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text x="916" y="1461" text-anchor="start" fill="black">Deposit</text><text class="amount" x="1060" y="1461" text-anchor="end" fill="black">10123 sat</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1108" y="1406" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1116" y="1425" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="1425" text-anchor="end" fill="black">120000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_2_v11_d2">
+    <g class="tx-title"><text class="title" x="892" y="1506" fill="black">Deposit 2 (depth=2, last="Deposit 1")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="1512" width="440" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="1522" width="160" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+        <g class="input" data-title="Deposit"><rect x="908" y="1558" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text x="916" y="1577" text-anchor="start" fill="black">Deposit</text><text class="amount" x="1060" y="1577" text-anchor="end" fill="black">20123 sat</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1108" y="1522" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1116" y="1541" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="1541" text-anchor="end" fill="black">130000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdraw_1_v12_d2">
+    <g class="tx-title"><text class="title" x="892" y="1622" fill="black">Withdraw 1 (depth=2, last="Deposit 2")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="1628" width="432" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="1638" width="120" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1068" y="1638" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1657" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1300" y="1657" text-anchor="end" fill="black">110000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="1068" y="1674" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1693" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="1300" y="1693" text-anchor="end" fill="black">10000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1068" y="1710" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1729" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1300" y="1729" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_2_v12_d2">
+    <g class="tx-title"><text class="title" x="892" y="1774" fill="black">Withdraw 2 (depth=2, last="Deposit 2")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="1780" width="432" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="1790" width="120" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1068" y="1790" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1809" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1300" y="1809" text-anchor="end" fill="black">100000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="1068" y="1826" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1845" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="1300" y="1845" text-anchor="end" fill="black">20000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1068" y="1862" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1076" y="1881" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1300" y="1881" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_1_v12_d2">
+    <g class="tx-title"><text class="title" x="892" y="1926" fill="black">Deposit 1 (depth=2, last="Deposit 2")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="1932" width="440" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="1942" width="160" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+        <g class="input" data-title="Deposit"><rect x="908" y="1978" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text x="916" y="1997" text-anchor="start" fill="black">Deposit</text><text class="amount" x="1060" y="1997" text-anchor="end" fill="black">10123 sat</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1108" y="1942" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1116" y="1961" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="1961" text-anchor="end" fill="black">130000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-deposit_2_v12_d2">
+    <g class="tx-title"><text class="title" x="892" y="2042" fill="black">Deposit 2 (depth=2, last="Deposit 2")</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="892" y="2048" width="440" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="908" y="2058" width="160" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+        <g class="input" data-title="Deposit"><rect x="908" y="2094" width="160" height="28" fill="none" stroke="black" stroke-width="1"/><text x="916" y="2113" text-anchor="start" fill="black">Deposit</text><text class="amount" x="1060" y="2113" text-anchor="end" fill="black">20123 sat</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="1108" y="2058" width="208" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1116" y="2077" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="1308" y="2077" text-anchor="end" fill="black">140000 sat</text></g>
+      </g>
+    </g>
+  </g>
+
+</svg>

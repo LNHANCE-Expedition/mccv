@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="1348" height="448">
+  <metadata>txviz (docs/diagrams/withdrawal.json)</metadata>
+  <style>svg {
+	font-family: sans-serif;
+}
+
+.title {
+	font-weight: 800;
+}
+
+.transaction rect {
+	rx: 6px;
+	ry: 6px;
+	stroke-width: 2px;
+}
+
+.spend {
+	stroke-width: 2px;
+}
+
+.spend.candidate {
+	stroke: grey;
+	stroke-dasharray: 8px, 8px;
+}
+</style>
+  <rect class="diagram-background" x="0" y="0" width="1348" height="448" fill="#FFFFFF"/>
+  <g class="spend-links" fill="none" stroke="black" stroke-width="1">
+    <path class="spend-link spend" d="M 436 312 C 462.4 312, 497.6 178, 524 178"/>
+    <path class="spend-link spend" d="M 812 178 C 838.4 178, 873.6 44, 900 44"/>
+    <path class="spend-link spend" d="M 436 312 C 463.6 312, 500.4 236, 528 236"/>
+    <path class="spend-link spend" d="M 808 236 C 835.6 236, 872.4 160, 900 160"/>
+    <path class="spend-link spend" d="M 436 348 C 463.6 348, 500.4 272, 528 272"/>
+    <path class="spend-link spend" d="M 808 272 C 835.6 272, 872.4 196, 900 196"/>
+    <path class="spend-link spend" d="M 436 348 C 474.4 348, 525.6 312, 564 312"/>
+    <path class="spend-link spend" d="M 772 312 C 810.4 312, 861.6 276, 900 276"/>
+    <path class="spend-link spend" d="M 436 348 C 473.2 348, 522.8 352, 560 352"/>
+    <path class="spend-link spend" d="M 776 352 C 813.2 352, 862.8 356, 900 356"/>
+  </g>
+  <g class="spend-descriptions">
+    <g class="spend-description"><rect x="524" y="164" width="288" height="28" fill="white" stroke="black" stroke-width="1"/><text x="668" y="183" text-anchor="middle" fill="black">and(pk(hot), ctv("Recover Vault"))</text></g>
+    <g class="spend-description"><rect x="528" y="222" width="280" height="28" fill="white" stroke="black" stroke-width="1"/><text x="668" y="241" text-anchor="middle" fill="black">and(pk(hot), ctv("Recover Both"))</text></g>
+    <g class="spend-description"><rect x="528" y="258" width="280" height="28" fill="white" stroke="black" stroke-width="1"/><text x="668" y="277" text-anchor="middle" fill="black">and(pk(hot), ctv("Recover Both"))</text></g>
+    <g class="spend-description"><rect x="564" y="298" width="208" height="28" fill="white" stroke="black" stroke-width="1"/><text x="668" y="317" text-anchor="middle" fill="black">and(hot(pk), csv(delay))</text></g>
+    <g class="spend-description"><rect x="560" y="330" width="216" height="44" fill="white" stroke="black" stroke-width="1"/><text x="668" y="349" text-anchor="middle" fill="black">and(pk(hot), ctv("Recover</text><text x="668" y="365" text-anchor="middle" fill="black">Withdrawal"))</text></g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal">
+    <g class="tx-title"><text class="title" x="20" y="282" fill="black">Withdraw</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="20" y="288" width="432" height="120" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Vault Output"><rect x="196" y="298" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="317" text-anchor="start" fill="black">Vault Output</text><text class="amount" x="428" y="317" text-anchor="end" fill="black">90000 sat</text></g>
+        <g class="output" data-title="Withdrawal Output"><rect x="196" y="334" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="353" text-anchor="start" fill="black">Withdrawal Output</text><text class="amount" x="428" y="353" text-anchor="end" fill="black">10000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="196" y="370" width="240" height="28" fill="none" stroke="black" stroke-width="1"/><text x="204" y="389" text-anchor="start" fill="black">Anchor</text><text class="amount" x="428" y="389" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-recover_vault">
+    <g class="tx-title"><text class="title" x="884" y="14" fill="black">Recover Vault</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="884" y="20" width="416" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="900" y="30" width="120" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Recovery Output"><rect x="1060" y="30" width="224" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1068" y="49" text-anchor="start" fill="black">Recovery Output</text><text class="amount" x="1276" y="49" text-anchor="end" fill="black">90000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1060" y="66" width="224" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1068" y="85" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1276" y="85" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-recovery">
+    <g class="tx-title"><text class="title" x="884" y="130" fill="black">Recover Both</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="884" y="136" width="424" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="900" y="146" width="120" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+        <g class="input" data-title=""><rect x="900" y="182" width="120" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Recovery Output"><rect x="1060" y="146" width="232" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1068" y="165" text-anchor="start" fill="black">Recovery Output</text><text class="amount" x="1284" y="165" text-anchor="end" fill="black">100000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1060" y="182" width="232" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1068" y="201" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1284" y="201" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-withdrawal_1_spend">
+    <g class="tx-title"><text class="title" x="884" y="246" fill="black">Spend Withdrawal</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="884" y="252" width="360" height="48" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="900" y="262" width="120" height="28" fill="none" stroke="black" stroke-width="1"/><text class="sequence" x="908" y="281" text-anchor="start" fill="black">after 3 blocks</text></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Spend"><rect x="1084" y="262" width="144" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1092" y="281" text-anchor="start" fill="black">Spend</text><text class="amount" x="1220" y="281" text-anchor="end" fill="black">10000 sat</text></g>
+      </g>
+    </g>
+  </g>
+  <g class="tx transaction" id="tx-recover_withdrawal">
+    <g class="tx-title"><text class="title" x="884" y="326" fill="black">Recover Withdrawal</text></g>
+    <g class="tx-body">
+      <rect class="tx-box" x="884" y="332" width="416" height="84" fill="none" stroke="black" stroke-width="1"/>
+      <g class="tx-inputs">
+        <g class="input" data-title=""><rect x="900" y="342" width="120" height="28" fill="none" stroke="black" stroke-width="1"/></g>
+      </g>
+      <g class="tx-outputs">
+        <g class="output" data-title="Recovery Output"><rect x="1060" y="342" width="224" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1068" y="361" text-anchor="start" fill="black">Recovery Output</text><text class="amount" x="1276" y="361" text-anchor="end" fill="black">10000 sat</text></g>
+        <g class="output" data-title="Anchor"><rect x="1060" y="378" width="224" height="28" fill="none" stroke="black" stroke-width="1"/><text x="1068" y="397" text-anchor="start" fill="black">Anchor</text><text class="amount" x="1276" y="397" text-anchor="end" fill="black">0 sat</text></g>
+      </g>
+    </g>
+  </g>
+
+</svg>

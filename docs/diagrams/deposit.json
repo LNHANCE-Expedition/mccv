@@ -1,0 +1,169 @@
+{
+  "transactions": [
+    {
+	  "title": "Deposit Shape 1",
+      "id": "deposit_shape_1",
+      "status": "candidate",
+      "outputs": [
+		  {
+			  "title": "Deposit Output",
+			  "amount_sat": 10123
+		  }
+	  ]
+    },
+    {
+	  "title": "Deposit Shape 2",
+      "id": "deposit_shape_2",
+      "status": "candidate",
+      "outputs": [
+		  {
+			  "title": "Deposit Output",
+			  "amount_sat": 20123
+		  }
+	  ]
+    },
+    {
+      "id": "deposit",
+	  "title": "Initial Deposit",
+	  "description": "",
+      "outputs": [
+		  {
+			  "title": "Vault Output",
+			  "amount_sat": 100000
+		  }
+	  ]
+    },
+    {
+	  "title": "Withdraw 1",
+      "id": "withdrawal_1",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "deposit:0",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Withdraw 1\"))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Vault Output",
+			  "amount_sat": 90000
+		  },
+		  {
+			  "title": "Withdrawal Output",
+			  "amount_sat": 10000
+		  },
+		  {
+			  "title": "Anchor",
+			  "amount_sat": 0
+		  }
+	  ]
+    },
+    {
+	  "title": "Withdraw 2",
+      "id": "withdrawal_2",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "deposit:0",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Withdraw 2\"))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Vault Output",
+			  "amount_sat": 80000
+		  },
+		  {
+			  "title": "Withdrawal Output",
+			  "amount_sat": 20000
+		  },
+		  {
+			  "title": "Anchor",
+			  "amount_sat": 0
+		  }
+	  ]
+    },
+    {
+	  "title": "Deposit 1",
+      "id": "deposit_1",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "deposit:0",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Deposit 1\"))"
+			  }
+		  },
+		  {
+			  "title": "Deposit Funds",
+			  "spends": "deposit_shape_1:0",
+			  "amount_sat": 10000,
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Deposit 1\"))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Vault Output",
+			  "amount_sat": 110000
+		  }
+	  ]
+    },
+    {
+	  "title": "Deposit 2",
+      "id": "deposit_2",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "deposit:0",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Deposit 2\"))"
+			  }
+		  },
+		  {
+			  "title": "Deposit Funds",
+			  "spends": "deposit_shape_2:0",
+			  "amount_sat": 20000,
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Deposit 2\"))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Vault Output",
+			  "amount_sat": 120000
+		  }
+	  ]
+    },
+    {
+	  "title": "Recovery",
+      "id": "recovery",
+      "status": "candidate",
+      "inputs": [
+		  {
+			  "spends": "deposit:0",
+			  "satisfaction": {
+				  "description": "and(pk(hot), ctv(\"Recovery\"))"
+			  }
+		  }
+	  ],
+      "outputs": [
+		  {
+			  "title": "Recovery Output",
+			  "description": "Only spendable by cold key",
+			  "amount_sat": 100000
+		  },
+		  {
+			  "title": "Anchor",
+			  "amount_sat": 0
+		  }
+	  ]
+    }
+  ]
+}
