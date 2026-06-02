@@ -222,7 +222,9 @@ impl VaultAmount {
         self.0.checked_sub(other.0).map(VaultAmount::new)
     }
 
-    pub(crate) fn to_unscaled_amount(&self) -> u32 {
+    /// Returns the number of increments this vault amount represents
+    /// Requires a vault scale to convert to a Bitcoin quanitity
+    pub fn to_unscaled_amount(&self) -> u32 {
         self.0
     }
 

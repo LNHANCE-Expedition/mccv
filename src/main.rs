@@ -59,8 +59,10 @@ use rusqlite::{
     params,
 };
 
+use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "bitcoind")]
 use mccv::{
@@ -144,6 +146,12 @@ struct GenerateArg {
     max_withdrawal: u32,
     #[arg(long = "max-depth", help = "The maximum number of vault operations that can be performed before moving it into a new vault")]
     max_depth: u32,
+
+    #[arg(short, long, help = "A path to a csv file to record benchmark information to")]
+    benchmark: Option<PathBuf>,
+
+    #[arg(long, help = "Do not persist vault in any way")]
+    benchmark_only: bool,
 
     #[command(flatten)]
     rpc_conf: RpcConf,
@@ -309,14 +317,29 @@ struct CommandLine {
 
 impl CommandLine {
     fn open_storage(&self) -> Storage {
+        let memory_only = match self.command {
+            Command::Generate(ref arg) => arg.benchmark_only,
+            _ => false,
+        };
+
         let vault_storage = SqliteStorage::from_connection(
-                Connection::open(&self.vault_path)
-                    .expect("open vault database")
+                if !memory_only {
+                    Connection::open(&self.vault_path)
+                        .expect("open vault database")
+                } else {
+                    Connection::open_in_memory()
+                        .expect("open vault database in memory")
+                }
             )
             .expect("open vault");
 
-        let wallet_storage = Connection::open(&self.wallet_path)
-            .expect("open wallet");
+        let wallet_storage = if !memory_only {
+            Connection::open(&self.wallet_path)
+                .expect("open wallet")
+        } else {
+            Connection::open_in_memory()
+                .expect("open wallet database in memory")
+        };
 
         Storage {
             wallet_storage,
@@ -779,10 +802,55 @@ fn main() {
                 args.network,
             );
 
-            println!("Generating Vault (this may take a while)...");
-
             // Sync vault
+            println!("Generating Vault (this may take a while)...");
+            let benchmark_timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("after epoch shouldn't fail")
+                .as_secs_f64();
+            let generate_start = Instant::now();
             let context = vault.vault.context(&secp);
+            let duration = Instant::now().duration_since(generate_start);
+            println!("... took {}s", duration.as_secs_f64());
+
+            if let Some(ref benchmark_csv_path) = generate_arg.benchmark {
+                let mut benchmark_csv = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(true)
+                    .open(benchmark_csv_path)
+                    .expect("open benchmark file");
+
+                let metadata = benchmark_csv
+                    .metadata()
+                    .expect("get benchmark file metadata");
+
+                if metadata.len() == 0 {
+                    writeln!(
+                            benchmark_csv,
+                            concat!(
+                                "Benchmark Timestamp,",
+                                "Time,",
+                                "Max,",
+                                "Maximum Deposit,Maximum Withdrawal,Maximum Depth",
+                            )
+                        )
+                        .expect("write benchmark results");
+                }
+
+                let parameters = vault.vault.parameters();
+
+                writeln!(benchmark_csv,
+                         "{benchmark_timestamp},{},{},{},{},{}",
+                         duration.as_secs_f64(),
+                         parameters.max.to_unscaled_amount(),
+                         parameters.max_deposit_per_step.to_unscaled_amount(),
+                         parameters.max_withdrawal_per_step.to_unscaled_amount(),
+                         parameters.max_depth,
+
+                     )
+                    .expect("write benchmark results");
+            }
 
             let genesis_block = bitcoin::blockdata::constants::genesis_block(args.network);
 
