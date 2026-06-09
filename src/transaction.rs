@@ -355,6 +355,17 @@ pub enum KeypairDerivationError {
     NoSigningInfo,
 }
 
+impl std::fmt::Display for KeypairDerivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongKey => write!(f, "wrong key"),
+            Self::DerivationDepthExceeded => write!(f, "maximum derivation depth exceeded"),
+            Self::NoSigningInfo => write!(f, "no signing info available"),
+        }
+    }
+}
+
+impl std::error::Error for KeypairDerivationError { }
 
 #[derive(Clone, Debug)]
 pub enum DepositSignError {
@@ -1566,9 +1577,35 @@ pub enum ToSignedRecoveryTransactionError {
     MissingSignature,
 }
 
+impl std::fmt::Display for ToSignedRecoveryTransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSignature => write!(f, "signature missing"),
+        }
+    }
+}
+
+impl std::error::Error for ToSignedRecoveryTransactionError { }
+
 #[derive(Clone,Debug)]
 pub enum SignRecoveryError {
     SignError(sighash::TaprootError),
+}
+
+impl std::fmt::Display for SignRecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SignError(e) => write!(f, "error signing recovery transaction: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SignRecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SignError(ref e) => Some(e),
+        }
+    }
 }
 
 impl TailDepositTransactionTemplate {

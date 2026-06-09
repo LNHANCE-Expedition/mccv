@@ -25,3 +25,11 @@ pub use wallet::{
     VaultDepositor,
     VaultWithdrawer,
 };
+
+pub mod error {
+    pub use crate::transaction::{
+        KeypairDerivationError,
+        SignRecoveryError,
+        ToSignedRecoveryTransactionError,
+    };
+}
