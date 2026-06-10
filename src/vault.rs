@@ -512,12 +512,26 @@ impl VaultParameters {
     // Hot key can trigger recovery. This is fine because if the hot key is compromised your (hot) funds
     // are already at risk, being griefed by your funds being sent to the cold key is the
     // best case scenario.
-    fn recovery_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
+    /// Generate the key that may sweep funds to recovery at a certain depth
+    /// This is currently the same as the hot key at the same depth.
+    fn trigger_recovery_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
         let path = [
             ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
         ];
 
         let xpub = self.hot_xpub.derive_pub(secp, &path)
+            .expect("recovery key derivation");
+
+        xpub.to_x_only_pub()
+    }
+
+    /// Generate the key that may access funds swept to recovery at a certain depth
+    pub(crate) fn recovery_key<C: Verification>(&self, secp: &Secp256k1<C>, depth: Depth) -> XOnlyPublicKey {
+        let path = [
+            ChildNumber::from_normal_idx(depth as u32).expect("sane child number")
+        ];
+
+        let xpub = self.cold_xpub.derive_pub(secp, &path)
             .expect("recovery key derivation");
 
         xpub.to_x_only_pub()
@@ -565,9 +579,9 @@ impl VaultParameters {
             input.push(dummy_input(relative::LockTime::ZERO));
         }
 
-        let key = self.recovery_key(secp, depth);
+        let recovery_key = self.recovery_key(secp, depth);
 
-        let script_pubkey = ScriptBuf::new_p2tr(secp, key, None);
+        let script_pubkey = ScriptBuf::new_p2tr(secp, recovery_key, None);
 
         let recovered_value = vault_amount + withdrawal_amount;
 
@@ -637,7 +651,7 @@ impl VaultParameters {
             //eprintln!("counter = {counter}");
         }
 
-        let recovery_key = self.recovery_key(secp, depth);
+        let trigger_recovery_key = self.trigger_recovery_key(secp, depth);
 
         // FIXME: we really need to get consistent about depth + 1 vs depth
         // I think the rule should be, that the transaction spending a txout with depth n is
@@ -660,7 +674,7 @@ impl VaultParameters {
                         withdrawal_amount: VaultAmount::ZERO,
                     },
                     SignedNextStateTemplate {
-                        pubkey: recovery_key,
+                        pubkey: trigger_recovery_key,
                         next_state_template_hash: get_default_template(&recovery_tx, 0),
                     },
                 )
@@ -681,7 +695,7 @@ impl VaultParameters {
                         withdrawal_amount,
                     },
                     SignedNextStateTemplate {
-                        pubkey: recovery_key,
+                        pubkey: trigger_recovery_key,
                         next_state_template_hash: get_default_template(&recovery_tx, 0),
                     },
                 )

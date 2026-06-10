@@ -768,7 +768,7 @@ impl WithdrawalOutputSpendInfo {
     pub fn from_parameters<C: Verification>(secp: &Secp256k1<C>, parameters: &VaultParameters, depth: Depth, timelock: relative::LockTime, vault_amount: VaultAmount, withdrawal_amount: VaultAmount) -> Self {
         let master_pubkey = parameters.master_key(secp, depth);
         let hot_pubkey = parameters.hot_key(secp, depth);
-        let recovery_key = parameters.hot_key(secp, depth + 1);
+        let recovery_key = parameters.recovery_key(secp, depth + 1);
 
         let timelocked_withdrawal_script = TimelockedSpend { pubkey: hot_pubkey, timelock };
         let timelocked_withdrawal_script = timelocked_withdrawal_script.to_scriptbuf();
