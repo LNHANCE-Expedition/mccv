@@ -49,12 +49,42 @@ use crate::vault::{
 
 use std::str::FromStr;
 
+#[derive(PartialEq, Eq)]
+enum VaultVersion {
+    /// created by <= v0.1.0. Has recovery key bug
+    None,
+    /// Not subject to recovery bug
+    RecoveryBugFixed,
+}
+
+impl FromSql for VaultVersion {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value.as_i64_or_null()? {
+            None => Ok(VaultVersion::None),
+            Some(0) => Ok(VaultVersion::RecoveryBugFixed),
+            Some(x) => Err(rusqlite::types::FromSqlError::OutOfRange(x)),
+        }
+    }
+}
+
+impl ToSql for VaultVersion {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        match self {
+            VaultVersion::None =>
+                Ok(ToSqlOutput::Owned(rusqlite::types::Value::Null)),
+            VaultVersion::RecoveryBugFixed =>
+                Ok(ToSqlOutput::Owned(rusqlite::types::Value::Integer(0i64))),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub static VAULT_VERSION_ID: i64 = 1;
 
 #[allow(dead_code)]
-pub static VAULT_MIGRATIONS: [(u32, &str); 1] = [
+pub static VAULT_MIGRATIONS: [(u32, &str); 2] = [
     (1, include_str!("../data/migrations/0001-initial.sql")),
+    (2, include_str!("../data/migrations/0002-vault-version.sql")),
 ];
 
 pub struct SqliteStorage {
@@ -353,6 +383,7 @@ pub enum LoadError {
     AddBlockError(AddBlockError),
     AddTransactionError(AddTransactionError<ConnectVaultTransactionError>),
     IgnoredContractTransaction(Txid),
+    VaultMustBeRecreated,
 }
 
 impl From<rusqlite::Error> for LoadError {
@@ -381,6 +412,8 @@ impl std::fmt::Display for LoadError {
             LoadError::AddBlockError(e) => write!(f, "Error adding block: {e}"),
             LoadError::AddTransactionError(e) => write!(f, "Error adding transaction {e}"),
             LoadError::IgnoredContractTransaction(txid) => write!(f, "Transaction {txid} was erroneously ignored"),
+            LoadError::VaultMustBeRecreated => write!(f, "This vault is insecure and incompatible with this version of MCCV because it was created by v0.1.0; it must be drained using v0.1.0 and recreated with a later version."),
+
         }
     }
 }
@@ -588,8 +621,9 @@ impl Storage for SqliteStorage {
                     delay_per_increment,
                     max_withdrawal_per_step,
                     max_deposit_per_step,
-                    max_depth
-                ) values ( ?, ?, ?, ?, ?, ?, ?, ?, ? )
+                    max_depth,
+                    version
+                ) values ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )
             "#)?;
 
             insert_vault.execute(
@@ -603,6 +637,7 @@ impl Storage for SqliteStorage {
                     parameters.max_withdrawal_per_step,
                     parameters.max_deposit_per_step,
                     parameters.max_depth,
+                    VaultVersion::RecoveryBugFixed,
                 ]
             )?;
 
@@ -640,12 +675,13 @@ impl Storage for SqliteStorage {
                 delay_per_increment,
                 max_withdrawal_per_step,
                 max_deposit_per_step,
-                max_depth
+                max_depth,
+                version
             from mccv_vault
             where id = ?
         "#)?;
 
-        let parameters = parameters.query_map(
+        let (vault_version, parameters) = parameters.query_map(
             params![ id ],
             |row| {
                 let scale: VaultScale = row.get::<_, u32>(0)
@@ -657,24 +693,32 @@ impl Storage for SqliteStorage {
                 let max_withdrawal_per_step: VaultAmount = row.get(5)?;
                 let max_deposit_per_step: VaultAmount = row.get(6)?;
                 let max_depth: u32 = row.get(7)?;
+                let vault_version: VaultVersion = row.get(8)?;
 
                 Ok(
-                    VaultParameters {
-                        scale,
-                        max,
-                        cold_xpub,
-                        hot_xpub,
-                        delay_per_increment,
-                        max_withdrawal_per_step,
-                        max_deposit_per_step,
-                        max_depth,
-                    }
+                    (
+                        vault_version,
+                        VaultParameters {
+                            scale,
+                            max,
+                            cold_xpub,
+                            hot_xpub,
+                            delay_per_increment,
+                            max_withdrawal_per_step,
+                            max_deposit_per_step,
+                            max_depth,
+                        }
+                    )
                 )
             },
         )?
         .next()
         .ok_or(LoadError::NotFound)?
         .map_err(LoadError::SqliteError)?;
+
+        if vault_version != VaultVersion::RecoveryBugFixed {
+            return Err(LoadError::VaultMustBeRecreated);
+        }
 
         let mut query_blocks = transaction.prepare(r#"
             with
