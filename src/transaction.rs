@@ -1,7 +1,10 @@
+use bitcoin::Opcode;
+use bitcoin::script::{PushBytes, PushBytesError};
 use bitcoin::{
     Amount,
     blockdata::locktime::relative,
     blockdata::locktime::absolute,
+    consensus::Encodable,
     FeeRate,
     OutPoint,
     psbt,
@@ -20,6 +23,8 @@ use bitcoin::{
     Weight,
     Witness,
 };
+
+use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHDATA1};
 
 use bitcoin::bip32::{
     Xpriv,
@@ -43,6 +48,7 @@ use bitcoin::opcodes::all::{
 };
 
 use bitcoin::secp256k1::{
+    constants::SCHNORR_PUBLIC_KEY_SIZE,
     constants::SCHNORR_SIGNATURE_SIZE,
     Keypair,
     Message,
@@ -83,6 +89,200 @@ use crate::wallet::{
     SEGWIT_MARKER_WEIGHT,
     UnderpayingParentTransaction,
 };
+
+pub trait Input: Encodable { }
+
+pub trait InputSequence {
+    fn sequence(&self) -> Sequence;
+}
+
+pub trait InputWitness {
+    fn witness(&self) -> Witness;
+}
+
+pub trait InputScriptSig {
+    fn script_sig(&self) -> ScriptBuf;
+}
+
+pub trait InputPrevout {
+    fn prevout(&self) -> OutPoint;
+}
+
+pub trait OutputAmount {
+    fn amount(&self) -> Amount;
+}
+
+pub trait ScriptFragment {
+    const STATIC_LEN: Option<usize>;
+
+    fn encoded_len(&self) -> Option<usize> { Self::LEN }
+
+    fn encode<E: ScriptEncoder>(&self, encoder: &mut E) -> Result<(), E::Error>;
+}
+
+pub trait OutputScriptPubkey: ScriptFragment { }
+
+/// Represents a Pay to Taproot output with a given output public key
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct PayToTaproot(bitcoin::key::TweakedPublicKey);
+
+impl PayToTaproot {
+    pub fn new_p2tr<C: Verification>(
+        secp: &Secp256k1<C>,
+        internal_key: XOnlyPublicKey,
+        merkle_root: Option<TapNodeHash>,
+    ) -> Self {
+        let (output_key, _) = internal_key.tap_tweak(secp, merkle_root);
+
+        Self::new_p2tr_tweaked(output_key)
+    }
+
+    pub fn new_p2tr_tweaked(output_key: TweakedPublicKey) -> Self {
+        Self(output_key)
+    }
+}
+
+const WITNESS_V1_LEN: u8 = 1;
+const WITNESS_V1: u8 = OP_PUSHNUM_1.to_u8();
+const PUSHBYTES_32_LEN: u8 = 1;
+const TAPROOT_SCRIPT_PUBKEY_LEN: u8 = WITNESS_V1_LEN + PUSHBYTES_32_LEN + SCHNORR_PUBLIC_KEY_SIZE as u8;
+
+pub trait ScriptEncoder {
+    type Error;
+
+    fn push_opcode(&mut self, opcode: Opcode) -> Result<usize, Self::Error>;
+
+    fn push_slice(&mut self, bytes: &[u8]) -> Result<usize, Self::Error>;
+}
+
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum ScriptWriteError {
+    Io(bitcoin::io::Error),
+    PushSliceLength(usize),
+    Length(),
+}
+
+impl From<bitcoin::io::Error> for ScriptWriteError {
+    fn from(e: bitcoin::io::Error) -> Self { Self::Io(e) }
+}
+
+pub struct ScriptWrite<W> {
+    writer: W,
+    committed_length: usize,
+    current_length: usize,
+}
+
+impl<W> for ScriptWrite<W> {
+    fn new(writer: W, committed_length: usize) -> Self {
+        Self {
+            writer,
+            committed_length,
+            current_length: 0,
+        }
+    }
+
+    fn write_opcode(&mut self, opcode: Opcode) -> Result<usize, bitcoin::io::Error> {
+        self.writer.write(&[opcode.to_u8()])
+    }
+}
+
+impl<W: bitcoin::io::Write> ScriptEncoder for ScriptWrite<W> {
+    type Error = bitcoin::io::Error;
+
+    fn push_opcode(mut self, opcode: Opcode) -> Result<Self, Self::Error> {
+        self.current_length += self.writer.write(&[opcode.to_u8()])?;
+
+        Ok(self)
+    }
+
+    fn push_slice(mut self, bytes: &[u8]) -> Result<Self, Self::Error> {
+        match data.len() as u64 {
+            n if n < OP_PUSHDATA1 as u64 => {
+                self.current_length += self.writer.write(&[n as u8])?;
+            }
+            n if n < 0x100 => {
+                self.current_length += self.write_opcode(OP_PUSHDATA1)?;
+                self.current_length += self.writer.write(&[n as u8])?;
+            }
+            n if n < 0x10000 => {
+                self.current_length += self.write_opcode(OP_PUSHDATA2)?;
+                self.current_length += self.writer.write(&n.to_le_bytes()[..2])?;
+            }
+            n if n < 0x100000000 => {
+                self.current_length += self.write_opcode(OP_PUSHDATA4)?;
+                self.current_length += self.writer.write(&n.to_le_bytes()[..4])?;
+            }
+            n => { return Err(ScriptWriteError::PushSliceLength(n)); }
+        }
+
+        self.current_length += self.writer.write(data)?;
+
+        Ok(self)
+    }
+}
+
+// FIXME: name
+pub enum BuildScriptBufError {
+    PushLengthError(PushBytesError),
+}
+
+impl ScriptEncoder for ScriptBuf {
+    type Error = BuildScriptBufError;
+
+    fn push_opcode(mut self, opcode: Opcode) -> Result<Self, Self::Error> {
+        ScriptBuf::push_opcode(&mut self, opcode);
+
+        Ok(self)
+    }
+
+    fn push_slice(mut self, bytes: &[u8]) -> Result<Self, Self::Error> {
+        let push_bytes = PushBytes::try_from(bytes)
+            .map_err(|e| BuildScriptBufError::PushLengthError(bytes.len()))?;
+
+        ScriptBuf::push_slice(&mut self, push_bytes);
+
+        Ok(self)
+    }
+}
+
+// XXX: Maybe ScriptBuilder should be ScriptSink or something
+
+impl Encodable for PayToTaproot {
+    fn consensus_encode<W: bitcoin::io::Write + ?Sized>(&self, writer: &mut W) -> Result<usize, bitcoin::io::Error> {
+        const TAPROOT_SCRIPT_PREFIX: [u8; 3] = [
+            TAPROOT_SCRIPT_PUBKEY_LEN,
+            WITNESS_V1,
+            OP_PUSHBYTES_32.to_u8(),
+        ];
+
+        let mut len = 0;
+
+        len += writer.write(&TAPROOT_SCRIPT_PREFIX)?;
+        len += writer.write(&self.0.serialize())?;
+
+        Ok(len)
+    }
+}
+
+impl From<PayToTaproot> for ScriptBuf {
+    fn from(p2tr: PayToTaproot) -> Self {
+        ScriptBuf::new_p2tr_tweaked(p2tr.0)
+    }
+}
+
+pub trait TransactionInputs {
+    type Input: Input;
+
+    fn get(&self) -> Option<Self::Input>;
+}
+
+pub trait TransactionOutputBuilder {
+    type Error;
+}
+
+pub trait TransactionBuilder {
+
+}
 
 pub fn builder_with_capacity(size: usize) -> Builder {
     Builder::from(Vec::with_capacity(size))
