@@ -1205,6 +1205,10 @@ impl WithdrawalSpendTransaction {
     }
 
     pub fn spend<C: Signing + Verification>(&self, secp: &Secp256k1<C>, keypair: &Keypair, script_pubkey: ScriptBuf, min_fee: Amount, min_fee_rate: FeeRate) -> Result<Transaction, WithdrawalSpendError> {
+        if min_fee > self.withdrawal_output.value {
+            return Err(WithdrawalSpendError::FeeTooLarge);
+        }
+
         let mut transaction = Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
@@ -1218,15 +1222,13 @@ impl WithdrawalSpendTransaction {
             ],
             output: vec![
                 TxOut {
-                    value: self.withdrawal_output.value - min_fee,
+                    // The output value will be modified with the fee
+                    // later.
+                    value: self.withdrawal_output.value,
                     script_pubkey,
                 }
             ],
         };
-
-        if min_fee > self.withdrawal_output.value {
-            return Err(WithdrawalSpendError::FeeTooLarge);
-        }
 
         let tap_leaf_hash = TapLeafHash::from_script(
             self
@@ -1270,7 +1272,9 @@ impl WithdrawalSpendTransaction {
 
         let fee = std::cmp::max(min_fee, fee);
 
-        transaction.output[0].value = self.withdrawal_output.value - fee;
+        transaction.output[0].value = self.withdrawal_output.value
+            .checked_sub(fee)
+            .ok_or(WithdrawalSpendError::FeeTooLarge)?;
 
         let prevout_txouts = vec![
             &self.withdrawal_output,
