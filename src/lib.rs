@@ -2,6 +2,7 @@ pub mod bip119;
 pub mod cache;
 mod chain;
 mod migrate;
+pub mod script;
 pub mod storage;
 mod transaction;
 pub mod vault;
