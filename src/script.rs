@@ -1,14 +1,31 @@
-use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHDATA1};
+use bitcoin::consensus::Encodable;
+use bitcoin::taproot::LeafVersion;
+use bitcoin::{Opcode, TapLeafHash, TapNodeHash, ScriptBuf, VarInt};
+use bitcoin::key::{TweakedPublicKey, TapTweak};
+use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4};
 use bitcoin::opcodes::{OP_0, OP_TRUE};
 
 use bitcoin::script::PushBytes;
+use bitcoin::io::{Error, Write};
+use bitcoin::secp256k1::{Secp256k1, Verification, XOnlyPublicKey};
+
+use bitcoin::hashes::Hash;
 
 pub trait ScriptFragment {
     const STATIC_LEN: Option<usize>;
 
-    fn encoded_len(&self) -> Option<usize> { Self::LEN }
+    fn encoded_len(&self) -> Option<usize> { Self::STATIC_LEN }
 
     fn encode<E: ScriptEncoder>(&self, encoder: &mut E) -> Result<(), E::Error>;
+
+    fn to_scriptbuf(&self) -> ScriptBuf {
+        let mut buf = Vec::new();
+
+        self.encode(&mut buf)
+            .expect("write to Vec buffer won't fail");
+
+        ScriptBuf::from_bytes(buf)
+    }
 }
 
 pub trait ToScriptFragment {
@@ -33,9 +50,107 @@ impl ScriptFragment for Opcode {
     const STATIC_LEN: Option<usize> = Some(1);
 
     fn encode<E: ScriptEncoder>(&self, encoder: &mut E) -> Result<(), E::Error> {
-        encoder.push_opcode(self)?;
+        encoder.push_opcode(*self)?;
 
         Ok(())
+    }
+}
+
+pub trait ScriptEncoder {
+    type Error;
+
+    fn push_opcode(&mut self, opcode: Opcode) -> Result<(), Self::Error>;
+
+    fn push_int(&mut self, value: i64) -> Result<(), Self::Error> {
+        if value == -1 || ((1 <= value && value <= 16)) {
+            let opcode = Opcode::from((value - 1 + OP_TRUE.to_u8() as i64) as u8);
+            self.push_opcode(opcode)?;
+        } else if value == 0 {
+            self.push_opcode(OP_0)?;
+        } else {
+            let mut int_bytes = [0u8; 8];
+            let mut len = 0;
+            let negative = value < 0;
+
+            let mut magnitude = value.unsigned_abs();
+            
+            while magnitude > 0xFF {
+                int_bytes[len] = magnitude as u8;
+                len += 1;
+                magnitude = magnitude >> 8;
+            }
+
+            if (magnitude & 0x80) != 0 {
+                int_bytes[len] = magnitude as u8;
+                len += 1;
+                int_bytes[len] = if negative { 0x80 } else { 0 };
+            } else {
+                if negative {
+                    int_bytes[len] = magnitude as u8 | 0x80;
+                } else {
+                    int_bytes[len] = magnitude as u8 | 0x00;
+                }
+            }
+
+            self.push_slice(&<&PushBytes>::from(&int_bytes)[..len])?;
+        }
+
+        Ok(())
+    }
+
+    fn push_slice<T: AsRef<PushBytes>>(&mut self, data: T) -> Result<(), Self::Error>;
+}
+
+impl<W: Write> ScriptEncoder for W {
+    type Error = Error;
+
+    fn push_opcode(&mut self, opcode: Opcode) -> Result<(), Self::Error> {
+        self.write(&[opcode.to_u8()])?;
+
+        Ok(())
+    }
+
+    fn push_slice<T: AsRef<PushBytes>>(&mut self, data: T) -> Result<(), Self::Error> {
+        match data.as_ref().len() as u64 {
+            n if n < OP_PUSHDATA1.to_u8() as u64 => {
+                self.write(&[n as u8])?;
+            }
+            n if n < 0x100 => {
+                self.write(&[OP_PUSHDATA1.to_u8()])?;
+                self.write(&[n as u8])?;
+            }
+            n if n < 0x10000 => {
+                self.write(&[OP_PUSHDATA2.to_u8()])?;
+                self.write(&n.to_le_bytes()[..2])?;
+            }
+            n if n < 0x100000000 => {
+                self.write(&[OP_PUSHDATA4.to_u8()])?;
+                self.write(&n.to_le_bytes()[..4])?;
+            }
+            _ => panic!("oversized push (over 4 Billion Bytes)"),
+        }
+
+        self.write(data.as_ref().as_bytes())?;
+
+        Ok(())
+    }
+}
+
+pub struct PushXOnlyPublicKey(XOnlyPublicKey);
+
+impl ScriptFragment for PushXOnlyPublicKey {
+    const STATIC_LEN: Option<usize> = Some(33);
+
+    fn encode<E: ScriptEncoder>(&self, encoder: &mut E) -> Result<(), E::Error> {
+        encoder.push_slice(self.0.serialize())
+    }
+}
+
+impl ToScriptFragment for PayToTaproot {
+    type Fragment = (Opcode, PushXOnlyPublicKey);
+
+    fn to_fragment(&self) -> Self::Fragment {
+        (OP_PUSHNUM_1, PushXOnlyPublicKey(self.0.to_x_only_public_key()))
     }
 }
 
@@ -56,156 +171,6 @@ impl PayToTaproot {
 
     pub fn new_p2tr_tweaked(output_key: TweakedPublicKey) -> Self {
         Self(output_key)
-    }
-}
-
-const WITNESS_V1_LEN: u8 = 1;
-const WITNESS_V1: u8 = OP_PUSHNUM_1.to_u8();
-const PUSHBYTES_32_LEN: u8 = 1;
-const TAPROOT_SCRIPT_PUBKEY_LEN: u8 = WITNESS_V1_LEN + PUSHBYTES_32_LEN + SCHNORR_PUBLIC_KEY_SIZE as u8;
-
-pub trait ScriptEncoder {
-    type Error;
-
-    fn push_opcode(&mut self, opcode: Opcode) -> Result<usize, Self::Error>;
-
-    fn push_int(mut self, value: i64) -> Result<Self, Self::Error> {
-        if value == -1 || ((1 <= value && value <= 16)) {
-            let opcode = Opcode::from((value - 1 + OP_TRUE.to_u8() as i64) as u8);
-            self.push_opcode(opcode)
-        } else if value == 0 {
-            self.push_opcode(OP_0)
-        } else {
-            let mut int_bytes = [0u8; 8];
-            let mut len = 0;
-            let negative = value < 0;
-
-            let magnitude = value.unsigned_abs();
-            
-            while magnitude > 0xFF {
-                int_bytes[len] = magnitude as u8;
-                len += 1;
-                magnitude = magnitude >> 8;
-            }
-
-            if abs & 0x80 != 0 {
-                int_bytes[len] = abs as u8;
-                len += 1;
-                int_bytes[len] = if negative { 0x80 } else { 0 };
-            } else {
-                if negative {
-                    int_bytes[len] = magnitude as u8 | 0x80;
-                } else {
-                    int_bytes[len] = magnitude as u8 | 0x00;
-                }
-            }
-        }
-    }
-
-    fn push_slice(&mut self, bytes: &[u8]) -> Result<usize, Self::Error>;
-}
-
-#[derive(Clone,Copy,Debug,Eq,PartialEq)]
-pub enum PushSliceError<E> {
-    Error(E),
-    InvalidSliceLength(usize),
-}
-
-pub struct ScriptWrite<W> {
-    writer: W,
-    committed_length: usize,
-    current_length: usize,
-}
-
-impl<W> for ScriptWrite<W> {
-    fn new(writer: W, committed_length: usize) -> Self {
-        Self {
-            writer,
-            committed_length,
-            current_length: 0,
-        }
-    }
-
-    fn write_opcode(&mut self, opcode: Opcode) -> Result<usize, bitcoin::io::Error> {
-        self.writer.write(&[opcode.to_u8()])
-    }
-}
-
-impl<W: bitcoin::io::Write> ScriptEncoder for ScriptWrite<W> {
-    type Error = bitcoin::io::Error;
-
-    fn push_opcode(mut self, opcode: Opcode) -> Result<Self, Self::Error> {
-        self.current_length += self.writer.write(&[opcode.to_u8()])?;
-
-        Ok(self)
-    }
-
-    fn push_slice(mut self, bytes: &[u8]) -> Result<Self, Self::Error> {
-        match data.len() as u64 {
-            n if n < OP_PUSHDATA1 as u64 => {
-                self.current_length += self.writer.write(&[n as u8])?;
-            }
-            n if n < 0x100 => {
-                self.current_length += self.write_opcode(OP_PUSHDATA1)?;
-                self.current_length += self.writer.write(&[n as u8])?;
-            }
-            n if n < 0x10000 => {
-                self.current_length += self.write_opcode(OP_PUSHDATA2)?;
-                self.current_length += self.writer.write(&n.to_le_bytes()[..2])?;
-            }
-            n if n < 0x100000000 => {
-                self.current_length += self.write_opcode(OP_PUSHDATA4)?;
-                self.current_length += self.writer.write(&n.to_le_bytes()[..4])?;
-            }
-            n => { return Err(ScriptWriteError::PushSliceLength(n)); }
-        }
-
-        self.current_length += self.writer.write(data)?;
-
-        Ok(self)
-    }
-}
-
-// FIXME: name
-pub enum BuildScriptBufError {
-    PushLengthError(PushBytesError),
-}
-
-impl ScriptEncoder for ScriptBuf {
-    type Error = BuildScriptBufError;
-
-    fn push_opcode(mut self, opcode: Opcode) -> Result<Self, Self::Error> {
-        ScriptBuf::push_opcode(&mut self, opcode);
-
-        Ok(self)
-    }
-
-    fn push_slice(mut self, bytes: &[u8]) -> Result<Self, Self::Error> {
-        let push_bytes = PushBytes::try_from(bytes)
-            .map_err(|e| BuildScriptBufError::PushLengthError(bytes.len()))?;
-
-        ScriptBuf::push_slice(&mut self, push_bytes);
-
-        Ok(self)
-    }
-}
-
-// XXX: Maybe ScriptBuilder should be ScriptSink or something
-
-impl Encodable for PayToTaproot {
-    fn consensus_encode<W: bitcoin::io::Write + ?Sized>(&self, writer: &mut W) -> Result<usize, bitcoin::io::Error> {
-        const TAPROOT_SCRIPT_PREFIX: [u8; 3] = [
-            TAPROOT_SCRIPT_PUBKEY_LEN,
-            WITNESS_V1,
-            OP_PUSHBYTES_32.to_u8(),
-        ];
-
-        let mut len = 0;
-
-        len += writer.write(&TAPROOT_SCRIPT_PREFIX)?;
-        len += writer.write(&self.0.serialize())?;
-
-        Ok(len)
     }
 }
 
@@ -233,16 +198,16 @@ macro_rules! impl_tuple_fragment {
             };
 
             fn encoded_len(&self) -> Option<usize> {
-                let len = 0;
+                let len = 0usize;
 
                 $(
-                    let len = len.checked_add(self.$idx.encoded_len()?)?;
+                    let len = len + self.$idx.encoded_len()?;
                 )+
 
                 Some(len)
             }
 
-            fn encode<E: ScriptEncoder>(&self, encoder: &mut E) -> Result<(), E::Error> {
+            fn encode<Encoder: ScriptEncoder>(&self, encoder: &mut Encoder) -> Result<(), Encoder::Error> {
                 $(
                     self.$idx.encode(encoder)?;
                 )+
@@ -253,3 +218,60 @@ macro_rules! impl_tuple_fragment {
     };
 }
 
+fn write_fragment<W: Write, F: ScriptFragment>(writer: &mut W, fragment: &F) -> Result<(), Error> {
+    const EXPECT_SCRIPT_LEN: &str = "script length fits in u64";
+    if let Some(len) = fragment.encoded_len() {
+        let len: u64 = len.try_into()
+            .expect(EXPECT_SCRIPT_LEN);
+        let len = VarInt(len);
+
+        len.consensus_encode(writer)?;
+
+        fragment.encode(writer)
+    } else {
+        let mut buf: Vec<u8> = Vec::new();
+
+        fragment.encode(&mut buf)?;
+
+        let len: u64 = buf.len().try_into()
+            .expect(EXPECT_SCRIPT_LEN);
+
+        let len = VarInt(len);
+
+        len.consensus_encode(writer)?;
+
+        writer.write(buf.as_ref())?;
+
+        Ok(())
+    }
+}
+
+pub trait TapScript {
+    fn to_tapleaf(&self, leaf_version: LeafVersion) -> TapLeafHash;
+}
+
+impl<F: ScriptFragment> TapScript for F {
+    fn to_tapleaf(&self, leaf_version: LeafVersion) -> TapLeafHash
+    {
+        let mut engine = TapLeafHash::engine();
+
+        leaf_version
+            .to_consensus()
+            .consensus_encode(&mut engine)
+            .expect("hash engines don't error");
+
+        write_fragment(&mut engine, self)
+            .expect("script write wrapping hash engines don't error");
+
+        TapLeafHash::from_engine(engine)
+    }
+}
+
+impl_tuple_fragment!(A: 0);
+impl_tuple_fragment!(A: 0, B: 1);
+impl_tuple_fragment!(A: 0, B: 1, C: 2);
+impl_tuple_fragment!(A: 0, B: 1, C: 2, D: 3);
+impl_tuple_fragment!(A: 0, B: 1, C: 2, D: 3, E: 4);
+impl_tuple_fragment!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5);
+impl_tuple_fragment!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6);
+impl_tuple_fragment!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7);
