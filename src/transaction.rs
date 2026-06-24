@@ -1,5 +1,4 @@
 use bitcoin::Opcode;
-use bitcoin::opcodes::{OP_0, OP_TRUE};
 use bitcoin::script::{PushBytes, PushBytesError};
 use bitcoin::{
     Amount,
@@ -43,7 +42,7 @@ use bitcoin::opcodes::all::{
     OP_CSV,
     OP_CHECKSIG,
     OP_NOP4 as OP_CHECKTEMPLATEVERIFY,
-    OP_DROP,
+    OP_DROP, OP_CHECKSIGVERIFY,
 };
 
 use bitcoin::secp256k1::{
@@ -70,6 +69,7 @@ use bitcoin::taproot::{
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::iter;
+use std::ops::Index;
 
 use crate::bip119::get_default_template;
 
@@ -84,12 +84,18 @@ use crate::vault::{
     VaultTransition,
 };
 
+use crate::script::{
+    PushHash,
+    PushXOnlyPublicKey,
+    ToScriptFragment,
+    TapScript,
+    ScriptPubkey, ScriptSig,
+};
+
 use crate::wallet::{
     SEGWIT_MARKER_WEIGHT,
     UnderpayingParentTransaction,
 };
-
-pub trait Input: Encodable { }
 
 pub trait InputSequence {
     fn sequence(&self) -> Sequence;
@@ -100,29 +106,55 @@ pub trait InputWitness {
 }
 
 pub trait InputScriptSig {
-    fn script_sig(&self) -> ScriptBuf;
+    type ScriptSig: ScriptSig;
+
+    fn script_sig(&self) -> Self::ScriptSig;
 }
 
 pub trait InputPrevout {
     fn prevout(&self) -> OutPoint;
 }
 
-pub trait OutputAmount {
+pub trait Output {
+    type ScriptPubkey: ScriptPubkey;
+
     fn amount(&self) -> Amount;
+    fn script_pubkey(&self) -> Self::ScriptPubkey;
 }
 
-pub trait TransactionInputs {
-    type Input: Input;
+pub trait OutputMetadata {
+    type Metadata;
 
-    fn get(&self) -> Option<Self::Input>;
+    // XXX: Still unsure if this should be an option, keeping it for now so transactions can be
+    // described which have outputs not part of the protocol, and all consuming code can understand
+    // that.
+    fn metadata(&self) -> Option<Self::Metadata>;
 }
 
-pub trait TransactionOutputBuilder {
-    type Error;
+pub trait TransactionDescription {
+    type Input;
+    type Output;
+
+    type Inputs: AsRef<[Self::Input]>;
+    type Outputs: AsRef<[Self::Output]>;
+
+    fn version(&self) -> transaction::Version;
+    fn locktime(&self) -> absolute::LockTime;
+
+    fn inputs(&self) -> Self::Inputs;
+    fn outputs(&self) -> Self::Outputs;
 }
 
-pub trait TransactionBuilder {
+struct DummyInput(Sequence);
 
+impl InputScriptSig for DummyInput {
+    type ScriptSig = ();
+
+    fn script_sig(&self) -> Self::ScriptSig { () }
+}
+
+impl InputSequence for DummyInput {
+    fn sequence(&self) -> Sequence { self.0 }
 }
 
 pub fn builder_with_capacity(size: usize) -> Builder {
@@ -1698,6 +1730,19 @@ pub struct VaultOutputSpendInfo {
 pub struct SignedNextStateTemplate {
     pub pubkey: XOnlyPublicKey,
     pub next_state_template_hash: sha256::Hash,
+}
+
+impl ToScriptFragment for SignedNextStateTemplate {
+    type Fragment = (PushXOnlyPublicKey, Opcode, PushHash<sha256::Hash>, Opcode);
+
+    fn to_fragment(&self) -> Self::Fragment {
+        (
+            PushXOnlyPublicKey(self.pubkey),
+            OP_CHECKSIGVERIFY,
+            PushHash(self.next_state_template_hash),
+            OP_CHECKTEMPLATEVERIFY,
+        )
+    }
 }
 
 impl SignedNextStateTemplate {

@@ -19,7 +19,7 @@ pub trait ScriptFragment {
     fn encode<E: ScriptEncoder>(&self, encoder: &mut E) -> Result<(), E::Error>;
 
     fn to_scriptbuf(&self) -> ScriptBuf {
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(self.encoded_len().unwrap_or(0));
 
         self.encode(&mut buf)
             .expect("write to Vec buffer won't fail");
@@ -27,6 +27,9 @@ pub trait ScriptFragment {
         ScriptBuf::from_bytes(buf)
     }
 }
+
+pub trait ScriptPubkey: ScriptFragment { }
+pub trait ScriptSig: ScriptFragment { }
 
 pub trait ToScriptFragment {
     type Fragment: ScriptFragment;
@@ -44,6 +47,16 @@ impl<T: ToScriptFragment> ScriptFragment for T {
     }
 }
 
+impl ScriptFragment for () {
+    const STATIC_LEN: Option<usize> = Some(0);
+
+    fn encode<E: ScriptEncoder>(&self, _encoder: &mut E) -> Result<(), E::Error> {
+        Ok(())
+    }
+}
+
+impl ScriptSig for () { }
+
 pub trait OutputScriptPubkey: ScriptFragment { }
 
 impl ScriptFragment for Opcode {
@@ -60,6 +73,7 @@ pub trait ScriptEncoder {
     type Error;
 
     fn push_opcode(&mut self, opcode: Opcode) -> Result<(), Self::Error>;
+    fn push_slice<T: AsRef<PushBytes>>(&mut self, data: T) -> Result<(), Self::Error>;
 
     fn push_int(&mut self, value: i64) -> Result<(), Self::Error> {
         if value == -1 || ((1 <= value && value <= 16)) {
@@ -97,8 +111,6 @@ pub trait ScriptEncoder {
 
         Ok(())
     }
-
-    fn push_slice<T: AsRef<PushBytes>>(&mut self, data: T) -> Result<(), Self::Error>;
 }
 
 impl<W: Write> ScriptEncoder for W {
@@ -136,13 +148,23 @@ impl<W: Write> ScriptEncoder for W {
     }
 }
 
-pub struct PushXOnlyPublicKey(XOnlyPublicKey);
+pub struct PushXOnlyPublicKey(pub XOnlyPublicKey);
 
 impl ScriptFragment for PushXOnlyPublicKey {
     const STATIC_LEN: Option<usize> = Some(33);
 
     fn encode<E: ScriptEncoder>(&self, encoder: &mut E) -> Result<(), E::Error> {
         encoder.push_slice(self.0.serialize())
+    }
+}
+
+pub struct PushHash<H>(pub H);
+
+impl<H: Hash<Bytes = [u8; 32]>> ScriptFragment for PushHash<H> {
+    const STATIC_LEN: Option<usize> = Some(33);
+
+    fn encode<E: ScriptEncoder>(&self, encoder: &mut E) -> Result<(), E::Error> {
+        encoder.push_slice(&self.0.to_byte_array())
     }
 }
 
@@ -153,6 +175,8 @@ impl ToScriptFragment for PayToTaproot {
         (OP_PUSHNUM_1, PushXOnlyPublicKey(self.0.to_x_only_public_key()))
     }
 }
+
+impl ScriptPubkey for PayToTaproot { }
 
 /// Represents a Pay to Taproot output with a given output public key
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -265,6 +289,94 @@ impl<F: ScriptFragment> TapScript for F {
 
         TapLeafHash::from_engine(engine)
     }
+}
+
+/// Store information about taproot leaf node.
+#[derive(Debug, Clone, Hash)]
+pub struct LeafNode<M> {
+    leaf: TapLeafHash,
+
+    metadata: M,
+    /// The merkle proof (hashing partners) to get this node.
+    merkle_branch: Vec<TapNodeHash>,
+}
+
+impl<M> PartialEq for LeafNode<M> {
+    fn eq(&self, other: &Self) -> bool {
+        self.leaf.eq(&other.leaf)
+    }
+}
+
+impl<M> Eq for LeafNode<M> { }
+
+impl<M> PartialOrd for LeafNode<M> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(Ord::cmp(self, other))
+    }
+}
+
+impl<M> Ord for LeafNode<M> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.leaf.cmp(&other.leaf)
+    }
+}
+
+#[derive(Debug, Clone, PartialOrd, Ord)]
+struct NodeInfo<M> {
+    hash: TapNodeHash,
+
+    leaves: Vec<LeafNode<M>>,
+}
+
+/// Creates a new [`TaprootSpendInfo`] from a list of scripts (with default script version) and
+/// weights of satisfaction for that script.
+///
+/// The weights represent the probability of each branch being taken. If probabilities/weights
+/// for each condition are known, constructing the tree as a Huffman Tree is the optimal way to
+/// minimize average case satisfaction cost. This function takes as input an iterator of
+/// `tuple(u32, ScriptBuf)` where `u32` represents the satisfaction weights of the branch. For
+/// example, [(3, S1), (2, S2), (5, S3)] would construct a [`TapTree`] that has optimal
+/// satisfaction weight when probability for S1 is 30%, S2 is 20% and S3 is 50%.
+///
+/// # Errors:
+///
+/// - When the optimal Huffman Tree has a depth more than 128.
+/// - If the provided list of script weights is empty.
+///
+/// # Edge Cases:
+///
+/// If the script weight calculations overflow, a sub-optimal tree may be generated. This should
+/// not happen unless you are dealing with billions of branches with weights close to 2^32.
+///
+/// [`TapTree`]: crate::taproot::TapTree
+pub fn with_huffman_tree<I, M, S>(script_weights: I) -> Result<Self, TaprootBuilderError>
+where
+    I: IntoIterator<Item = (u32, M, S)>,
+{
+    let mut node_weights = BinaryHeap::<(Reverse<u32>, NodeInfo)>::new();
+    for (p, leaf) in script_weights {
+        node_weights
+            .push((Reverse(p), NodeInfo::new_leaf_with_ver(leaf, LeafVersion::TapScript)));
+    }
+    if node_weights.is_empty() {
+        return Err(TaprootBuilderError::EmptyTree);
+    }
+    while node_weights.len() > 1 {
+        // Combine the last two elements and insert a new node
+        let (p1, s1) = node_weights.pop().expect("len must be at least two");
+        let (p2, s2) = node_weights.pop().expect("len must be at least two");
+        // Insert the sum of first two in the tree as a new node
+        // N.B.: p1 + p2 can not practically saturate as you would need to have 2**32 max u32s
+        // from the input to overflow. However, saturating is a reasonable behavior here as
+        // huffman tree construction would treat all such elements as "very likely".
+        let p = Reverse(p1.0.saturating_add(p2.0));
+        node_weights.push((p, NodeInfo::combine(s1, s2)?));
+    }
+    // Every iteration of the loop reduces the node_weights.len() by exactly 1
+    // Therefore, the loop will eventually terminate with exactly 1 element
+    debug_assert_eq!(node_weights.len(), 1);
+    let node = node_weights.pop().expect("huffman tree algorithm is broken").1;
+    Ok(TaprootBuilder { branch: vec![Some(node)] })
 }
 
 impl_tuple_fragment!(A: 0);
