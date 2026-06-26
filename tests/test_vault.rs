@@ -453,6 +453,46 @@ fn test_deposit_withdraw() {
         balance_after_update.confirmed,
     );
 
+    // ============ Deposit After Withdrawal ============
+
+    let deposit_amount_raw = VAULT_SCALE * 2;
+    total_deposit += deposit_amount_raw;
+    let (deposit_amount, remainder) = vault.to_vault_amount(deposit_amount_raw).expect("valid vault amount");
+    assert_eq!(remainder, Amount::ZERO);
+
+    let mut deposit_transaction = vault.create_deposit(&secp, deposit_amount).unwrap();
+
+    let mut shape_psbt = wallet.create_shape(&secp, &mut deposit_transaction, FeeRate::BROADCAST_MIN)
+        .expect("create shape success");
+
+    let sign_success = wallet.sign(&mut shape_psbt, SignOptions::default())
+        .expect("sign success");
+
+    assert!(sign_success);
+
+    let shape_transaction = shape_psbt.extract_tx()
+        .expect("tx complete");
+
+    let hot_keypair = deposit_transaction.hot_keypair(&secp, &hot_xpriv)
+        .expect("successful key derivation");
+
+    let _ = deposit_transaction.sign_vault_input(&secp, &hot_keypair)
+        .expect("sign success");
+
+    let transmittable_deposit_transaction = deposit_transaction.to_signed_transaction().expect("deposit transaction signed");
+
+    nodes.client(0)
+        .submit_package(&[&shape_transaction, &transmittable_deposit_transaction])
+        .expect("package submission success");
+
+    generate_to_wallet(&mut wallet, nodes.client(0), 6);
+
+    update_vault(&secp, &mut vault, &context, &mut changelog, &mut vault_block_emitter);
+
+    assert_eq!(vault.confirmed_balance(None), total_deposit);
+
+    // ============ Unauthorized Withdrawal ============
+
     let withdrawal_amount_raw = VAULT_SCALE * 1;
     total_deposit -= withdrawal_amount_raw;
     let (withdrawal_amount, remainder) = vault.to_vault_amount(withdrawal_amount_raw).expect("valid vault amount");
@@ -461,7 +501,6 @@ fn test_deposit_withdraw() {
     nodes.sync_nodes(&[0, 1]);
     nodes.disconnect_nodes(0, 1);
 
-    // ============ Unauthorized Withdrawal ============
     let mut withdrawal_transaction = vault.create_withdrawal(&secp, withdrawal_amount)
         .expect("can withdraw");
 
