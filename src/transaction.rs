@@ -258,8 +258,8 @@ impl DepositTransactionTemplateCommon {
 
     fn to_transaction(self, vault_input: Option<TxIn>) -> Transaction {
         let input = iter::empty()
-            .chain(Some(dummy_input(relative::LockTime::ZERO)))
             .chain(vault_input)
+            .chain(Some(dummy_input(relative::LockTime::ZERO)))
             .collect();
 
         Transaction {
