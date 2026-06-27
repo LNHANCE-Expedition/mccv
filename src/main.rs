@@ -455,6 +455,12 @@ impl VaultSystem {
 
         let (vault, vault_changelog) = storage.vault_storage
             .load(secp, vault_id)
+            .inspect_err(|e| {
+                match e {
+                    mccv::vault_storage::LoadError::VaultMustBeRecreated => eprintln!("E: {e}"),
+                    _ => {}
+                }
+            })
             .expect("load vault");
 
         Self {
