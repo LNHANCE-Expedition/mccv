@@ -1091,12 +1091,25 @@ pub enum RecoveryCreationError {
     VaultClosed,
     MaxDepth,
     HistoryError,
-    UnrecoverableLastTransaction,
     // Generalization of VaultUnopened, VaultClosed, and UnrecoverableLastTransaction
     // Might eliminate those variants, I don't think we care about the reason that much, plus it's
     // harder to distinguish in the new model
     NoOutputs,
 }
+
+impl std::fmt::Display for RecoveryCreationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VaultUnopened => write!(f, "vault not open"),
+            Self::VaultClosed => write!(f, "vault closed"),
+            Self::MaxDepth => write!(f, "maximum vault depth exceeded"),
+            Self::HistoryError => write!(f, "vault history broken"),
+            Self::NoOutputs => write!(f, "no outputs to recover"),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryCreationError { }
 
 /// A local identifier for a vault
 pub type VaultId = i64;
@@ -1250,6 +1263,8 @@ impl ContractTransaction for VaultStateTransaction {
 }
 
 impl VaultStateTransaction {
+    pub fn txid(&self) -> Txid { self.txid }
+    pub fn as_transaction(&self) -> &Transaction { &self.transaction }
     fn input_utxos(&self) -> impl Iterator<Item = (u32, VaultStateUtxo)> {
         match &self.metadata {
             VaultTransactionMetadata::InitialDeposit(_) => {
@@ -1484,6 +1499,90 @@ impl VaultStateTransaction {
             _ => None
         }
     }
+}
+
+/// Find withdrawal transactions
+pub fn find_withdrawals(transactions: Vec<Rc<VaultStateTransaction>>) -> Vec<Rc<VaultStateTransaction>> {
+    transactions
+        .into_iter()
+        .filter(|tx| match tx.metadata {
+            VaultTransactionMetadata::Withdrawal { .. } => true,
+            _ => false,
+        })
+        .collect()
+}
+
+/// Find withdrawal transactions and their UTXOs
+///
+/// [`transactions`] is assumed to be topologically sorted
+// XXX: This is probably slightly insufficient. The user should be prompted for all new
+// withdrawals, since if the withdrawal was not approved, they still may wish to sweep the vault to
+// safety.
+// This is not relevant to the common/reasonable case where the watchtower detects the withdrawal
+// within the challenge period.
+pub fn find_active_withdrawals(transactions: Vec<Rc<VaultStateTransaction>>) -> HashMap<Rc<VaultStateTransaction>, HashSet<VaultStateOutput>> {
+    let mut transactions_by_id: HashMap<Txid, Rc<VaultStateTransaction>> = HashMap::with_capacity(transactions.len());
+    // Pretty bad swag but it probably saves us an allocation in the typical case
+    let mut utxos: HashSet<OutPoint> = HashSet::with_capacity(std::cmp::max(2, transactions.len()));
+
+    for transaction in &transactions {
+        transactions_by_id.insert(transaction.txid(), transaction.clone());
+
+        for input in &transaction.transaction.input {
+            utxos.remove(&input.previous_output);
+        }
+
+        for (vout, _) in transaction.transaction.output.iter().enumerate() {
+            utxos.insert(
+                OutPoint {
+                    txid: transaction.txid,
+                    vout: vout as u32,
+                }
+            );
+        }
+    }
+
+    let mut utxos_by_tx: HashMap<Txid, BTreeSet<u32>> =
+        utxos
+            .iter()
+            .map(|utxo| (utxo.txid, BTreeSet::new()))
+            .collect();
+
+    for utxo in &utxos {
+        match utxos_by_tx
+            .entry(utxo.txid)
+        {
+            hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().insert(utxo.vout);
+            }
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert(
+                    iter::once(utxo.vout)
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    utxos_by_tx
+        .into_iter()
+        .filter_map(|(txid, vouts)| {
+            let transaction = transactions_by_id
+                .get(&txid)
+                .expect("all transactions are in this map");
+
+            let outputs = vouts
+                .iter()
+                .filter_map(|vout| transaction.output_type(*vout))
+                .collect();
+
+            match transaction.metadata {
+                VaultTransactionMetadata::Withdrawal { .. } =>
+                    Some((transaction.clone(), outputs)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "bitcoind")]
@@ -2118,7 +2217,7 @@ impl Vault {
     }
 
     #[cfg(feature = "bitcoind")]
-    pub fn apply_block<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, block: &Block, block_height: u32, changelog: &mut ChangeLog<SqliteStorage>) -> Result<(), ApplyBlockError> {
+    pub fn apply_block<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, block: &Block, block_height: u32, changelog: &mut ChangeLog<SqliteStorage>) -> Result<Vec<Rc<VaultStateTransaction>>, ApplyBlockError> {
         let block_hash = block.block_hash();
         let parent_block_hash = block.header.prev_blockhash;
 
@@ -2133,11 +2232,11 @@ impl Vault {
                 .unwrap_or(BlockHash::from_byte_array([0; 32]))
         });
 
-        for added_transaction in added_transactions {
+        for added_transaction in &added_transactions {
             changelog.add(Change::AddTransaction(block_hash, added_transaction.clone()));
         }
 
-        Ok(())
+        Ok(added_transactions)
     }
 
     fn utxos(&self, selector: UtxoSelector) -> BTreeSet<VaultStateUtxo> {
@@ -2195,22 +2294,15 @@ impl Vault {
             .collect()
     }
 
-    pub fn create_recovery<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<RecoveryTransaction, RecoveryCreationError> {
+    fn vault_outputs_by_transaction(&self) -> Vec<(Rc<VaultStateTransaction>, HashSet<VaultStateOutput>)> {
         let utxos = self.utxos(
             UtxoSelector::any_confirmed(),
         );
 
-        let utxos = utxos
-            .iter()
-            .filter(|VaultStateUtxo(_tx, output)| match output {
-                VaultStateOutput::Vault => true,
-                VaultStateOutput::Withdrawal => true,
-            });
-
-        let mut sorted_utxos: HashMap<Rc<VaultStateTransaction>, HashSet<VaultStateOutput>> = HashMap::new();
+        let mut grouped_utxos: HashMap<Rc<VaultStateTransaction>, HashSet<VaultStateOutput>> = HashMap::new();
 
         for utxo in utxos {
-            match sorted_utxos.entry(utxo.0.clone()) {
+            match grouped_utxos.entry(utxo.0.clone()) {
                 hash_map::Entry::Occupied(mut entry) => { entry.get_mut().insert(utxo.1); }
                 hash_map::Entry::Vacant(entry) => {
                     entry.insert(
@@ -2220,7 +2312,12 @@ impl Vault {
             }
         }
 
-        let utxos = sorted_utxos.iter()
+        grouped_utxos.into_iter().collect()
+    }
+
+    pub fn vault_outputs_by_value(&self) -> Vec<(Rc<VaultStateTransaction>, HashSet<VaultStateOutput>)> {
+        let mut sorted_utxos: Vec<_> = self.vault_outputs_by_transaction()
+            .into_iter()
             .map(|(tx, outputs)| {
                 let value = outputs.iter().map(|utxo| {
                     tx.txout(*utxo)
@@ -2231,10 +2328,40 @@ impl Vault {
 
                 (tx, outputs, value)
             })
-            .max_by(|a, b| a.2.cmp(&b.2));
+            .collect();
 
-        let (tx, outputs, _value) = utxos.ok_or(RecoveryCreationError::NoOutputs)?;
+        // XXX: Reverse order
+        sorted_utxos.sort_by(|a, b| b.2.cmp(&a.2));
 
+        sorted_utxos
+            .into_iter()
+            .map(|(tx, outputs, _)| (tx, outputs))
+            .collect()
+    }
+
+    /// Sweeps the most valuable vault transaction's outputs to recovery
+    /// After calling there may still be other open outputs
+    pub fn create_recovery<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<RecoveryTransaction, RecoveryCreationError> {
+        let utxos = self.vault_outputs_by_value();
+
+        let (tx, outputs) = utxos
+            .into_iter()
+            .next()
+            .ok_or(RecoveryCreationError::NoOutputs)?;
+
+        self.create_recovery_for_utxos(secp, tx, &outputs)
+    }
+
+    pub fn recover_all<C: Verification>(&self, secp: &Secp256k1<C>) -> Result<Vec<RecoveryTransaction>, RecoveryCreationError> {
+        self.vault_outputs_by_value()
+            .into_iter()
+            .map(|(tx, outputs)| 
+                self.create_recovery_for_utxos(secp, tx, &outputs)
+            )
+            .collect()
+    }
+
+    pub fn create_recovery_for_utxos<C: Verification>(&self, secp: &Secp256k1<C>, tx: Rc<VaultStateTransaction>, outputs: &HashSet<VaultStateOutput>) -> Result<RecoveryTransaction, RecoveryCreationError> {
         let depth = tx.depth + 1;
         let parent_depth = tx.depth;
 

@@ -2,6 +2,8 @@
 compile_error!("Vault CLI requires a blockchain interface, enable the `bitcoind` feature.");
 
 #[cfg(feature = "bitcoind")]
+use bdk_bitcoind_rpc::bitcoincore_rpc;
+#[cfg(feature = "bitcoind")]
 use bdk_bitcoind_rpc::Emitter;
 #[cfg(feature = "bitcoind")]
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -13,6 +15,7 @@ use bdk_core::{BlockId, CheckPoint};
 
 use bdk_wallet::SignOptions;
 
+use bdk_wallet::signer::SignerError;
 use bdk_wallet::{
     KeychainKind,
     PersistedWallet,
@@ -25,7 +28,15 @@ use bdk_wallet::{
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::amount::Display;
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{Address, Amount, FeeRate, Denomination};
+use bitcoin::psbt::ExtractTxError;
+use bitcoin::{
+    Address,
+    Amount,
+    FeeRate,
+    Denomination,
+    Transaction,
+    Txid,
+};
 
 use bitcoin::bip32::{
     Xpriv,
@@ -48,6 +59,12 @@ use clap::{
     Subcommand,
 };
 
+use mccv::error::{
+    KeypairDerivationError,
+    SignRecoveryError,
+    ToSignedRecoveryTransactionError,
+};
+use mccv::vault::{VaultStateOutput, RecoveryCreationError};
 use rand::{
     RngCore,
     thread_rng,
@@ -59,10 +76,12 @@ use rusqlite::{
     params,
 };
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "bitcoind")]
 use mccv::{
@@ -74,6 +93,7 @@ use mccv::{
     storage::ChangeLog,
     UtxoSelector,
     vault::Context,
+    vault::VaultStateTransaction,
     VaultAmount,
     VaultDepositor,
     VaultId,
@@ -90,6 +110,10 @@ use mccv::storage::{
 use mccv::vault_storage::{
     StoredSecrets,
     SqliteStorage,
+};
+
+use mccv::wallet::{
+    AnchoredTransaction, CpfpCreationError,
 };
 
 #[derive(Clone, Args)]
@@ -189,23 +213,30 @@ struct FeeRateArg {
 }
 
 impl FeeRateArg {
-    fn fee_rate(&self, rpc_client: &Client) -> FeeRate {
+    fn try_fee_rate(&self, rpc_client: &Client) -> Result<FeeRate, bitcoincore_rpc::Error> {
         if let Some(fee_rate) = self.fee_rate {
-            FeeRate::from_sat_per_vb(fee_rate)
-                .expect("valid fee rate")
+            Ok(
+                FeeRate::from_sat_per_vb(fee_rate)
+                    .expect("valid fee rate")
+            )
         } else {
             let fee_rate_estimate = rpc_client.estimate_smart_fee(
                     self.block_confirmation_target,
                     None,
-                )
-                .expect("fee rate");
+                )?;
 
             // Checked RPC docs and this is indeed kvB not kB, which makes sense, docs are probably
             // just stale
             let amount_per_kvb = fee_rate_estimate.fee_rate.expect("fee rate");
 
-            FeeRate::from_sat_per_kwu(amount_per_kvb.to_sat() / 4)
+            Ok(
+                FeeRate::from_sat_per_kwu(amount_per_kvb.to_sat() / 4)
+            )
         }
+    }
+
+    fn fee_rate(&self, rpc_client: &Client) -> FeeRate {
+        self.try_fee_rate(rpc_client).expect("fee rate")
     }
 }
 
@@ -222,6 +253,28 @@ struct ModifyArg {
 
     amount: Amount,
 }
+
+#[derive(Clone, Args)]
+struct WatchtowerArg {
+    #[arg(short, long = "vault-name", help = "Human readable identifier string")]
+    name: Option<String>,
+
+    #[command(flatten)]
+    rpc_conf: RpcConf,
+
+    #[command(flatten)]
+    fee_rate: FeeRateArg,
+
+    #[arg(short, long, help = "Path to approval executable")]
+    approval_executable: PathBuf,
+
+    #[arg(short = 't', long, default_value_t = 120, help = "How long to wait for the approval executable to return a result in seconds")]
+    approval_timeout: u64,
+
+    #[arg(short = 'i', long, default_value_t = 60, help = "How frequently to check for new blocks")]
+    blockchain_poll_interval: u64,
+}
+
 
 #[derive(Clone, Subcommand)]
 enum Command {
@@ -291,6 +344,7 @@ enum Command {
     },
     Deposit(ModifyArg),
     Withdraw(ModifyArg),
+    Watchtower(WatchtowerArg),
 }
 
 #[derive(Parser)]
@@ -581,17 +635,21 @@ impl VaultSystem {
         }
     }
 
-    #[cfg(feature = "bitcoind")]
-    fn sync<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, rpc_client: &Client) {
+    fn vault_height(&self) -> u32 {
         let vault_checkpoint = self.vault.checkpoint().unwrap();
+        vault_checkpoint.height()
+    }
+
+    fn wallet_height(&self) -> u32 {
         let wallet_checkpoint = self.wallet.latest_checkpoint();
+        wallet_checkpoint.height()
+    }
 
-        let vault_height = vault_checkpoint.height();
-        let wallet_height = wallet_checkpoint.height();
+    #[cfg(feature = "bitcoind")]
+    fn sync<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, rpc_client: &Client, transactions: &mut Vec<Rc<VaultStateTransaction>>) {
+        let highest = std::cmp::max(self.vault_height(), self.wallet_height());
 
-        let highest = std::cmp::max(vault_height, wallet_height);
-
-        self.sync_to(secp, context, rpc_client, highest);
+        self.sync_to(secp, context, rpc_client, highest, transactions);
 
         self.store();
 
@@ -604,7 +662,7 @@ impl VaultSystem {
         let mut height = highest;
         loop {
             let next = next_height(height);
-            if self.sync_to(secp, context, rpc_client, next) == 0 {
+            if self.sync_to(secp, context, rpc_client, next, transactions) == 0 {
                 break;
             }
 
@@ -615,7 +673,7 @@ impl VaultSystem {
     }
 
     #[cfg(feature = "bitcoind")]
-    fn sync_to<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, rpc_client: &Client, max_height: u32) -> usize {
+    fn sync_to<C: Verification>(&mut self, secp: &Secp256k1<C>, context: &Context, rpc_client: &Client, max_height: u32, transactions: &mut Vec<Rc<VaultStateTransaction>>) -> usize {
         let vault_checkpoint = self.vault.checkpoint().unwrap();
         let wallet_checkpoint = self.wallet.latest_checkpoint();
 
@@ -649,8 +707,10 @@ impl VaultSystem {
             let _ = write!(out, "...and vault...");
             out.flush().unwrap();
 
-            self.vault.apply_block(&secp, &context, &block.block, block.block_height(), &mut self.vault_changelog)
+            let added_transactions = self.vault.apply_block(&secp, &context, &block.block, block.block_height(), &mut self.vault_changelog)
                 .expect("apply block success");
+
+            transactions.extend(added_transactions);
 
             let _ = writeln!(out, "Done!");
             out.flush().unwrap();
@@ -923,7 +983,7 @@ fn main() {
 
             if !args.skip_sync {
                 let context = vault.vault.context(&secp);
-                vault.sync(&secp, &context, &rpc_client);
+                vault.sync(&secp, &context, &rpc_client, &mut vec![]);
             }
 
             let balance = vault.wallet.balance();
@@ -978,7 +1038,7 @@ fn main() {
             let context = vault.vault.context(&secp);
 
             println!("Syncing...");
-            vault.sync(&secp, &context, &rpc_client);
+            vault.sync(&secp, &context, &rpc_client, &mut vec![]);
             vault.store();
             println!("Synced!");
         }
@@ -990,7 +1050,7 @@ fn main() {
 
             if !args.skip_sync {
                 let context = vault.vault.context(&secp);
-                vault.sync(&secp, &context, &rpc_client);
+                vault.sync(&secp, &context, &rpc_client, &mut vec![]);
             }
 
             let current_height = vault.vault.height()
@@ -1061,7 +1121,7 @@ fn main() {
 
             if !args.skip_sync {
                 let context = vault.vault.context(&secp);
-                vault.sync(&secp, &context, &rpc_client);
+                vault.sync(&secp, &context, &rpc_client, &mut vec![]);
             }
 
             let mut recovery = vault.vault.create_recovery(&secp)
@@ -1107,7 +1167,7 @@ fn main() {
 
             if !args.skip_sync {
                 let context = vault.vault.context(&secp);
-                vault.sync(&secp, &context, &rpc_client);
+                vault.sync(&secp, &context, &rpc_client, &mut vec![]);
             }
 
             let address = address.clone().require_network(args.network)
@@ -1182,7 +1242,7 @@ fn main() {
 
             if !args.skip_sync {
                 let context = vault.vault.context(&secp);
-                vault.sync(&secp, &context, &rpc_client);
+                vault.sync(&secp, &context, &rpc_client, &mut vec![]);
             }
 
             let wallet_balance = vault.wallet.balance();
@@ -1247,7 +1307,7 @@ fn main() {
 
             if !args.skip_sync {
                 let context = vault.vault.context(&secp);
-                vault.sync(&secp, &context, &rpc_client);
+                vault.sync(&secp, &context, &rpc_client, &mut vec![]);
             }
 
             let vault_balance = vault.vault.confirmed_balance(None);
@@ -1283,8 +1343,7 @@ fn main() {
 
             println!("Withdrawal TX: {}", serialize_hex(&withdrawal));
             println!("Withdrawal TXID: {}", withdrawal.compute_txid());
-            println!("Withdrawal CPFP TX: {}", serialize_hex(&withdrawal_cpfp));
-            println!("Withdrawal CPFP TXID: {}", withdrawal_cpfp.compute_txid());
+            println!("Withdrawal CPFP TX: {}", serialize_hex(&withdrawal_cpfp)); println!("Withdrawal CPFP TXID: {}", withdrawal_cpfp.compute_txid());
 
             rpc_client.submit_package(&[
                     &withdrawal,
@@ -1295,5 +1354,243 @@ fn main() {
             // TODO: Persist unconfirmed transactions for rebroadcast
             // TODO: Persist metadata for Withdrawal output spending
         }
+        Command::Watchtower(ref watchtower_args) => {
+            watchtower(&args, watchtower_args);
+        }
+    }
+}
+
+struct Backoff {
+    duration: Duration,
+    min: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    fn new(min: Duration, max: Duration) -> Self {
+        Self {
+            duration: min,
+            min,
+            max,
+        }
+    }
+
+    fn backoff(&mut self) -> Duration {
+        let result = self.duration;
+
+        self.duration *= 2;
+        self.duration = std::cmp::min(self.duration, self.max);
+
+        result
+    }
+
+    fn reset(&mut self) { self.duration = self.min }
+}
+
+#[derive(Debug)]
+enum RecoveryError {
+    RecoveryCreationError(RecoveryCreationError),
+    KeypairDerivationError(KeypairDerivationError),
+    SignRecoveryError(SignRecoveryError),
+    ToSignedRecoveryTransactionError(ToSignedRecoveryTransactionError),
+    MissingAnchor,
+    CpfpCreationError(CpfpCreationError),
+    CpfpNotFinalError,
+    CpfpSigningError(SignerError),
+    CpfpExtractionError(ExtractTxError),
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecoveryCreationError(e) => write!(f, "error creating recovery transaction: {e}"),
+            Self::KeypairDerivationError(e) => write!(f, "error deriving keypair: {e}"),
+            Self::SignRecoveryError(e) => write!(f, "error signing recovery transaction: {e}"),
+            Self::ToSignedRecoveryTransactionError(e) => write!(f, "error extracting signed recovery transaction: {e}"),
+            Self::MissingAnchor => write!(f, "recovery transaction missing anchor output"),
+            Self::CpfpCreationError(e) => write!(f, "error creating CPFP transaction: {e}"),
+            Self::CpfpNotFinalError => write!(f, "signed CPFP transaction not final"),
+            Self::CpfpSigningError(e) => write!(f, "error signing CPFP transaction: {e}"),
+            Self::CpfpExtractionError(e) => write!(f, "error extracting CPFP transaction: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RecoveryError::RecoveryCreationError(ref e) => Some(e),
+            RecoveryError::KeypairDerivationError(ref e) => Some(e),
+            RecoveryError::SignRecoveryError(ref e) => Some(e),
+            RecoveryError::ToSignedRecoveryTransactionError(ref e) => Some(e),
+            RecoveryError::CpfpCreationError(ref e) => Some(e),
+            RecoveryError::CpfpSigningError(ref e) => Some(e),
+            RecoveryError::CpfpExtractionError(ref e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+fn recover<C: Signing + Verification>(secp: &Secp256k1<C>, vault: &mut VaultSystem, transaction: &Rc<VaultStateTransaction>, outputs: HashSet<VaultStateOutput>, fee_rate: FeeRate) -> Result<[Transaction; 2], RecoveryError> {
+    let mut recovery_tx = vault
+        .vault.create_recovery_for_utxos(&secp, transaction.clone(), &outputs)
+        .map_err(RecoveryError::RecoveryCreationError)?;
+
+    let keypair = recovery_tx
+        .hot_keypair(&secp, &vault.secrets.hot_xpriv)
+        .map_err(RecoveryError::KeypairDerivationError)?;
+
+    recovery_tx.sign(&secp, &keypair)
+        .map_err(RecoveryError::SignRecoveryError)?;
+
+    let recovery_tx = recovery_tx.into_signed_transaction()
+        .map_err(RecoveryError::ToSignedRecoveryTransactionError)?;
+
+    let anchor = recovery_tx.find_anchor()
+        .ok_or(RecoveryError::MissingAnchor)?;
+
+    let mut cpfp = vault.wallet.create_cpfp(&secp, &anchor, fee_rate)
+        .map_err(RecoveryError::CpfpCreationError)?;
+
+    let cpfp_final = vault.wallet.sign(&mut cpfp, SignOptions::default())
+        .map_err(RecoveryError::CpfpSigningError)?;
+
+    if !cpfp_final {
+        return Err(RecoveryError::CpfpNotFinalError); 
+    }
+
+    let cpfp = cpfp.extract_tx() 
+        .map_err(RecoveryError::CpfpExtractionError)?;
+
+    Ok(
+        [
+            recovery_tx,
+            cpfp,
+        ]
+    )
+}
+
+fn watchtower(args: &CommandLine, watchtower_args: &WatchtowerArg) {
+    let secp = Secp256k1::new();
+
+    let approval_timeout = Duration::from_secs(watchtower_args.approval_timeout);
+    let poll_interval = Duration::from_secs(watchtower_args.blockchain_poll_interval);
+
+    let mut blockchain_poll_interval = Backoff::new(Duration::from_millis(100), poll_interval);
+
+    let executable_exists = std::fs::exists(&watchtower_args.approval_executable)
+        .expect("approval executable existence check");
+
+    assert!(executable_exists, "approval executable file does not exist");
+
+    let storage = args.open_storage();
+
+    let mut vault = VaultSystem::load(&secp, storage, watchtower_args.name.as_deref());
+    let rpc_client = vault.open_rpc(&watchtower_args.rpc_conf);
+
+    let _ = watchtower_args.fee_rate.try_fee_rate(&rpc_client)
+        .expect("valid RPC and/or fee rate configuration");
+
+    let mut previous_vault_height = vault.vault_height();
+
+    let context = vault.vault.context(&secp);
+
+    let approve = |txid: Txid| {
+        let mut process = match std::process::Command::new(&watchtower_args.approval_executable)
+            .arg(txid.to_string())
+            .spawn()
+        {
+            Ok(process) => process,
+            Err(_) => { return false; }
+        };
+
+        let approval_timeout_end = Instant::now() + approval_timeout;
+        let mut approval_poll_interval = Backoff::new(Duration::from_millis(100), Duration::from_secs(10));
+
+        loop {
+            match process.try_wait() {
+                Ok(Some(status)) => { return status.success(); },
+                Ok(None) => {
+                    let now = Instant::now();
+                    let delay_end = now + approval_poll_interval.backoff();
+                    let delay_end = std::cmp::min(delay_end, approval_timeout_end);
+
+                    let delay = delay_end - now;
+
+                    if delay == Duration::ZERO {
+                        break;
+                    }
+
+                    //eprintln!("sleeping: {}s", delay.as_secs_f32());
+                    std::thread::sleep(delay);
+                }
+                Err(_) => { return false; },
+            }
+        }
+
+        let _ = process.kill();
+        let _ = process.wait();
+
+        false
+    };
+
+    let mut sweep_to_recovery = false;
+
+    loop {
+        let mut transactions = vec![];
+        vault.sync(&secp, &context, &rpc_client, &mut transactions);
+
+        if !transactions.is_empty() {
+            let transactions = mccv::vault::find_withdrawals(transactions);
+
+            for transaction in transactions {
+                if !approve(transaction.txid()) {
+                    println!("Withdrawal {} NOT approved. Initiating recovery.", transaction.txid());
+                    sweep_to_recovery = true;
+                } else {
+                    println!("Withdrawal {} approved", transaction.txid());
+                }
+            }
+
+        }
+
+        let new_vault_height = vault.vault_height();
+        if new_vault_height != previous_vault_height {
+            blockchain_poll_interval.reset();
+            previous_vault_height = new_vault_height;
+        } else if sweep_to_recovery {
+            // XXX: there is currently an issue where `estimatesmartfee` may return excessively
+            // high fee rates on signet. Since we're already rebuilding the transactions, we may as
+            // well check the current fee rate.
+            //
+            // TODO: Keep track of unconfirmed transactions and do proper fee bumping.
+            let fee_rate = watchtower_args.fee_rate.fee_rate(&rpc_client);
+
+            for (transaction, outputs) in vault.vault.vault_outputs_by_value() {
+                match recover(&secp, &mut vault, &transaction, outputs, fee_rate) {
+                    Ok(transactions) => {
+                        println!("Recovery TXID: {}", transactions[0].compute_txid());
+                        println!("Recovery TX: {}", serialize_hex(&transactions[0]));
+                        println!("Recovery CPFP TXID: {}", transactions[1].compute_txid());
+                        println!("Recovery CPFP TX: {}", serialize_hex(&transactions[1]));
+
+                        match rpc_client.submit_package(&[&transactions[0], &transactions[1]]) {
+                            Ok(_) => { }
+                            Err(e) => {
+                                eprintln!("E: {}: Error broadcasting recovery CPFP package: {e:?}", transaction.txid());
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("E: {}: Error recovering transaction: {e}", transaction.txid());
+                    }
+                }
+            }
+        }
+
+        let delay = blockchain_poll_interval.backoff();
+        //eprintln!("sleeping: {}s", delay.as_secs_f32());
+        std::thread::sleep(delay);
     }
 }

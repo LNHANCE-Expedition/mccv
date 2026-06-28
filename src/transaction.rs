@@ -355,6 +355,17 @@ pub enum KeypairDerivationError {
     NoSigningInfo,
 }
 
+impl std::fmt::Display for KeypairDerivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongKey => write!(f, "wrong key"),
+            Self::DerivationDepthExceeded => write!(f, "maximum derivation depth exceeded"),
+            Self::NoSigningInfo => write!(f, "no signing info available"),
+        }
+    }
+}
+
+impl std::error::Error for KeypairDerivationError { }
 
 #[derive(Clone, Debug)]
 pub enum DepositSignError {
@@ -1205,6 +1216,10 @@ impl WithdrawalSpendTransaction {
     }
 
     pub fn spend<C: Signing + Verification>(&self, secp: &Secp256k1<C>, keypair: &Keypair, script_pubkey: ScriptBuf, min_fee: Amount, min_fee_rate: FeeRate) -> Result<Transaction, WithdrawalSpendError> {
+        if min_fee > self.withdrawal_output.value {
+            return Err(WithdrawalSpendError::FeeTooLarge);
+        }
+
         let mut transaction = Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
@@ -1218,15 +1233,13 @@ impl WithdrawalSpendTransaction {
             ],
             output: vec![
                 TxOut {
-                    value: self.withdrawal_output.value - min_fee,
+                    // The output value will be modified with the fee
+                    // later.
+                    value: self.withdrawal_output.value,
                     script_pubkey,
                 }
             ],
         };
-
-        if min_fee > self.withdrawal_output.value {
-            return Err(WithdrawalSpendError::FeeTooLarge);
-        }
 
         let tap_leaf_hash = TapLeafHash::from_script(
             self
@@ -1270,7 +1283,9 @@ impl WithdrawalSpendTransaction {
 
         let fee = std::cmp::max(min_fee, fee);
 
-        transaction.output[0].value = self.withdrawal_output.value - fee;
+        transaction.output[0].value = self.withdrawal_output.value
+            .checked_sub(fee)
+            .ok_or(WithdrawalSpendError::FeeTooLarge)?;
 
         let prevout_txouts = vec![
             &self.withdrawal_output,
@@ -1562,9 +1577,35 @@ pub enum ToSignedRecoveryTransactionError {
     MissingSignature,
 }
 
+impl std::fmt::Display for ToSignedRecoveryTransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSignature => write!(f, "signature missing"),
+        }
+    }
+}
+
+impl std::error::Error for ToSignedRecoveryTransactionError { }
+
 #[derive(Clone,Debug)]
 pub enum SignRecoveryError {
     SignError(sighash::TaprootError),
+}
+
+impl std::fmt::Display for SignRecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SignError(e) => write!(f, "error signing recovery transaction: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SignRecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SignError(ref e) => Some(e),
+        }
+    }
 }
 
 impl TailDepositTransactionTemplate {

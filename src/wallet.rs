@@ -15,12 +15,16 @@ use bitcoin::{
     OutPoint,
     Psbt,
     psbt,
+    Transaction,
     VarInt,
     Weight,
+    Witness,
 };
 
 use crate::transaction::{
     DepositTransaction,
+    ephemeral_anchor,
+    is_ephemeral_anchor,
     WithdrawalTransaction,
 };
 
@@ -137,6 +141,44 @@ pub trait UnderpayingParentTransaction {
     fn weight(&self) -> Weight;
 }
 
+pub struct AnchorOutpoint<'a>(&'a Transaction, OutPoint);
+
+impl<'a> UnderpayingParentTransaction for AnchorOutpoint<'a> {
+    fn anchor_outpoint(&self) -> OutPoint { self.1 }
+
+    fn anchor_output_psbt_input(&self) -> psbt::Input {
+        psbt::Input {
+            witness_utxo: Some(ephemeral_anchor()),
+            final_script_witness: Some(Witness::new()),
+            ..Default::default()
+        }
+    }
+
+    fn weight(&self) -> Weight { self.0.weight() }
+}
+
+pub trait AnchoredTransaction {
+    fn find_anchor(&self) -> Option<AnchorOutpoint<'_>>;
+}
+
+impl AnchoredTransaction for Transaction {
+    fn find_anchor(&self) -> Option<AnchorOutpoint<'_>> {
+        self.output
+            .iter()
+            .position(is_ephemeral_anchor)
+            .and_then(|vout| u32::try_from(vout).ok())
+            .map(|vout|
+                 AnchorOutpoint(
+                    self,
+                    OutPoint {
+                        txid: self.compute_txid(),
+                        vout,
+                    }
+                )
+            )
+    }
+}
+
 impl UnderpayingParentTransaction for WithdrawalTransaction {
     fn anchor_outpoint(&self) -> OutPoint {
         WithdrawalTransaction::anchor_outpoint(self)
@@ -156,6 +198,26 @@ pub enum CpfpCreationError {
     FeeOverflow,
     InsufficientFunds,
     TransactionBuildError(CreateTxError),
+}
+
+impl std::fmt::Display for CpfpCreationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FeeOverflow => write!(f, "fee overflow"),
+            Self::InsufficientFunds => write!(f, "insufficient funds"),
+            Self::TransactionBuildError(e) => write!(f, "error building transaction: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CpfpCreationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::FeeOverflow => None,
+            Self::InsufficientFunds => None,
+            Self::TransactionBuildError(ref e) => Some(e),
+        }
+    }
 }
 
 pub trait VaultWithdrawer {
@@ -184,6 +246,7 @@ impl VaultWithdrawer for Wallet {
             builder
                 .version(3)
                 .fee_absolute(required_total_fee)
+                .only_witness_utxo()
                 .drain_to(change_address.script_pubkey())
                 .add_foreign_utxo(anchor_outpoint, psbt_input.clone(), Weight::ZERO)
                 .expect("we provide correct foreign utxo metadata");
