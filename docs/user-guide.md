@@ -237,6 +237,20 @@ At this point the funds can be spent from the hot wallet.
 mccv send tb1p0dvncdux9r4wqdetetng0xe830r6wum06legmk29ek5l43497epse2u5vz 10000sat
 ```
 
+### Monitoring the blockchain for unauthorized withdrawals
+
+MCCV can be run to periodically poll a bitcoind instance for blockchain updates, and respond to vault withdrawals detected on-chain.
+
+```
+mccv watchtower --approval-timeout 300 --approval-executable ../examples/approve-prompt.sh
+```
+
+The watchtower subcommand takes a path to the approval executable.
+The approval executable must return a status code of 0 before the timeout to approve the withdrawal.
+The approval executable should return a non-zero status code immediately if the withdrawal should be rejected.
+If the timeout elapses without the approval executable completing with a zero status code, it is considered to have rejected the withdrawal, and the watchtower will initiate a sweep to cold keys.
+The configurable timeout is specified in seconds.
+
 # MCCV Command Reference
 
 | Subcommand | Purpose |
