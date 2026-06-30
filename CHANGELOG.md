@@ -4,7 +4,8 @@
 
 ### Fixed
 
-Vault recovery coins are now locked by the correct (cold) keys.
+- Vault recovery coins are now locked by the correct (cold) keys.
+- Vault deposit CTV hashes are now calculated correctly.
 
 ### Security
 
