@@ -1,15 +1,20 @@
 use bitcoin::consensus::Encodable;
-use bitcoin::taproot::LeafVersion;
+use bitcoin::taproot::{LeafVersion, TaprootBuilderError};
 use bitcoin::{Opcode, TapLeafHash, TapNodeHash, ScriptBuf, VarInt};
-use bitcoin::key::{TweakedPublicKey, TapTweak};
+use bitcoin::key::{TweakedPublicKey, TapTweak, UntweakedPublicKey};
 use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4};
 use bitcoin::opcodes::{OP_0, OP_TRUE};
 
 use bitcoin::script::PushBytes;
 use bitcoin::io::{Error, Write};
-use bitcoin::secp256k1::{Secp256k1, Verification, XOnlyPublicKey};
+use bitcoin::secp256k1::{Parity, Secp256k1, Verification, XOnlyPublicKey};
+use bitcoin::secp256k1;
 
 use bitcoin::hashes::Hash;
+use bitcoin::taproot::TaprootMerkleBranch;
+
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, BTreeMap, BTreeSet};
 
 pub trait ScriptFragment {
     const STATIC_LEN: Option<usize>;
@@ -301,6 +306,12 @@ pub struct LeafNode<M> {
     merkle_branch: Vec<TapNodeHash>,
 }
 
+impl<M> LeafNode<M> {
+    fn new(leaf: TapLeafHash, metadata: M, merkle_branch: Vec<TapNodeHash>) -> Self {
+        Self
+    }
+}
+
 impl<M> PartialEq for LeafNode<M> {
     fn eq(&self, other: &Self) -> bool {
         self.leaf.eq(&other.leaf)
@@ -326,57 +337,132 @@ struct NodeInfo<M> {
     hash: TapNodeHash,
 
     leaves: Vec<LeafNode<M>>,
+
+    has_hidden_nodes: bool,
 }
 
-/// Creates a new [`TaprootSpendInfo`] from a list of scripts (with default script version) and
-/// weights of satisfaction for that script.
-///
-/// The weights represent the probability of each branch being taken. If probabilities/weights
-/// for each condition are known, constructing the tree as a Huffman Tree is the optimal way to
-/// minimize average case satisfaction cost. This function takes as input an iterator of
-/// `tuple(u32, ScriptBuf)` where `u32` represents the satisfaction weights of the branch. For
-/// example, [(3, S1), (2, S2), (5, S3)] would construct a [`TapTree`] that has optimal
-/// satisfaction weight when probability for S1 is 30%, S2 is 20% and S3 is 50%.
-///
-/// # Errors:
-///
-/// - When the optimal Huffman Tree has a depth more than 128.
-/// - If the provided list of script weights is empty.
-///
-/// # Edge Cases:
-///
-/// If the script weight calculations overflow, a sub-optimal tree may be generated. This should
-/// not happen unless you are dealing with billions of branches with weights close to 2^32.
-///
-/// [`TapTree`]: crate::taproot::TapTree
-pub fn with_huffman_tree<I, M, S>(script_weights: I) -> Result<Self, TaprootBuilderError>
-where
-    I: IntoIterator<Item = (u32, M, S)>,
-{
-    let mut node_weights = BinaryHeap::<(Reverse<u32>, NodeInfo)>::new();
-    for (p, leaf) in script_weights {
-        node_weights
-            .push((Reverse(p), NodeInfo::new_leaf_with_ver(leaf, LeafVersion::TapScript)));
+impl<M> PartialEq for NodeInfo<M> {
+    fn eq(&self, other: &Self) -> bool { self.hash.eq(&other.hash) }
+}
+
+impl<M> core::hash::Hash for NodeInfo<M> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) { self.hash.hash(state) }
+}
+
+impl<M> Eq for NodeInfo <M>{}
+
+impl<M> NodeInfo<M> {
+    /*
+    /// Creates a new [`NodeInfo`] with omitted/hidden info.
+    pub fn new_hidden_node(hash: TapNodeHash) -> Self {
+        Self { hash, leaves: vec![], has_hidden_nodes: true }
     }
-    if node_weights.is_empty() {
-        return Err(TaprootBuilderError::EmptyTree);
+    */
+
+    /// Creates a new leaf [`NodeInfo`] with given [`ScriptBuf`] and [`LeafVersion`].
+    pub fn new_leaf_with_ver(leaf: TapLeafHash, metadata: M) -> Self {
+        Self {
+            hash: TapNodeHash::from(leaf),
+            leaves: vec![LeafNode { leaf, metadata, merkle_branch: Vec::new() }],
+            has_hidden_nodes: false,
+        }
     }
-    while node_weights.len() > 1 {
-        // Combine the last two elements and insert a new node
-        let (p1, s1) = node_weights.pop().expect("len must be at least two");
-        let (p2, s2) = node_weights.pop().expect("len must be at least two");
-        // Insert the sum of first two in the tree as a new node
-        // N.B.: p1 + p2 can not practically saturate as you would need to have 2**32 max u32s
-        // from the input to overflow. However, saturating is a reasonable behavior here as
-        // huffman tree construction would treat all such elements as "very likely".
-        let p = Reverse(p1.0.saturating_add(p2.0));
-        node_weights.push((p, NodeInfo::combine(s1, s2)?));
+
+    /// Combines two [`NodeInfo`] to create a new parent.
+    pub fn combine(a: Self, b: Self) -> Result<Self, TaprootBuilderError> {
+        let mut all_leaves = Vec::with_capacity(a.leaves.len() + b.leaves.len());
+        let (hash, left_first) = TapNodeHash::combine_node_hashes(a.hash, b.hash);
+        let (a, b) = if left_first { (a, b) } else { (b, a) };
+        for mut a_leaf in a.leaves {
+            a_leaf.merkle_branch.push(b.hash)?; // add hashing partner
+            all_leaves.push(a_leaf);
+        }
+        for mut b_leaf in b.leaves {
+            b_leaf.merkle_branch.push(a.hash)?; // add hashing partner
+            all_leaves.push(b_leaf);
+        }
+        Ok(Self {
+            hash,
+            leaves: all_leaves,
+            has_hidden_nodes: a.has_hidden_nodes || b.has_hidden_nodes,
+        })
     }
-    // Every iteration of the loop reduces the node_weights.len() by exactly 1
-    // Therefore, the loop will eventually terminate with exactly 1 element
-    debug_assert_eq!(node_weights.len(), 1);
-    let node = node_weights.pop().expect("huffman tree algorithm is broken").1;
-    Ok(TaprootBuilder { branch: vec![Some(node)] })
+
+    /// Creates an iterator over all leaves (including hidden leaves) in the tree.
+    pub fn leaf_nodes(&self) -> LeafNodes { LeafNodes { leaf_iter: self.leaves.iter() } }
+
+    /// Returns the root [`TapNodeHash`] of this node info.
+    pub fn node_hash(&self) -> TapNodeHash { self.hash }
+}
+
+struct TaprootSpendInfo<M> {
+    /// The BIP341 internal key.
+    internal_key: UntweakedPublicKey,
+    /// The merkle root of the script tree (None if there are no scripts).
+    merkle_root: Option<TapNodeHash>,
+    /// The sign final output pubkey as per BIP 341.
+    output_key_parity: Parity,
+    /// The tweaked output key.
+    output_key: TweakedPublicKey,
+    /// Map from (script, leaf_version) to (sets of) [`TaprootMerkleBranch`]. More than one control
+    /// block for a given script is only possible if it appears in multiple branches of the tree. In
+    /// all cases, keeping one should be enough for spending funds, but we keep all of the paths so
+    /// that a full tree can be constructed again from spending data if required.
+    script_map: BTreeMap<(TapLeafHash, LeafVersion), BTreeSet<TaprootMerkleBranch>>,
+}
+
+impl<M> TaprootSpendInfo<M> {
+
+    /// Creates a new [`TaprootSpendInfo`] from a list of scripts (with default script version) and
+    /// weights of satisfaction for that script.
+    ///
+    /// The weights represent the probability of each branch being taken. If probabilities/weights
+    /// for each condition are known, constructing the tree as a Huffman Tree is the optimal way to
+    /// minimize average case satisfaction cost. This function takes as input an iterator of
+    /// `tuple(u32, ScriptBuf)` where `u32` represents the satisfaction weights of the branch. For
+    /// example, [(3, S1), (2, S2), (5, S3)] would construct a [`TapTree`] that has optimal
+    /// satisfaction weight when probability for S1 is 30%, S2 is 20% and S3 is 50%.
+    ///
+    /// # Errors:
+    ///
+    /// - When the optimal Huffman Tree has a depth more than 128.
+    /// - If the provided list of script weights is empty.
+    ///
+    /// # Edge Cases:
+    ///
+    /// If the script weight calculations overflow, a sub-optimal tree may be generated. This should
+    /// not happen unless you are dealing with billions of branches with weights close to 2^32.
+    ///
+    /// [`TapTree`]: crate::taproot::TapTree
+    pub fn with_huffman_tree<I, M, S>(script_weights: I) -> Result<Self, TaprootBuilderError>
+    where
+        I: IntoIterator<Item = (u32, M, S)>,
+    {
+        let mut node_weights = BinaryHeap::<(Reverse<u32>, NodeInfo<M>)>::new();
+        for (p, leaf) in script_weights {
+            node_weights
+                .push((Reverse(p), NodeInfo::new_leaf_with_ver(leaf, LeafVersion::TapScript)));
+            }
+        if node_weights.is_empty() {
+            return Err(TaprootBuilderError::EmptyTree);
+        }
+        while node_weights.len() > 1 {
+            // Combine the last two elements and insert a new node
+            let (p1, s1) = node_weights.pop().expect("len must be at least two");
+            let (p2, s2) = node_weights.pop().expect("len must be at least two");
+            // Insert the sum of first two in the tree as a new node
+            // N.B.: p1 + p2 can not practically saturate as you would need to have 2**32 max u32s
+            // from the input to overflow. However, saturating is a reasonable behavior here as
+            // huffman tree construction would treat all such elements as "very likely".
+            let p = Reverse(p1.0.saturating_add(p2.0));
+            node_weights.push((p, NodeInfo::combine(s1, s2)?));
+        }
+        // Every iteration of the loop reduces the node_weights.len() by exactly 1
+        // Therefore, the loop will eventually terminate with exactly 1 element
+        debug_assert_eq!(node_weights.len(), 1);
+        let node = node_weights.pop().expect("huffman tree algorithm is broken").1;
+        Ok(TaprootBuilder { branch: vec![Some(node)] })
+    }
 }
 
 impl_tuple_fragment!(A: 0);
